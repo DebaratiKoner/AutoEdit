@@ -1,0 +1,99 @@
+.upload-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #1a1a1a;
+  color: #ffffff;
+}
+
+.upload-header {
+  padding: 2rem;
+  text-align: center;
+  border-bottom: 1px solid #333;
+}
+
+.upload-header h1 {
+  margin: 0;
+  font-size: 2rem;
+  font-weight: 600;
+}
+
+.upload-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  gap: 2rem;
+}
+
+.drop-zone {
+  width: 100%;
+  max-width: 600px;
+  min-height: 400px;
+  border: 3px dashed #444;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  background: #222;
+}
+
+.drop-zone:hover {
+  border-color: #666;
+  background: #252525;
+}
+
+.drop-zone.drag-active {
+  border-color: #4a90e2;
+  background: #1e3a5f;
+}
+
+.drop-zone-content {
+  text-align: center;
+  padding: 2rem;
+}
+
+.upload-icon {
+  color: #888;
+  margin-bottom: 1.5rem;
+}
+
+.drop-zone-text {
+  font-size: 1.5rem;
+  font-weight: 500;
+  margin: 0 0 0.5rem 0;
+  color: #ffffff;
+}
+
+.drop-zone-subtext {
+  font-size: 1rem;
+  margin: 0 0 1.5rem 0;
+  color: #888;
+}
+
+.drop-zone-formats {
+  font-size: 0.875rem;
+  color: #666;
+  margin: 0;
+}
+
+.error-message {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.5rem;
+  background: #3d1f1f;
+  border: 1px solid #6b2c2c;
+  border-radius: 8px;
+  color: #ff6b6b;
+  max-width: 600px;
+  width: 100%;
+}
+
+.error-icon {
+  flex-shrink: 0;
+}
