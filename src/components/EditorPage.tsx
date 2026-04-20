@@ -193,13 +193,61 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!session || !videoRef.current || isDraggingPlayhead) return;
     
+    // Don't handle click if click is on a segment
+    if (e.target !== e.currentTarget) return;
+    
     const rect = e.currentTarget.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const percentage = clickX / rect.width;
-    const newTime = percentage * session.duration;
     
-    videoRef.current.currentTime = newTime;
-    setCurrentTime(newTime);
+    // Calculate time based on edited timeline, not original video
+    const totalEditedDuration = session.timeline.reduce((sum, seg) => sum + seg.duration, 0);
+    const editedTime = percentage * totalEditedDuration;
+    
+    // Find which segment this corresponds to and map to source time
+    const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
+    let cumulativeTime = 0;
+    
+    for (const segment of sortedSegments) {
+      if (editedTime >= cumulativeTime && editedTime <= cumulativeTime + segment.duration) {
+        // Calculate position within this segment
+        const segmentProgress = (editedTime - cumulativeTime) / segment.duration;
+        const sourceTime = segment.sourceStart + (segmentProgress * (segment.sourceEnd - segment.sourceStart));
+        
+        videoRef.current.currentTime = sourceTime;
+        setCurrentTime(sourceTime);
+        return;
+      }
+      cumulativeTime += segment.duration;
+    }
+  };
+
+  const getPlayheadPosition = (): number => {
+    if (!session) return 0;
+    
+    // Find which segment contains the current time
+    const currentSegment = session.timeline.find(
+      seg => currentTime >= seg.sourceStart && currentTime <= seg.sourceEnd
+    );
+    
+    if (!currentSegment) return 0;
+    
+    // Calculate position within the edited timeline
+    const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
+    const totalEditedDuration = sortedSegments.reduce((sum, seg) => sum + seg.duration, 0);
+    
+    let cumulativeTime = 0;
+    for (const segment of sortedSegments) {
+      if (segment.id === currentSegment.id) {
+        // Calculate progress within this segment
+        const segmentProgress = (currentTime - segment.sourceStart) / (segment.sourceEnd - segment.sourceStart);
+        const editedTime = cumulativeTime + (segmentProgress * segment.duration);
+        return (editedTime / totalEditedDuration) * 100;
+      }
+      cumulativeTime += segment.duration;
+    }
+    
+    return 0;
   };
 
   const handlePlayheadMouseDown = (e: React.MouseEvent) => {
@@ -213,10 +261,27 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const rect = timelineRef.current.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
     const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
-    const newTime = percentage * session.duration;
     
-    videoRef.current.currentTime = newTime;
-    setCurrentTime(newTime);
+    // Calculate time based on edited timeline
+    const totalEditedDuration = session.timeline.reduce((sum, seg) => sum + seg.duration, 0);
+    const editedTime = percentage * totalEditedDuration;
+    
+    // Find which segment this corresponds to and map to source time
+    const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
+    let cumulativeTime = 0;
+    
+    for (const segment of sortedSegments) {
+      if (editedTime >= cumulativeTime && editedTime <= cumulativeTime + segment.duration) {
+        // Calculate position within this segment
+        const segmentProgress = (editedTime - cumulativeTime) / segment.duration;
+        const sourceTime = segment.sourceStart + (segmentProgress * (segment.sourceEnd - segment.sourceStart));
+        
+        videoRef.current.currentTime = sourceTime;
+        setCurrentTime(sourceTime);
+        return;
+      }
+      cumulativeTime += segment.duration;
+    }
   };
 
   const handleMouseUp = () => {
@@ -367,6 +432,22 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         cumulativeTime += seg.duration;
         return adjusted;
       });
+    } else if (lastAction.type === 'MOVE') {
+      // Reverse move: restore original order
+      const movedSegment = newTimeline.find(s => s.id === lastAction.segmentId);
+      if (movedSegment) {
+        const currentIndex = newTimeline.findIndex(s => s.id === lastAction.segmentId);
+        const [removed] = newTimeline.splice(currentIndex, 1);
+        newTimeline.splice(lastAction.oldOrder, 0, removed);
+        
+        // Update order and positions
+        let cumulativeTime = 0;
+        newTimeline = newTimeline.map((seg, index) => {
+          const updated = { ...seg, order: index, timelineStart: cumulativeTime };
+          cumulativeTime += seg.duration;
+          return updated;
+        });
+      }
     }
     
     const updatedSession = {
@@ -428,6 +509,22 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         cumulativeTime += seg.duration;
         return adjusted;
       });
+    } else if (actionToRedo.type === 'MOVE') {
+      // Redo move: move to new order
+      const movedSegment = newTimeline.find(s => s.id === actionToRedo.segmentId);
+      if (movedSegment) {
+        const currentIndex = newTimeline.findIndex(s => s.id === actionToRedo.segmentId);
+        const [removed] = newTimeline.splice(currentIndex, 1);
+        newTimeline.splice(actionToRedo.newOrder, 0, removed);
+        
+        // Update order and positions
+        let cumulativeTime = 0;
+        newTimeline = newTimeline.map((seg, index) => {
+          const updated = { ...seg, order: index, timelineStart: cumulativeTime };
+          cumulativeTime += seg.duration;
+          return updated;
+        });
+      }
     }
     
     const updatedSession = {
@@ -450,7 +547,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     if (!session) return;
     
     const updatedTimeline = session.timeline.map(seg =>
-      seg.id === segmentId ? { ...seg, name: newName } : seg
+      seg.id === segmentId ? { ...seg, name: newName || undefined } : seg
     );
     
     const updatedSession = {
@@ -460,6 +557,139 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     
     setSession(updatedSession);
     sessionManager.saveSession(sessionId, updatedSession);
+  };
+
+  // Clips tab drag and drop handlers
+  const [draggedClipId, setDraggedClipId] = useState<string | null>(null);
+  const [dragOverClipId, setDragOverClipId] = useState<string | null>(null);
+  const [clipDropPosition, setClipDropPosition] = useState<'before' | 'after' | null>(null);
+
+  const handleClipDragStart = (segmentId: string, e: React.DragEvent) => {
+    console.log('🚀 Clip Drag Start:', segmentId);
+    setDraggedClipId(segmentId);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', segmentId);
+  };
+
+  const handleClipDragOver = (segmentId: string, e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    
+    console.log('🎯 Clip Drag Over:', segmentId);
+    
+    const rect = e.currentTarget.getBoundingClientRect();
+    const mouseY = e.clientY - rect.top;
+    const segmentHeight = rect.height;
+    
+    // Use vertical positioning for clips tab
+    const position: 'before' | 'after' = mouseY < segmentHeight / 2 ? 'before' : 'after';
+    console.log('📍 Clips position:', position, 'mouseY:', mouseY, 'height:', segmentHeight);
+    
+    setDragOverClipId(segmentId);
+    setClipDropPosition(position);
+  };
+
+  const handleClipDragLeave = (e: React.DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      console.log('👋 Clip Drag Leave');
+      setDragOverClipId(null);
+      setClipDropPosition(null);
+    }
+  };
+
+  const handleClipDrop = (targetSegmentId: string, e: React.DragEvent) => {
+    e.preventDefault();
+    console.log('🎯 Clip Drop event:', targetSegmentId, 'dragged:', draggedClipId);
+    
+    if (!session || !draggedClipId || draggedClipId === targetSegmentId) {
+      console.log('❌ Clip Drop cancelled: invalid state');
+      setDraggedClipId(null);
+      setDragOverClipId(null);
+      setClipDropPosition(null);
+      return;
+    }
+
+    // Sort timeline by current order to get correct positions
+    const sortedTimeline = [...session.timeline].sort((a, b) => a.order - b.order);
+    
+    // Find current positions
+    const draggedIndex = sortedTimeline.findIndex(seg => seg.id === draggedClipId);
+    const targetIndex = sortedTimeline.findIndex(seg => seg.id === targetSegmentId);
+    
+    console.log('🔄 Clips Drag & Drop Debug:');
+    console.log('Dragged:', sortedTimeline[draggedIndex]?.name || `Clip ${draggedIndex + 1}`, 'at index', draggedIndex);
+    console.log('Target:', sortedTimeline[targetIndex]?.name || `Clip ${targetIndex + 1}`, 'at index', targetIndex);
+    console.log('Drop position:', clipDropPosition);
+    console.log('📊 Before reorder:', sortedTimeline.map((seg, i) => `${seg.name || `Clip ${i + 1}`}(${i})`).join(' → '));
+    
+    if (draggedIndex === -1 || targetIndex === -1) {
+      console.log('❌ Clip Drop cancelled: segment not found');
+      setDraggedClipId(null);
+      setDragOverClipId(null);
+      setClipDropPosition(null);
+      return;
+    }
+
+    // Remove dragged segment
+    const [draggedSegment] = sortedTimeline.splice(draggedIndex, 1);
+    
+    // Calculate new insertion index
+    let newIndex = targetIndex;
+    
+    // Adjust for the removed item
+    if (draggedIndex < targetIndex) {
+      newIndex = targetIndex - 1;
+    }
+    
+    // Apply drop position (before/after)
+    if (clipDropPosition === 'after') {
+      newIndex = newIndex + 1;
+    }
+    
+    console.log('Calculated new index:', newIndex);
+    
+    // Insert at the new position
+    sortedTimeline.splice(newIndex, 0, draggedSegment);
+    
+    console.log('📈 After reorder:', sortedTimeline.map((seg, i) => `${seg.name || `Clip ${i + 1}`}(${i})`).join(' → '));
+    console.log('✅ Timeline will update automatically!');
+
+    // Update order property and recalculate timeline positions
+    let cumulativeTime = 0;
+    const reorderedTimeline = sortedTimeline.map((seg, index) => {
+      const updated = {
+        ...seg,
+        order: index,
+        timelineStart: cumulativeTime,
+      };
+      cumulativeTime += seg.duration;
+      return updated;
+    });
+
+    const updatedSession = {
+      ...session,
+      timeline: reorderedTimeline,
+      undoStack: [...session.undoStack, { 
+        type: 'MOVE' as const, 
+        segmentId: draggedClipId, 
+        oldOrder: draggedIndex, 
+        newOrder: newIndex
+      }],
+      redoStack: [],
+    };
+
+    setSession(updatedSession);
+    sessionManager.saveSession(sessionId, updatedSession);
+    setDraggedClipId(null);
+    setDragOverClipId(null);
+    setClipDropPosition(null);
+  };
+
+  const handleClipDragEnd = () => {
+    setDraggedClipId(null);
+    setDragOverClipId(null);
+    setClipDropPosition(null);
   };
 
   const getDeletedSections = () => {
@@ -724,18 +954,21 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           <div className="timeline">
             <div className="timeline-header">
               <span>Timeline</span>
-              <span className="timeline-time">{formatTime(currentTime)} / {formatTime(session.duration)}</span>
+              <span className="timeline-time">
+                {formatTime(currentTime)} / {formatTime(session.timeline.reduce((sum, seg) => sum + seg.duration, 0))}
+              </span>
             </div>
             <div className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`} ref={timelineRef} onClick={handleTimelineClick}>
               {/* Timestamp ruler */}
               <div className="timeline-ruler">
-                {Array.from({ length: 11 }).map((_, i) => {
-                  const time = (session.duration / 10) * i;
+                {Array.from({ length: 21 }).map((_, i) => {
+                  const totalEditedDuration = session.timeline.reduce((sum, seg) => sum + seg.duration, 0);
+                  const time = (totalEditedDuration / 20) * i;
                   return (
                     <div
                       key={i}
                       className="timeline-tick"
-                      style={{ left: `${i * 10}%` }}
+                      style={{ left: `${i * 5}%` }}
                     >
                       <span className="timeline-tick-label">{formatTime(time)}</span>
                     </div>
@@ -757,23 +990,34 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 ))}
                 
                 {/* Show active segments */}
-                {session.timeline.map((segment) => (
-                  <div
-                    key={segment.id}
-                    className={`timeline-segment ${selectedSegmentId === segment.id ? 'selected' : ''}`}
-                    style={{
-                      left: `${(segment.sourceStart / session.duration) * 100}%`,
-                      width: `${(segment.duration / session.duration) * 100}%`,
-                    }}
-                    onClick={(e) => handleSegmentClick(segment.id, e)}
-                  >
-                    <span className="segment-label">{segment.name || `Clip ${segment.order + 1}`}</span>
-                  </div>
-                ))}
+                {session.timeline
+                  .sort((a, b) => a.order - b.order)
+                  .map((segment, index, sortedSegments) => {
+                    // Calculate position based on order, not source time
+                    const totalDuration = sortedSegments.reduce((sum, seg) => sum + seg.duration, 0);
+                    let cumulativeTime = 0;
+                    for (let i = 0; i < index; i++) {
+                      cumulativeTime += sortedSegments[i].duration;
+                    }
+                    
+                    return (
+                      <div
+                        key={segment.id}
+                        className={`timeline-segment ${selectedSegmentId === segment.id ? 'selected' : ''}`}
+                        style={{
+                          left: `${(cumulativeTime / totalDuration) * 100}%`,
+                          width: `${(segment.duration / totalDuration) * 100}%`,
+                        }}
+                        onClick={(e) => handleSegmentClick(segment.id, e)}
+                      >
+                        <span className="segment-label">{segment.name || `Clip ${segment.order + 1}`}</span>
+                      </div>
+                    );
+                  })}
                 <div
                   className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
                   style={{
-                    left: `${(currentTime / session.duration) * 100}%`,
+                    left: `${getPlayheadPosition()}%`,
                   }}
                   onMouseDown={handlePlayheadMouseDown}
                 />
@@ -819,19 +1063,46 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                     .map((segment) => (
                       <div
                         key={segment.id}
-                        className={`clip-item ${selectedSegmentId === segment.id ? 'selected' : ''}`}
+                        className={`clip-item ${selectedSegmentId === segment.id ? 'selected' : ''} ${
+                          dragOverClipId === segment.id ? `drag-over drop-${clipDropPosition}` : ''
+                        }`}
+                        onDragOver={(e) => handleClipDragOver(segment.id, e)}
+                        onDragLeave={handleClipDragLeave}
+                        onDrop={(e) => handleClipDrop(segment.id, e)}
                         onClick={() => handleSegmentJump(segment)}
                       >
+                        <div 
+                          className="clip-drag-handle" 
+                          title="Drag to reorder"
+                          draggable
+                          onDragStart={(e) => handleClipDragStart(segment.id, e)}
+                          onDragEnd={handleClipDragEnd}
+                          onMouseDown={(e) => {
+                            // Ensure drag starts from handle
+                            e.stopPropagation();
+                          }}
+                        >
+                          ⋮⋮
+                        </div>
                         <div className="clip-header">
                           <input
                             type="text"
                             className="clip-name-input"
-                            value={segment.name || `Clip ${segment.order + 1}`}
+                            value={segment.name ?? ''}
                             onChange={(e) => {
                               e.stopPropagation();
                               handleClipRename(segment.id, e.target.value);
                             }}
                             onClick={(e) => e.stopPropagation()}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onDragStart={(e) => e.preventDefault()}
+                            onKeyDown={(e) => {
+                              e.stopPropagation();
+                              // Allow complete clearing with backspace
+                              if (e.key === 'Backspace' && e.currentTarget.value === '') {
+                                handleClipRename(segment.id, '');
+                              }
+                            }}
                             placeholder={`Clip ${segment.order + 1}`}
                           />
                           <span className="clip-duration">{formatTime(segment.duration)}</span>
@@ -846,6 +1117,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                               e.stopPropagation();
                               handleSegmentJump(segment);
                             }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onDragStart={(e) => e.preventDefault()}
                             disabled={seekingSegmentId === segment.id}
                           >
                             {seekingSegmentId === segment.id ? 'Seeking...' : 'Jump to'}
@@ -857,6 +1130,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                               setSelectedSegmentId(segment.id);
                               handleDelete();
                             }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onDragStart={(e) => e.preventDefault()}
                             disabled={seekingSegmentId !== null}
                           >
                             Delete
