@@ -3,7 +3,7 @@ FastAPI Backend for Video Editor
 Provides endpoints for video upload, transcription, and export
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import openai
@@ -14,6 +14,11 @@ import tempfile
 from typing import Optional
 from pydantic import BaseModel
 import subprocess
+import httpx
+from dotenv import load_dotenv
+
+# Load .env file from the backend directory
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 app = FastAPI(title="Video Editor API")
 
@@ -190,6 +195,58 @@ async def stream_video(session_id: str):
             return FileResponse(video_path)
     
     raise HTTPException(status_code=404, detail="Video not found")
+
+@app.get("/api/pixabay")
+async def pixabay_proxy(
+    type: str = Query("videos", description="'videos' or 'images'"),
+    q: str = Query("", description="Search query"),
+    per_page: int = Query(10, ge=3, le=200),
+    page: int = Query(1, ge=1),
+    safesearch: bool = Query(True),
+    image_type: Optional[str] = Query(None),
+):
+    """
+    Proxy endpoint for Pixabay API.
+    Reads PIXABAY_API_KEY from environment so the key is never exposed to the frontend.
+    """
+    api_key = os.getenv("PIXABAY_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="PIXABAY_API_KEY not configured. Set it in backend/.env"
+        )
+
+    if type == "videos":
+        url = "https://pixabay.com/api/videos/"
+    else:
+        url = "https://pixabay.com/api/"
+
+    params: dict = {
+        "key": api_key,
+        "q": q,
+        "per_page": per_page,
+        "page": page,
+        "safesearch": "true" if safesearch else "false",
+    }
+    if image_type:
+        params["image_type"] = image_type
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return JSONResponse(content=response.json())
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Pixabay API error: {e.response.text}"
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach Pixabay: {str(e)}"
+        )
+
 
 if __name__ == "__main__":
     import uvicorn

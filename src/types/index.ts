@@ -13,6 +13,8 @@ export interface TimelineSegment {
   duration: number;        // Segment duration (seconds)
   order: number;           // Sequence order in timeline
   name?: string;           // Optional custom name for the clip
+  assetUrl?: string;       // External asset URL (Pixabay video/photo)
+  assetKind?: 'video' | 'photo'; // Type of external asset
 }
 
 /**
