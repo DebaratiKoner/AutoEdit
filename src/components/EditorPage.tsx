@@ -123,11 +123,12 @@ function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   const fetchAssets = useCallback(async (
     query: string, currentFilter: AssetFilter, currentPage: number, append = false,
   ) => {
-    if (!query.trim() && currentFilter === 'all') return;
+    // Only fetch when there's an actual search term
+    if (!query.trim()) return;
     setIsLoading(true);
     setError(null);
     try {
-      const q = query.trim() || currentFilter;
+      const q = query.trim();
       let results: PixabayAsset[] = [];
       let hits = 0;
 
@@ -165,7 +166,7 @@ function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   }, []);
 
   useEffect(() => {
-    if (searchQuery.trim() || filter !== 'all') {
+    if (searchQuery.trim()) {
       setPage(1);
       fetchAssets(searchQuery, filter, 1, false);
     } else {
@@ -176,14 +177,15 @@ function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
 
   const handleFilterClick = (f: AssetFilter) => {
     setFilter(f);
-    if (f !== 'all' && f !== 'ai-generate') {
-      const label = f === 'photo' ? 'Photos' : f.charAt(0).toUpperCase() + f.slice(1);
-      setInputValue(label);
-      setSearchQuery(label);
-    } else if (f === 'all') {
+    // Never auto-fill the search bar with the filter name.
+    // Just clear results when switching to "All"; keep the current query otherwise
+    // so the user's typed keyword is re-used against the new filter type.
+    if (f === 'all') {
       setInputValue('');
       setSearchQuery('');
     }
+    // For video/photo/audio: keep inputValue/searchQuery as-is so the existing
+    // keyword is immediately re-fetched under the new filter.
   };
 
   const handleSearchSubmit = (e: React.FormEvent) => { e.preventDefault(); setSearchQuery(inputValue); };
@@ -274,7 +276,10 @@ function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
               <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
             </svg>
-            <p>No results found</p><p className="assets-empty-hint">Try a different search term</p>
+            {searchQuery
+              ? <><p>No results found</p><p className="assets-empty-hint">Try a different search term</p></>
+              : <><p>Search for {filter === 'photo' ? 'photos' : filter === 'video' ? 'videos' : 'assets'}</p>
+                  <p className="assets-empty-hint">Type a keyword above or pick a topic</p></>}
           </div>
         )}
         {!isLoading && !error && assets.length === 0 && !searchQuery && filter === 'all' && (
@@ -702,7 +707,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     if (!video) return;
     const onPlay  = () => { setIsPlaying(true);  isPlayingRef.current = true; };
     const onPause = () => {
-      // Ignore pause events that come from our own src-switch or photo handling
+      // Only sync state for user-initiated pauses (not our internal src-switch pauses)
+      // We check both flags: isSwitchingRef (src change) and photoModeRef (photo segment)
       if (isSwitchingRef.current || photoModeRef.current) return;
       setIsPlaying(false);
       isPlayingRef.current = false;
@@ -866,7 +872,13 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     sessionManager.saveSession(sessionId, updated);
   };
 
-  const handleSegmentClick = (segmentId: string, e: React.MouseEvent) => { e.stopPropagation(); setSelectedSegmentId(segmentId); };
+  const handleSegmentClick = (segmentId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSelectedSegmentId(segmentId);
+    // Also seek the playhead to the start of the clicked segment
+    const seg = sessionRef.current?.timeline.find(s => s.id === segmentId);
+    if (seg) seekToTimelinePos(seg.timelineStart);
+  };
 
   const handleClipRename = (segmentId: string, newName: string) => {
     if (!session) return;
@@ -893,9 +905,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const video = videoRef.current;
     if (!sess || !video) return;
 
-    const wasPlaying = !video.paused;
-    // Pause while we restructure the timeline
-    video.pause();
+    // Do NOT pause playback — the new segment is queued after the current one
+    // and will play automatically. Playback continues uninterrupted.
 
     const assetUrl = asset._kind === 'video'
       ? (asset.videos.small?.url || asset.videos.medium?.url || asset.videos.tiny?.url || '')
@@ -922,52 +933,24 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       // Photos always go at the end
       newTimeline = rebuildTimeline([...sess.timeline, { ...newSeg, order: sess.timeline.length }]);
     } else {
-      // Videos: insert at insertPos, splitting the host segment if needed
-      const resolved = resolveSegment(sess.timeline, insertPos);
+      // Videos: queue AFTER the end of the currently active segment so playback
+      // is never interrupted. Find the active segment and insert right after it.
+      const sorted = [...sess.timeline].sort((a, b) => a.order - b.order);
+      const activeSeg = sorted.find(s => s.id === activeSegIdRef.current);
 
-      if (!resolved) {
-        // Inserting at the very end
+      if (!activeSeg) {
+        // No active segment — append at the end
         newTimeline = rebuildTimeline([...sess.timeline, { ...newSeg, order: sess.timeline.length }]);
       } else {
-        const { segment: host, offsetInSegment } = resolved;
-        const beforeHost = sess.timeline.filter(s => s.order < host.order);
-        const afterHost  = sess.timeline.filter(s => s.order > host.order);
-
-        if (offsetInSegment < 0.05) {
-          // Insert right before the host segment
-          newTimeline = rebuildTimeline([
-            ...beforeHost,
-            { ...newSeg, order: host.order },
-            ...afterHost.concat([host]).map((s, i) => ({ ...s, order: host.order + 1 + i })),
-          ]);
-        } else if (offsetInSegment > host.duration - 0.05) {
-          // Insert right after the host segment
-          newTimeline = rebuildTimeline([
-            ...beforeHost,
-            host,
-            { ...newSeg, order: host.order + 1 },
-            ...afterHost.map((s, i) => ({ ...s, order: host.order + 2 + i })),
-          ]);
-        } else {
-          // Split the host segment and insert in the middle
-          const hostBefore: TimelineSegment = {
-            ...host, id: `${host.id}-b`,
-            sourceEnd: host.assetUrl ? host.sourceEnd : host.sourceStart + offsetInSegment,
-            duration: offsetInSegment,
-          };
-          const hostAfter: TimelineSegment = {
-            ...host, id: `${host.id}-a`,
-            sourceStart: host.assetUrl ? host.sourceStart : host.sourceStart + offsetInSegment,
-            duration: host.duration - offsetInSegment,
-          };
-          newTimeline = rebuildTimeline([
-            ...beforeHost,
-            hostBefore,
-            { ...newSeg, order: host.order + 1 },
-            hostAfter,
-            ...afterHost.map((s, i) => ({ ...s, order: host.order + 3 + i })),
-          ]);
-        }
+        // Insert immediately after the active segment
+        const insertAfterOrder = activeSeg.order;
+        const before = sorted.filter(s => s.order <= insertAfterOrder);
+        const after  = sorted.filter(s => s.order >  insertAfterOrder);
+        newTimeline = rebuildTimeline([
+          ...before,
+          { ...newSeg, order: insertAfterOrder + 1 },
+          ...after.map((s, i) => ({ ...s, order: insertAfterOrder + 2 + i })),
+        ]);
       }
     }
 
@@ -988,22 +971,12 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       redoStack: [],
     };
 
-    // 1. Update React state AND the ref immediately so the engine sees the new timeline
+    // Update React state AND the ref immediately so the engine sees the new timeline.
+    // Do NOT seek or interrupt playback — the new segment is queued after the current
+    // one and will play automatically when the engine advances to it.
     setSession(updatedSession);
     sessionRef.current = updatedSession;
     sessionManager.saveSession(sessionId, updatedSession);
-
-    // 2. Imperatively switch the video to the new segment at insertPos.
-    //    For a video asset inserted at insertPos, that segment starts at insertPos
-    //    in the new timeline, so offset = 0.
-    const newResolved = resolveSegment(newTimeline, insertPos);
-    if (newResolved) {
-      switchToSegment(newResolved.segment, newResolved.offsetInSegment, wasPlaying).then(() => {
-        timelinePosRef.current = insertPos;
-        setTimelinePos(insertPos);
-        if (wasPlaying) setIsPlaying(true);
-      });
-    }
   }, [switchToSegment, sessionId]);
 
   // ── Misc handlers ────────────────────────────────────────────────────────────
@@ -1099,7 +1072,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               onClick={() => {
                 const video = videoRef.current;
                 if (!video) return;
-                if (isPlayingRef.current || photoModeRef.current) {
+                if (!video.paused || photoModeRef.current) {
                   // ── Pause ──────────────────────────────────────────────────
                   // Stop the video FIRST, then freeze all state.
                   video.pause();
