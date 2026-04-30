@@ -1,13 +1,427 @@
-/**
+﻿/**
  * Editor Page Component
  * Main editing interface with video player, timeline, and controls
+ *
+ * Playback engine design:
+ * - A single <video> element is NEVER remounted (no key= on it).
+ * - `timelinePos` is the master clock: total seconds elapsed across all segments.
+ * - On every animationFrame tick the engine finds which segment owns that position,
+ *   switches the video src imperatively (only when it actually changes), seeks to
+ *   the right offset inside that segment, and keeps playing.
+ * - React state is only used for UI rendering, never to drive src/currentTime.
  */
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { SessionManager, APIClient } from '../services';
 import { formatTime } from '../utils';
 import type { SessionData, TimelineSegment } from '../types';
 import './EditorPage.css';
+
+const PIXABAY_PROXY = 'http://localhost:8000/api/pixabay';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type AssetFilter = 'all' | 'video' | 'photo' | 'audio' | 'ai-generate';
+
+interface PixabayVideo {
+  id: number; pageURL: string; type: string; tags: string; duration: number; picture_id: string;
+  videos: {
+    large: { url: string; width: number; height: number; size: number; thumbnail: string };
+    medium: { url: string; width: number; height: number; size: number; thumbnail: string };
+    small: { url: string; width: number; height: number; size: number; thumbnail: string };
+    tiny: { url: string; width: number; height: number; size: number; thumbnail: string };
+  };
+  views: number; downloads: number; likes: number; user: string; userImageURL: string;
+}
+
+interface PixabayPhoto {
+  id: number; pageURL: string; type: string; tags: string;
+  previewURL: string; previewWidth: number; previewHeight: number;
+  webformatURL: string; webformatWidth: number; webformatHeight: number;
+  largeImageURL: string; imageWidth: number; imageHeight: number; imageSize: number;
+  views: number; downloads: number; likes: number; user: string; userImageURL: string;
+}
+
+type PixabayAsset = (PixabayVideo & { _kind: 'video' }) | (PixabayPhoto & { _kind: 'photo' });
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function getVideoThumbnail(asset: PixabayVideo & { _kind: 'video' }): string {
+  return (
+    asset.videos.medium?.thumbnail ||
+    asset.videos.small?.thumbnail ||
+    asset.videos.tiny?.thumbnail ||
+    `https://i.vimeocdn.com/video/${asset.picture_id}_295x166.jpg`
+  );
+}
+
+/** Return total timeline duration (sum of all segment durations). */
+function totalDuration(timeline: TimelineSegment[]): number {
+  return timeline.reduce((s, seg) => s + seg.duration, 0);
+}
+
+/**
+ * Given a timeline position (seconds from start of the whole sequence),
+ * find which segment is active and how far into that segment we are.
+ */
+function resolveSegment(
+  timeline: TimelineSegment[],
+  pos: number,
+): { segment: TimelineSegment; offsetInSegment: number } | null {
+  const sorted = [...timeline].sort((a, b) => a.order - b.order);
+  let elapsed = 0;
+  for (const seg of sorted) {
+    if (pos >= elapsed && pos < elapsed + seg.duration) {
+      return { segment: seg, offsetInSegment: pos - elapsed };
+    }
+    elapsed += seg.duration;
+  }
+  return null;
+}
+
+/** Build a normalised timeline where timelineStart is always recalculated. */
+function rebuildTimeline(segs: TimelineSegment[]): TimelineSegment[] {
+  let t = 0;
+  return segs.map((seg, i) => {
+    const s = { ...seg, order: i, timelineStart: t };
+    t += seg.duration;
+    return s;
+  });
+}
+
+// ─── AssetsTab ────────────────────────────────────────────────────────────────
+
+interface AssetsTabProps {
+  onAddToTimeline: (asset: PixabayAsset, photoDuration?: number) => void;
+}
+
+function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
+  const [filter, setFilter] = useState<AssetFilter>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [inputValue, setInputValue] = useState('');
+  const [assets, setAssets] = useState<PixabayAsset[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [totalHits, setTotalHits] = useState(0);
+  const [previewAsset, setPreviewAsset] = useState<(PixabayVideo & { _kind: 'video' }) | null>(null);
+  const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
+  const [selectedAssetId, setSelectedAssetId] = useState<number | null>(null);
+  const [addedAssetIds, setAddedAssetIds] = useState<Set<number>>(new Set());
+  const [photoDurations, setPhotoDurations] = useState<Record<number, string>>({});
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const PER_PAGE = 10;
+
+  // Topic suggestions shown after a filter is selected
+  const TOPIC_SUGGESTIONS: Record<string, string[]> = {
+    video:  ['nature', 'technology', 'business', 'travel', 'food', 'sports', 'music', 'city', 'animals', 'education'],
+    photo:  ['nature', 'architecture', 'people', 'travel', 'food', 'fashion', 'abstract', 'animals', 'flowers', 'sky'],
+    audio:  ['ambient', 'music', 'sound effects', 'nature sounds', 'background', 'cinematic'],
+  };
+  const topics = TOPIC_SUGGESTIONS[filter] ?? [];
+
+  const fetchAssets = useCallback(async (
+    query: string, currentFilter: AssetFilter, currentPage: number, append = false,
+  ) => {
+    // Only fetch when there's an actual search term
+    if (!query.trim()) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const q = query.trim();
+      let results: PixabayAsset[] = [];
+      let hits = 0;
+
+      if (currentFilter === 'video' || currentFilter === 'all') {
+        const params = new URLSearchParams({
+          type: 'videos', q, per_page: String(PER_PAGE),
+          page: String(currentPage), safesearch: 'true',
+        });
+        const res = await fetch(`${PIXABAY_PROXY}?${params}`);
+        if (!res.ok) { const e = await res.json().catch(() => ({ detail: `HTTP ${res.status}` })); throw new Error(e.detail); }
+        const data = await res.json();
+        hits = data.totalHits ?? 0;
+        results = [...results, ...(data.hits ?? []).map((v: PixabayVideo) => ({ ...v, _kind: 'video' as const }))];
+      }
+
+      if (currentFilter === 'photo' || currentFilter === 'all') {
+        const params = new URLSearchParams({
+          type: 'images', q, per_page: String(PER_PAGE),
+          page: String(currentPage), safesearch: 'true', image_type: 'photo',
+        });
+        const res = await fetch(`${PIXABAY_PROXY}?${params}`);
+        if (!res.ok) { const e = await res.json().catch(() => ({ detail: `HTTP ${res.status}` })); throw new Error(e.detail); }
+        const data = await res.json();
+        if (currentFilter === 'photo') hits = data.totalHits ?? 0;
+        results = [...results, ...(data.hits ?? []).map((p: PixabayPhoto) => ({ ...p, _kind: 'photo' as const }))];
+      }
+
+      setTotalHits(hits);
+      setAssets(prev => append ? [...prev, ...results] : results);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch assets');
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (searchQuery.trim()) {
+      setPage(1);
+      fetchAssets(searchQuery, filter, 1, false);
+    } else {
+      setAssets([]);
+      setTotalHits(0);
+    }
+  }, [searchQuery, filter, fetchAssets]);
+
+  const handleFilterClick = (f: AssetFilter) => {
+    setFilter(f);
+    // Never auto-fill the search bar with the filter name.
+    // Just clear results when switching to "All"; keep the current query otherwise
+    // so the user's typed keyword is re-used against the new filter type.
+    if (f === 'all') {
+      setInputValue('');
+      setSearchQuery('');
+    }
+    // For video/photo/audio: keep inputValue/searchQuery as-is so the existing
+    // keyword is immediately re-fetched under the new filter.
+  };
+
+  const handleSearchSubmit = (e: React.FormEvent) => { e.preventDefault(); setSearchQuery(inputValue); };
+  const handleLoadMore = () => { const next = page + 1; setPage(next); fetchAssets(searchQuery, filter, next, true); };
+  const handleVideoClick = (asset: PixabayVideo & { _kind: 'video' }) => {
+    setSelectedAssetId(asset.id); setPreviewAsset(asset); setIsPreviewPlaying(true);
+  };
+  const handleClosePreview = () => {
+    setPreviewAsset(null); setIsPreviewPlaying(false); previewVideoRef.current?.pause();
+  };
+  const handlePreviewPlayPause = () => {
+    if (!previewVideoRef.current) return;
+    if (isPreviewPlaying) { previewVideoRef.current.pause(); } else { previewVideoRef.current.play(); }
+    setIsPreviewPlaying(!isPreviewPlaying);
+  };
+  const handleAddToTimeline = (asset: PixabayAsset, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const photoDuration = asset._kind === 'photo'
+      ? Math.max(1, parseFloat(photoDurations[asset.id] || '5') || 5)
+      : undefined;
+    onAddToTimeline(asset, photoDuration);
+    setAddedAssetIds(prev => new Set(prev).add(asset.id));
+  };
+
+  const filters: { key: AssetFilter; label: string }[] = [
+    { key: 'all', label: 'All' }, { key: 'video', label: 'Video' }, { key: 'audio', label: 'Audio' },
+    { key: 'photo', label: 'Photos' }, { key: 'ai-generate', label: '+ AI Generate' },
+  ];
+
+  const FALLBACK_SVG = 'data:image/svg+xml,%3Csvg xmlns%3D"http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg" width%3D"295" height%3D"166"%3E%3Crect width%3D"295" height%3D"166" fill%3D"%231a1a2e"%2F%3E%3Cpolygon points%3D"118%2C55 177%2C83 118%2C111" fill%3D"%234a90e2"%2F%3E%3C%2Fsvg%3E';
+
+  return (
+    <div className="assets-tab">
+      <div className="assets-header">
+        <form className="assets-search-form" onSubmit={handleSearchSubmit}>
+          <div className="assets-search-wrapper">
+            <svg className="assets-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="text" className="assets-search-input" placeholder="Search assets..."
+              value={inputValue} onChange={e => setInputValue(e.target.value)} />
+            {inputValue && (
+              <button type="button" className="assets-search-clear"
+                onClick={() => { setInputValue(''); setSearchQuery(''); setFilter('all'); }}>✕</button>
+            )}
+          </div>
+        </form>
+        <div className="assets-filters">
+          {filters.map(f => (
+            <button key={f.key}
+              className={`assets-filter-btn${filter === f.key ? ' active' : ''}${f.key === 'ai-generate' ? ' ai-generate' : ''}`}
+              onClick={() => handleFilterClick(f.key)}>
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Topic suggestion chips — shown when a filter with known topics is active */}
+        {topics.length > 0 && (
+          <div className="assets-topics">
+            {topics.map(topic => (
+              <button
+                key={topic}
+                className={`assets-topic-chip${searchQuery === topic ? ' active' : ''}`}
+                onClick={() => { setInputValue(topic); setSearchQuery(topic); }}
+              >
+                {topic}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="assets-results">
+        {isLoading && assets.length === 0 && (
+          <div className="assets-loading"><div className="assets-spinner"/><span>Fetching assets…</span></div>
+        )}
+        {error && (
+          <div className="assets-error">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <span>{error}</span>
+          </div>
+        )}
+        {!isLoading && !error && assets.length === 0 && (searchQuery || filter !== 'all') && (
+          <div className="assets-empty">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            {searchQuery
+              ? <><p>No results found</p><p className="assets-empty-hint">Try a different search term</p></>
+              : <><p>Search for {filter === 'photo' ? 'photos' : filter === 'video' ? 'videos' : 'assets'}</p>
+                  <p className="assets-empty-hint">Type a keyword above or pick a topic</p></>}
+          </div>
+        )}
+        {!isLoading && !error && assets.length === 0 && !searchQuery && filter === 'all' && (
+          <div className="assets-empty">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/>
+              <polyline points="21 15 16 10 5 21"/>
+            </svg>
+            <p>Search for assets</p>
+            <p className="assets-empty-hint">Use the search bar or select a filter above</p>
+          </div>
+        )}
+
+        {assets.length > 0 && (
+          <div className="assets-grid">
+            {assets.map(asset => (
+              <div key={`${asset._kind}-${asset.id}`}
+                className={`asset-card${selectedAssetId === asset.id ? ' selected' : ''}`}
+                onClick={() => asset._kind === 'video'
+                  ? handleVideoClick(asset as PixabayVideo & { _kind: 'video' })
+                  : setSelectedAssetId(asset.id)}>
+                <div className="asset-card-thumb">
+                  {asset._kind === 'video' ? (
+                    <>
+                      <img src={getVideoThumbnail(asset as PixabayVideo & { _kind: 'video' })}
+                        alt={asset.tags} loading="lazy"
+                        onError={e => {
+                          const img = e.target as HTMLImageElement;
+                          if (!img.dataset.fb) {
+                            img.dataset.fb = '1';
+                            img.src = `https://i.vimeocdn.com/video/${(asset as PixabayVideo).picture_id}_295x166.jpg`;
+                          } else { img.src = FALLBACK_SVG; }
+                        }}/>
+                      <div className="asset-card-play-overlay">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                          <polygon points="5 3 19 12 5 21 5 3"/>
+                        </svg>
+                      </div>
+                      <div className="asset-card-badge video">
+                        <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor">
+                          <polygon points="5 3 19 12 5 21 5 3"/>
+                        </svg>
+                        {(asset as PixabayVideo).duration}s
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <img src={(asset as PixabayPhoto).previewURL} alt={asset.tags} loading="lazy"/>
+                      <div className="asset-card-badge photo">Photo</div>
+                    </>
+                  )}
+                  {selectedAssetId === asset.id && (
+                    <div className="asset-card-selected-overlay">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                        <polyline points="20 6 9 17 4 12"/>
+                      </svg>
+                    </div>
+                  )}
+                </div>
+                <div className="asset-card-info">
+                  <p className="asset-card-tags">{asset.tags.split(',').slice(0, 3).join(', ')}</p>
+                  {asset._kind === 'photo' && (
+                    <div className="asset-photo-duration">
+                      <label className="asset-photo-duration-label">Duration (s):</label>
+                      <input type="number" className="asset-photo-duration-input" min="1" max="60" step="1"
+                        value={photoDurations[asset.id] ?? '5'}
+                        onClick={e => e.stopPropagation()}
+                        onChange={e => {
+                          e.stopPropagation();
+                          setPhotoDurations(prev => ({ ...prev, [asset.id]: e.target.value }));
+                          setAddedAssetIds(prev => { const s = new Set(prev); s.delete(asset.id); return s; });
+                        }}/>
+                    </div>
+                  )}
+                  <div className="asset-card-actions">
+                    {asset._kind === 'video' && (
+                      <button className="asset-preview-btn"
+                        onClick={e => { e.stopPropagation(); handleVideoClick(asset as PixabayVideo & { _kind: 'video' }); }}
+                        title="Preview video">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                          <polygon points="5 3 19 12 5 21 5 3"/>
+                        </svg>
+                        Preview
+                      </button>
+                    )}
+                    <button className={`asset-add-btn${addedAssetIds.has(asset.id) ? ' added' : ''}`}
+                      onClick={e => handleAddToTimeline(asset, e)} title="Add to timeline">
+                      {addedAssetIds.has(asset.id)
+                        ? <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>Added</>
+                        : <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add</>}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {assets.length > 0 && assets.length < totalHits && (
+          <button className="assets-load-more" onClick={handleLoadMore} disabled={isLoading}>
+            {isLoading
+              ? <><div className="assets-spinner-sm"/>Loading…</>
+              : `Load More (${assets.length} out of ${totalHits})`}
+          </button>
+        )}
+      </div>
+
+      {previewAsset && (
+        <div className="asset-preview-overlay" onClick={handleClosePreview}>
+          <div className="asset-preview-panel" onClick={e => e.stopPropagation()}>
+            <div className="asset-preview-header">
+              <span className="asset-preview-title">{previewAsset.tags.split(',')[0].trim()}</span>
+              <button className="asset-preview-close" onClick={handleClosePreview}>✕</button>
+            </div>
+            <div className="asset-preview-video-wrap">
+              <video ref={previewVideoRef}
+                src={previewAsset.videos.small?.url || previewAsset.videos.tiny?.url}
+                className="asset-preview-video" autoPlay loop
+                onPlay={() => setIsPreviewPlaying(true)}
+                onPause={() => setIsPreviewPlaying(false)}/>
+            </div>
+            <div className="asset-preview-controls">
+              <button className="asset-preview-playpause" onClick={handlePreviewPlayPause}>
+                {isPreviewPlaying
+                  ? <><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Pause</>
+                  : <><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>Play</>}
+              </button>
+              <button className={`asset-preview-add${addedAssetIds.has(previewAsset.id) ? ' added' : ''}`}
+                onClick={e => handleAddToTimeline(previewAsset, e)}>
+                {addedAssetIds.has(previewAsset.id)
+                  ? <><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>Added to Timeline</>
+                  : <><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add to Timeline</>}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── EditorPage ───────────────────────────────────────────────────────────────
 
 interface EditorPageProps {
   sessionId: string;
@@ -16,859 +430,608 @@ interface EditorPageProps {
 
 export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [session, setSession] = useState<SessionData | null>(null);
-  const [currentTime, setCurrentTime] = useState(0);
+
+  // timelinePos = master clock in "timeline seconds" (0 … totalDuration)
+  const [timelinePos, setTimelinePos] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+
   const [activeTab, setActiveTab] = useState<'clips' | 'ai-edit' | 'assets'>('clips');
   const [showResetDialog, setShowResetDialog] = useState(false);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [seekingSegmentId, setSeekingSegmentId] = useState<string | null>(null);
+
+  // The segment currently loaded into the <video> element
+  const [displaySegId, setDisplaySegId] = useState<string | null>(null);
+  // When showing a photo asset we overlay an <img> instead
+  const [photoOverlay, setPhotoOverlay] = useState<{ url: string; name: string } | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
-
   const sessionManager = new SessionManager();
 
-  useEffect(() => {
-    loadSession();
-  }, [sessionId]);
+  // Refs used inside the RAF loop (avoid stale closures)
+  const sessionRef = useRef<SessionData | null>(null);
+  const timelinePosRef = useRef(0);
+  const isPlayingRef = useRef(false);
+  const currentSrcRef = useRef<string>('');   // src currently loaded in <video>
+  const isSwitchingRef = useRef(false);        // true while we're loading a new src
 
-  useEffect(() => {
-    // Handle playback to skip deleted segments
-    if (!session || !videoRef.current) return;
+  // Keep refs in sync
+  useEffect(() => { sessionRef.current = session; }, [session]);
+  useEffect(() => { timelinePosRef.current = timelinePos; }, [timelinePos]);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
 
-    const video = videoRef.current;
-    
-    const handleTimeUpdate = () => {
-      const currentVideoTime = video.currentTime;
-      setCurrentTime(currentVideoTime);
-      
-      // Check if current time is within any timeline segment
-      const currentSegment = session.timeline.find(
-        seg => currentVideoTime >= seg.sourceStart && currentVideoTime < seg.sourceEnd
-      );
-      
-      if (!currentSegment && !video.paused) {
-        // Current time is in a deleted section, jump to next segment
-        const nextSegment = session.timeline.find(seg => seg.sourceStart > currentVideoTime);
-        
-        if (nextSegment) {
-          video.currentTime = nextSegment.sourceStart;
-        } else {
-          // No more segments, reset to start of first segment
-          video.pause();
-          setIsPlaying(false);
-          
-          const firstSegment = session.timeline.sort((a, b) => a.order - b.order)[0];
-          if (firstSegment) {
-            video.currentTime = firstSegment.sourceStart;
-            setCurrentTime(firstSegment.sourceStart);
-          }
-        }
-      }
-    };
-    
-    video.addEventListener('timeupdate', handleTimeUpdate);
-    
-    return () => {
-      video.removeEventListener('timeupdate', handleTimeUpdate);
-    };
-  }, [session]);
+  // ── Session loading ──────────────────────────────────────────────────────────
+
+  useEffect(() => { loadSession(); }, [sessionId]);
 
   const loadSession = async () => {
     const data = await sessionManager.loadSession(sessionId);
-    if (data) {
-      setSession(data);
-    } else {
-      // Try to load the uploaded video from IndexedDB
-      try {
-        const db = await openVideoDatabase();
-        const transaction = db.transaction(['videos'], 'readonly');
-        const store = transaction.objectStore('videos');
-        const request = store.get(sessionId);
-        
-        request.onsuccess = async () => {
-          const result = request.result;
-          
-          if (result && result.file) {
-            // Create blob URL from the stored file
-            const videoUrl = URL.createObjectURL(result.file);
-            
-            // Get video metadata
-            const video = document.createElement('video');
-            video.preload = 'metadata';
-            
-            video.onloadedmetadata = async () => {
-              const duration = video.duration;
-              const width = video.videoWidth;
-              const height = video.videoHeight;
-              
-              const mockSession: SessionData = {
-                sessionId,
-                videoUrl,
-                duration,
-                resolution: { width, height },
-                timeline: [
-                  {
-                    id: '1',
-                    sourceStart: 0,
-                    sourceEnd: duration,
-                    timelineStart: 0,
-                    duration,
-                    order: 0,
-                  },
-                ],
-                transcript: null,
-                undoStack: [],
-                redoStack: [],
-                lastModified: Date.now(),
-              };
-              
-              setSession(mockSession);
-              await sessionManager.saveSession(sessionId, mockSession);
+    if (data) { setSession(data); return; }
+    try {
+      const db = await openVideoDatabase();
+      const tx = db.transaction(['videos'], 'readonly');
+      const req = tx.objectStore('videos').get(sessionId);
+      req.onsuccess = async () => {
+        const result = req.result;
+        if (result?.file) {
+          const videoUrl = URL.createObjectURL(result.file);
+          const v = document.createElement('video');
+          v.preload = 'metadata';
+          v.onloadedmetadata = async () => {
+            const s: SessionData = {
+              sessionId, videoUrl, duration: v.duration,
+              resolution: { width: v.videoWidth, height: v.videoHeight },
+              timeline: [{ id: '1', sourceStart: 0, sourceEnd: v.duration, timelineStart: 0, duration: v.duration, order: 0 }],
+              transcript: null, undoStack: [], redoStack: [], lastModified: Date.now(),
             };
-            
-            video.src = videoUrl;
-          } else {
-            // Fallback to sample video
-            loadSampleVideo();
-          }
-        };
-        
-        request.onerror = () => {
-          loadSampleVideo();
-        };
-      } catch (error) {
-        console.error('Failed to load video from IndexedDB:', error);
-        loadSampleVideo();
-      }
-    }
+            setSession(s);
+            await sessionManager.saveSession(sessionId, s);
+          };
+          v.src = videoUrl;
+        } else { loadSampleVideo(); }
+      };
+      req.onerror = () => loadSampleVideo();
+    } catch { loadSampleVideo(); }
   };
 
   const loadSampleVideo = async () => {
-    const mockSession: SessionData = {
+    const s: SessionData = {
       sessionId,
       videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
-      duration: 596,
-      resolution: { width: 1920, height: 1080 },
-      timeline: [
-        {
-          id: '1',
-          sourceStart: 0,
-          sourceEnd: 596,
-          timelineStart: 0,
-          duration: 596,
-          order: 0,
-        },
-      ],
-      transcript: null,
-      undoStack: [],
-      redoStack: [],
-      lastModified: Date.now(),
+      duration: 596, resolution: { width: 1920, height: 1080 },
+      timeline: [{ id: '1', sourceStart: 0, sourceEnd: 596, timelineStart: 0, duration: 596, order: 0 }],
+      transcript: null, undoStack: [], redoStack: [], lastModified: Date.now(),
     };
-    setSession(mockSession);
-    await sessionManager.saveSession(sessionId, mockSession);
+    setSession(s);
+    await sessionManager.saveSession(sessionId, s);
   };
 
-  const openVideoDatabase = (): Promise<IDBDatabase> => {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open('VideoEditorDB', 1);
-      
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-      
-      request.onupgradeneeded = (event) => {
-        const db = (event.target as IDBOpenDBRequest).result;
-        if (!db.objectStoreNames.contains('videos')) {
-          db.createObjectStore('videos', { keyPath: 'id' });
-        }
+  const openVideoDatabase = (): Promise<IDBDatabase> =>
+    new Promise((resolve, reject) => {
+      const req = indexedDB.open('VideoEditorDB', 1);
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => resolve(req.result);
+      req.onupgradeneeded = e => {
+        const db = (e.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains('videos')) db.createObjectStore('videos', { keyPath: 'id' });
       };
     });
-  };
 
-  const handlePlayPause = () => {
-    setIsPlaying(!isPlaying);
-  };
+  // ── Playback engine ──────────────────────────────────────────────────────────
+  //
+  // A single requestAnimationFrame loop runs for the entire lifetime of the
+  // component. It always re-queues itself — there is no start/stop logic.
+  //
+  // activeSegIdRef  — ID of the segment currently playing.
+  // segStartTimeRef — video.currentTime that maps to offset=0 of this segment.
+  // photoModeRef    — true while a photo segment is the active segment.
+  // advancingRef    — guard: true while advanceToNextSegment is in-flight,
+  //                   prevents the RAF tick from firing it multiple times.
+
+  const activeSegIdRef    = useRef<string>('');
+  const segStartTimeRef   = useRef<number>(0);
+  const photoModeRef      = useRef<boolean>(false);
+  const photoStartWallRef = useRef<number>(0);
+  const photoStartPosRef  = useRef<number>(0);
+  const photoDurationRef  = useRef<number>(0);
+  const rafRef            = useRef<number | null>(null);
+  const advancingRef      = useRef<boolean>(false); // guard against double-advance
+
+  const advanceToNextSegmentRef = useRef<(segId: string) => void>(() => {});
+
+  // The RAF tick — always running, reads only refs, never stale.
+  const rafTick = useCallback(() => {
+    rafRef.current = requestAnimationFrame(rafTick); // always re-queue first
+
+    const video = videoRef.current;
+    const sess  = sessionRef.current;
+    if (!video || !sess) return;
+
+    const sorted = [...sess.timeline].sort((a, b) => a.order - b.order);
+    const activeSeg = sorted.find(s => s.id === activeSegIdRef.current);
+    if (!activeSeg) return;
+
+    if (photoModeRef.current) {
+      // ── Photo: wall-clock drives position ──────────────────────────────────
+      const elapsed = (Date.now() - photoStartWallRef.current) / 1000;
+      const newPos  = Math.min(
+        photoStartPosRef.current + elapsed,
+        activeSeg.timelineStart + activeSeg.duration,
+      );
+      timelinePosRef.current = newPos;
+      setTimelinePos(newPos);
+
+      if (elapsed >= photoDurationRef.current && !advancingRef.current) {
+        advancingRef.current = true;
+        photoModeRef.current = false;
+        advanceToNextSegmentRef.current(activeSeg.id);
+      }
+    } else {
+      // ── Video: video.currentTime drives position ───────────────────────────
+      if (isSwitchingRef.current) return; // mid-switch, skip this frame
+
+      const offsetInSeg = video.currentTime - segStartTimeRef.current;
+      if (offsetInSeg < 0) return; // seeking backwards
+
+      // Clamp so timelinePos never exceeds total duration
+      const tlTotal = sorted.reduce((s, seg) => s + seg.duration, 0);
+      const newPos  = Math.min(activeSeg.timelineStart + offsetInSeg, tlTotal);
+      timelinePosRef.current = newPos;
+      setTimelinePos(newPos);
+
+      // Segment boundary — fire once per boundary using advancingRef guard
+      if (!video.paused && offsetInSeg >= activeSeg.duration - 0.08 && !advancingRef.current) {
+        advancingRef.current = true;
+        advanceToNextSegmentRef.current(activeSeg.id);
+      }
+    }
+  }, []); // zero deps — everything read from refs
+
+  // Start the loop once on mount; it never stops until unmount.
+  useEffect(() => {
+    rafRef.current = requestAnimationFrame(rafTick);
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    };
+  }, [rafTick]);
+
+  /**
+   * Switch the active segment. Loads a new src if needed, seeks, then plays.
+   * For photos: pauses the video, shows the overlay, starts wall-clock tracking.
+   */
+  const switchToSegment = useCallback(async (
+    seg: TimelineSegment,
+    offsetInSegment: number,
+    shouldPlay: boolean,
+  ) => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // ── Photo segment ────────────────────────────────────────────────────────
+    if (seg.assetKind === 'photo' && seg.assetUrl) {
+      video.pause();
+      isSwitchingRef.current = false;
+
+      activeSegIdRef.current    = seg.id;
+      photoModeRef.current      = true;
+      photoStartPosRef.current  = seg.timelineStart + offsetInSegment;
+      photoDurationRef.current  = seg.duration - offsetInSegment;
+      photoStartWallRef.current = Date.now();
+      advancingRef.current      = false; // ready for next boundary
+
+      setDisplaySegId(seg.id);
+      setPhotoOverlay({ url: seg.assetUrl, name: seg.name ?? 'Photo' });
+
+      if (shouldPlay) {
+        setIsPlaying(true);
+        isPlayingRef.current = true;
+      }
+      return;
+    }
+
+    // ── Video segment ────────────────────────────────────────────────────────
+    photoModeRef.current = false;
+    setPhotoOverlay(null);
+    isSwitchingRef.current = true;
+
+    const targetSrc  = seg.assetUrl ?? sessionRef.current?.videoUrl ?? '';
+    const srcStart   = seg.assetUrl ? 0 : seg.sourceStart;
+    const targetTime = srcStart + offsetInSegment;
+
+    if (video.src !== targetSrc) {
+      // Temporarily suppress onPause so it doesn't clear isPlayingRef
+      isSwitchingRef.current = true;
+      video.pause();
+      video.src = targetSrc;
+      currentSrcRef.current = targetSrc;
+      video.load();
+      await new Promise<void>(resolve => {
+        const onReady = () => { video.removeEventListener('canplay', onReady); resolve(); };
+        video.addEventListener('canplay', onReady);
+        setTimeout(resolve, 3000);
+      });
+    }
+
+    if (Math.abs(video.currentTime - targetTime) > 0.15) {
+      video.currentTime = targetTime;
+      await new Promise<void>(resolve => {
+        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+        video.addEventListener('seeked', onSeeked);
+        setTimeout(resolve, 1000);
+      });
+    }
+
+    activeSegIdRef.current  = seg.id;
+    segStartTimeRef.current = srcStart;
+    isSwitchingRef.current  = false;
+    advancingRef.current    = false; // ready for next boundary
+    setDisplaySegId(seg.id);
+
+    if (shouldPlay) {
+      video.play().catch(() => {});
+    }
+  }, []); // no deps — reads everything from refs
+
+  // Wire advanceToNextSegmentRef after switchToSegment is stable
+  useEffect(() => {
+    advanceToNextSegmentRef.current = (segId: string) => {
+      const sess = sessionRef.current;
+      if (!sess) return;
+      const sorted = [...sess.timeline].sort((a, b) => a.order - b.order);
+      const cur    = sorted.find(s => s.id === segId);
+      if (!cur) return;
+      const next = sorted.find(s => s.order === cur.order + 1);
+      if (next) {
+        // Pass the captured playing state — don't read isPlayingRef here
+        // because onPause may have already cleared it during src switch
+        switchToSegment(next, 0, true);
+      } else {
+        // End of timeline
+        photoModeRef.current = false;
+        advancingRef.current = false;
+        videoRef.current?.pause();
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        setPhotoOverlay(null);
+      }
+    };
+  }, [switchToSegment]);
+
+  // Keep isPlaying state in sync with the video element.
+  // isSwitchingRef guards against onPause clearing the flag during src changes.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onPlay  = () => { setIsPlaying(true);  isPlayingRef.current = true; };
+    const onPause = () => {
+      // Only sync state for user-initiated pauses (not our internal src-switch pauses)
+      // We check both flags: isSwitchingRef (src change) and photoModeRef (photo segment)
+      if (isSwitchingRef.current || photoModeRef.current) return;
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+    };
+    video.addEventListener('play',  onPlay);
+    video.addEventListener('pause', onPause);
+    return () => { video.removeEventListener('play', onPlay); video.removeEventListener('pause', onPause); };
+  }, []);
+
+  // Prime the video when the session first loads
+  useEffect(() => {
+    if (!session) return;
+    const sorted = [...session.timeline].sort((a, b) => a.order - b.order);
+    const first  = sorted[0];
+    if (!first) return;
+
+    const src      = first.assetUrl ?? session.videoUrl;
+    const srcStart = first.assetUrl ? 0 : first.sourceStart;
+
+    activeSegIdRef.current  = first.id;
+    segStartTimeRef.current = srcStart;
+    photoModeRef.current    = false;
+    advancingRef.current    = false;
+    setDisplaySegId(first.id);
+
+    const video = videoRef.current;
+    if (video && currentSrcRef.current !== src) {
+      video.src = src;
+      currentSrcRef.current = src;
+      video.load();
+      video.addEventListener('canplay', () => { video.currentTime = srcStart; }, { once: true });
+    }
+  }, [session?.sessionId]);
+
+  // ── Timeline click / drag ────────────────────────────────────────────────────
+
+  const seekToTimelinePos = useCallback(async (pos: number) => {
+    const sess = sessionRef.current;
+    if (!sess) return;
+    const clamped = Math.max(0, Math.min(pos, totalDuration(sess.timeline)));
+    const resolved = resolveSegment(sess.timeline, clamped);
+    if (!resolved) return;
+    timelinePosRef.current = clamped;
+    setTimelinePos(clamped);
+    await switchToSegment(resolved.segment, resolved.offsetInSegment, isPlayingRef.current);
+  }, [switchToSegment]);
 
   const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!session || !videoRef.current || isDraggingPlayhead) return;
-    
-    // Don't handle click if click is on a segment
-    if (e.target !== e.currentTarget) return;
-    
+    if (!session || isDraggingPlayhead) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const percentage = clickX / rect.width;
-    
-    // Calculate time based on edited timeline, not original video
-    const totalEditedDuration = session.timeline.reduce((sum, seg) => sum + seg.duration, 0);
-    const editedTime = percentage * totalEditedDuration;
-    
-    // Find which segment this corresponds to and map to source time
-    const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
-    let cumulativeTime = 0;
-    
-    for (const segment of sortedSegments) {
-      if (editedTime >= cumulativeTime && editedTime <= cumulativeTime + segment.duration) {
-        // Calculate position within this segment
-        const segmentProgress = (editedTime - cumulativeTime) / segment.duration;
-        const sourceTime = segment.sourceStart + (segmentProgress * (segment.sourceEnd - segment.sourceStart));
-        
-        videoRef.current.currentTime = sourceTime;
-        setCurrentTime(sourceTime);
-        return;
-      }
-      cumulativeTime += segment.duration;
-    }
+    const pct = (e.clientX - rect.left) / rect.width;
+    seekToTimelinePos(pct * totalDuration(session.timeline));
   };
 
-  const getPlayheadPosition = (): number => {
-    if (!session) return 0;
-    
-    // Find which segment contains the current time
-    const currentSegment = session.timeline.find(
-      seg => currentTime >= seg.sourceStart && currentTime <= seg.sourceEnd
-    );
-    
-    if (!currentSegment) return 0;
-    
-    // Calculate position within the edited timeline
-    const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
-    const totalEditedDuration = sortedSegments.reduce((sum, seg) => sum + seg.duration, 0);
-    
-    let cumulativeTime = 0;
-    for (const segment of sortedSegments) {
-      if (segment.id === currentSegment.id) {
-        // Calculate progress within this segment
-        const segmentProgress = (currentTime - segment.sourceStart) / (segment.sourceEnd - segment.sourceStart);
-        const editedTime = cumulativeTime + (segmentProgress * segment.duration);
-        return (editedTime / totalEditedDuration) * 100;
-      }
-      cumulativeTime += segment.duration;
-    }
-    
-    return 0;
-  };
+  const handlePlayheadMouseDown = (e: React.MouseEvent) => { e.stopPropagation(); setIsDraggingPlayhead(true); };
 
-  const handlePlayheadMouseDown = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setIsDraggingPlayhead(true);
-  };
-
-  const handleMouseMove = (e: MouseEvent) => {
-    if (!isDraggingPlayhead || !session || !videoRef.current || !timelineRef.current) return;
-    
+  const handleMouseMove = useCallback((e: MouseEvent) => {
+    if (!isDraggingPlayhead || !session || !timelineRef.current) return;
     const rect = timelineRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
-    
-    // Calculate time based on edited timeline
-    const totalEditedDuration = session.timeline.reduce((sum, seg) => sum + seg.duration, 0);
-    const editedTime = percentage * totalEditedDuration;
-    
-    // Find which segment this corresponds to and map to source time
-    const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
-    let cumulativeTime = 0;
-    
-    for (const segment of sortedSegments) {
-      if (editedTime >= cumulativeTime && editedTime <= cumulativeTime + segment.duration) {
-        // Calculate position within this segment
-        const segmentProgress = (editedTime - cumulativeTime) / segment.duration;
-        const sourceTime = segment.sourceStart + (segmentProgress * (segment.sourceEnd - segment.sourceStart));
-        
-        videoRef.current.currentTime = sourceTime;
-        setCurrentTime(sourceTime);
-        return;
-      }
-      cumulativeTime += segment.duration;
-    }
-  };
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    seekToTimelinePos(pct * totalDuration(session.timeline));
+  }, [isDraggingPlayhead, session, seekToTimelinePos]);
 
-  const handleMouseUp = () => {
-    setIsDraggingPlayhead(false);
-  };
+  const handleMouseUp = useCallback(() => setIsDraggingPlayhead(false), []);
 
   useEffect(() => {
     if (isDraggingPlayhead) {
       window.addEventListener('mousemove', handleMouseMove);
       window.addEventListener('mouseup', handleMouseUp);
-      
-      return () => {
-        window.removeEventListener('mousemove', handleMouseMove);
-        window.removeEventListener('mouseup', handleMouseUp);
-      };
+      return () => { window.removeEventListener('mousemove', handleMouseMove); window.removeEventListener('mouseup', handleMouseUp); };
     }
-  }, [isDraggingPlayhead, session]);
+  }, [isDraggingPlayhead, handleMouseMove, handleMouseUp]);
+
+  // ── Edit operations ──────────────────────────────────────────────────────────
 
   const handleCut = () => {
     if (!session) return;
-    
-    // Find which segment contains the current time
-    const segmentToCut = session.timeline.find(
-      seg => currentTime >= seg.sourceStart && currentTime <= seg.sourceEnd
-    );
-    
-    if (!segmentToCut || currentTime === segmentToCut.sourceStart || currentTime === segmentToCut.sourceEnd) {
-      alert('Cannot cut at segment boundaries. Please position the playhead within a segment.');
-      return;
+    const pos = timelinePosRef.current;
+    const resolved = resolveSegment(session.timeline, pos);
+    if (!resolved || resolved.offsetInSegment < 0.05 || resolved.offsetInSegment > resolved.segment.duration - 0.05) {
+      alert('Position the playhead inside a segment to cut.'); return;
     }
-    
-    // Create two new segments from the cut
-    const segment1: TimelineSegment = {
-      id: `${segmentToCut.id}-1`,
-      sourceStart: segmentToCut.sourceStart,
-      sourceEnd: currentTime,
-      timelineStart: segmentToCut.timelineStart,
-      duration: currentTime - segmentToCut.sourceStart,
-      order: segmentToCut.order,
+    const { segment: seg, offsetInSegment } = resolved;
+    const s1: TimelineSegment = {
+      ...seg, id: `${seg.id}-1`,
+      sourceEnd: seg.assetUrl ? seg.sourceEnd : seg.sourceStart + offsetInSegment,
+      duration: offsetInSegment,
     };
-    
-    const segment2: TimelineSegment = {
-      id: `${segmentToCut.id}-2`,
-      sourceStart: currentTime,
-      sourceEnd: segmentToCut.sourceEnd,
-      timelineStart: segmentToCut.timelineStart + segment1.duration,
-      duration: segmentToCut.sourceEnd - currentTime,
-      order: segmentToCut.order + 1,
+    const s2: TimelineSegment = {
+      ...seg, id: `${seg.id}-2`,
+      sourceStart: seg.assetUrl ? seg.sourceStart : seg.sourceStart + offsetInSegment,
+      duration: seg.duration - offsetInSegment,
     };
-    
-    // Update timeline: remove old segment, add two new ones, reorder
-    const newTimeline = session.timeline
-      .filter(seg => seg.id !== segmentToCut.id)
-      .concat([segment1, segment2])
-      .map((seg, index) => ({ ...seg, order: index }))
-      .sort((a, b) => a.order - b.order);
-    
-    // Save to undo stack
-    const updatedSession = {
-      ...session,
-      timeline: newTimeline,
-      undoStack: [...session.undoStack, { type: 'CUT' as const, segmentId: segmentToCut.id, cutTime: currentTime, newSegmentId: segment2.id }],
+    const newTimeline = rebuildTimeline(
+      session.timeline.filter(s => s.id !== seg.id).concat([s1, s2]).sort((a, b) => a.order - b.order),
+    );
+    const updated = {
+      ...session, timeline: newTimeline,
+      undoStack: [...session.undoStack, { type: 'CUT' as const, segmentId: seg.id, cutTime: pos, newSegmentId: s2.id }],
       redoStack: [],
     };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    setSession(updated);
+    sessionManager.saveSession(sessionId, updated);
   };
 
   const handleDelete = () => {
-    if (!session || !selectedSegmentId) {
-      alert('Please select a segment to delete by clicking on it in the timeline.');
-      return;
-    }
-    
-    const segmentToDelete = session.timeline.find(seg => seg.id === selectedSegmentId);
-    if (!segmentToDelete) return;
-    
-    if (session.timeline.length === 1) {
-      alert('Cannot delete the last segment.');
-      return;
-    }
-    
-    // Remove segment and reorder
-    const newTimeline = session.timeline
-      .filter(seg => seg.id !== selectedSegmentId)
-      .map((seg, index) => ({ ...seg, order: index }))
-      .sort((a, b) => a.order - b.order);
-    
-    // Recalculate timeline positions
-    let cumulativeTime = 0;
-    const adjustedTimeline = newTimeline.map(seg => {
-      const adjusted = { ...seg, timelineStart: cumulativeTime };
-      cumulativeTime += seg.duration;
-      return adjusted;
-    });
-    
-    // Save to undo stack
-    const updatedSession = {
-      ...session,
-      timeline: adjustedTimeline,
-      undoStack: [...session.undoStack, { type: 'DELETE' as const, segment: segmentToDelete }],
+    if (!session || !selectedSegmentId) { alert('Select a segment to delete.'); return; }
+    if (session.timeline.length === 1) { alert('Cannot delete the last segment.'); return; }
+    const seg = session.timeline.find(s => s.id === selectedSegmentId);
+    if (!seg) return;
+    const newTimeline = rebuildTimeline(session.timeline.filter(s => s.id !== selectedSegmentId));
+    const updated = {
+      ...session, timeline: newTimeline,
+      undoStack: [...session.undoStack, { type: 'DELETE' as const, segment: seg }],
       redoStack: [],
     };
-    
-    setSession(updatedSession);
+    setSession(updated);
     setSelectedSegmentId(null);
-    sessionManager.saveSession(sessionId, updatedSession);
+    sessionManager.saveSession(sessionId, updated);
   };
 
   const handleUndo = () => {
     if (!session || session.undoStack.length === 0) return;
-    
-    const lastAction = session.undoStack[session.undoStack.length - 1];
-    let newTimeline = [...session.timeline];
-    
-    if (lastAction.type === 'CUT') {
-      // Reverse cut: merge the two segments back
-      const seg1 = newTimeline.find(s => s.id === `${lastAction.segmentId}-1`);
-      const seg2 = newTimeline.find(s => s.id === `${lastAction.segmentId}-2`);
-      
-      if (seg1 && seg2) {
+    const last = session.undoStack[session.undoStack.length - 1];
+    let tl = [...session.timeline];
+    if (last.type === 'CUT') {
+      const s1 = tl.find(s => s.id === `${last.segmentId}-1`);
+      const s2 = tl.find(s => s.id === `${last.segmentId}-2`);
+      if (s1 && s2) {
         const merged: TimelineSegment = {
-          id: lastAction.segmentId,
-          sourceStart: seg1.sourceStart,
-          sourceEnd: seg2.sourceEnd,
-          timelineStart: seg1.timelineStart,
-          duration: seg1.duration + seg2.duration,
-          order: seg1.order,
+          ...s1, id: last.segmentId,
+          sourceEnd: s2.sourceEnd, duration: s1.duration + s2.duration,
         };
-        
-        newTimeline = newTimeline
-          .filter(s => s.id !== seg1.id && s.id !== seg2.id)
-          .concat([merged])
-          .map((seg, index) => ({ ...seg, order: index }))
-          .sort((a, b) => a.order - b.order);
+        tl = rebuildTimeline(tl.filter(s => s.id !== s1.id && s.id !== s2.id).concat([merged]).sort((a, b) => a.order - b.order));
       }
-    } else if (lastAction.type === 'DELETE') {
-      // Reverse delete: restore the segment
-      newTimeline = [...newTimeline, lastAction.segment]
-        .sort((a, b) => a.order - b.order)
-        .map((seg, index) => ({ ...seg, order: index }));
-      
-      // Recalculate timeline positions
-      let cumulativeTime = 0;
-      newTimeline = newTimeline.map(seg => {
-        const adjusted = { ...seg, timelineStart: cumulativeTime };
-        cumulativeTime += seg.duration;
-        return adjusted;
-      });
-    } else if (lastAction.type === 'MOVE') {
-      // Reverse move: restore original order
-      const movedSegment = newTimeline.find(s => s.id === lastAction.segmentId);
-      if (movedSegment) {
-        const currentIndex = newTimeline.findIndex(s => s.id === lastAction.segmentId);
-        const [removed] = newTimeline.splice(currentIndex, 1);
-        newTimeline.splice(lastAction.oldOrder, 0, removed);
-        
-        // Update order and positions
-        let cumulativeTime = 0;
-        newTimeline = newTimeline.map((seg, index) => {
-          const updated = { ...seg, order: index, timelineStart: cumulativeTime };
-          cumulativeTime += seg.duration;
-          return updated;
-        });
-      }
+    } else if (last.type === 'DELETE') {
+      tl = rebuildTimeline([...tl, last.segment].sort((a, b) => a.order - b.order));
     }
-    
-    const updatedSession = {
-      ...session,
-      timeline: newTimeline,
-      undoStack: session.undoStack.slice(0, -1),
-      redoStack: [...session.redoStack, lastAction],
-    };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    const updated = { ...session, timeline: tl, undoStack: session.undoStack.slice(0, -1), redoStack: [...session.redoStack, last] };
+    setSession(updated);
+    sessionManager.saveSession(sessionId, updated);
   };
 
   const handleRedo = () => {
     if (!session || session.redoStack.length === 0) return;
-    
-    const actionToRedo = session.redoStack[session.redoStack.length - 1];
-    let newTimeline = [...session.timeline];
-    
-    if (actionToRedo.type === 'CUT') {
-      // Redo cut
-      const segmentToCut = newTimeline.find(s => s.id === actionToRedo.segmentId);
-      if (segmentToCut) {
-        const segment1: TimelineSegment = {
-          id: `${segmentToCut.id}-1`,
-          sourceStart: segmentToCut.sourceStart,
-          sourceEnd: actionToRedo.cutTime,
-          timelineStart: segmentToCut.timelineStart,
-          duration: actionToRedo.cutTime - segmentToCut.sourceStart,
-          order: segmentToCut.order,
-        };
-        
-        const segment2: TimelineSegment = {
-          id: `${segmentToCut.id}-2`,
-          sourceStart: actionToRedo.cutTime,
-          sourceEnd: segmentToCut.sourceEnd,
-          timelineStart: segmentToCut.timelineStart + segment1.duration,
-          duration: segmentToCut.sourceEnd - actionToRedo.cutTime,
-          order: segmentToCut.order + 1,
-        };
-        
-        newTimeline = newTimeline
-          .filter(s => s.id !== segmentToCut.id)
-          .concat([segment1, segment2])
-          .map((seg, index) => ({ ...seg, order: index }))
-          .sort((a, b) => a.order - b.order);
+    const action = session.redoStack[session.redoStack.length - 1];
+    let tl = [...session.timeline];
+    if (action.type === 'CUT') {
+      const seg = tl.find(s => s.id === action.segmentId);
+      if (seg) {
+        const offset = action.cutTime - seg.timelineStart;
+        const s1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: seg.sourceStart + offset, duration: offset };
+        const s2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: seg.sourceStart + offset, duration: seg.duration - offset };
+        tl = rebuildTimeline(tl.filter(s => s.id !== seg.id).concat([s1, s2]).sort((a, b) => a.order - b.order));
       }
-    } else if (actionToRedo.type === 'DELETE') {
-      // Redo delete
-      newTimeline = newTimeline
-        .filter(s => s.id !== actionToRedo.segment.id)
-        .map((seg, index) => ({ ...seg, order: index }))
-        .sort((a, b) => a.order - b.order);
-      
-      // Recalculate timeline positions
-      let cumulativeTime = 0;
-      newTimeline = newTimeline.map(seg => {
-        const adjusted = { ...seg, timelineStart: cumulativeTime };
-        cumulativeTime += seg.duration;
-        return adjusted;
-      });
-    } else if (actionToRedo.type === 'MOVE') {
-      // Redo move: move to new order
-      const movedSegment = newTimeline.find(s => s.id === actionToRedo.segmentId);
-      if (movedSegment) {
-        const currentIndex = newTimeline.findIndex(s => s.id === actionToRedo.segmentId);
-        const [removed] = newTimeline.splice(currentIndex, 1);
-        newTimeline.splice(actionToRedo.newOrder, 0, removed);
-        
-        // Update order and positions
-        let cumulativeTime = 0;
-        newTimeline = newTimeline.map((seg, index) => {
-          const updated = { ...seg, order: index, timelineStart: cumulativeTime };
-          cumulativeTime += seg.duration;
-          return updated;
-        });
-      }
+    } else if (action.type === 'DELETE') {
+      tl = rebuildTimeline(tl.filter(s => s.id !== action.segment.id).sort((a, b) => a.order - b.order));
     }
-    
-    const updatedSession = {
-      ...session,
-      timeline: newTimeline,
-      undoStack: [...session.undoStack, actionToRedo],
-      redoStack: session.redoStack.slice(0, -1),
-    };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    const updated = { ...session, timeline: tl, undoStack: [...session.undoStack, action], redoStack: session.redoStack.slice(0, -1) };
+    setSession(updated);
+    sessionManager.saveSession(sessionId, updated);
   };
 
   const handleSegmentClick = (segmentId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setSelectedSegmentId(segmentId);
+    // Also seek the playhead to the start of the clicked segment
+    const seg = sessionRef.current?.timeline.find(s => s.id === segmentId);
+    if (seg) seekToTimelinePos(seg.timelineStart);
   };
 
   const handleClipRename = (segmentId: string, newName: string) => {
     if (!session) return;
-    
-    const updatedTimeline = session.timeline.map(seg =>
-      seg.id === segmentId ? { ...seg, name: newName || undefined } : seg
-    );
-    
-    const updatedSession = {
-      ...session,
-      timeline: updatedTimeline,
+    const updated = { ...session, timeline: session.timeline.map(s => s.id === segmentId ? { ...s, name: newName } : s) };
+    setSession(updated);
+    sessionManager.saveSession(sessionId, updated);
+  };
+
+  const handleSegmentJump = async (segment: TimelineSegment) => {
+    setSeekingSegmentId(segment.id);
+    setSelectedSegmentId(segment.id);
+    await seekToTimelinePos(segment.timelineStart);
+    setSeekingSegmentId(null);
+  };
+
+  // ── Add asset to timeline ────────────────────────────────────────────────────
+  //
+  // Key invariant: after inserting, the master clock (timelinePos) stays at the
+  // same logical position — the start of the newly inserted segment — and the
+  // video continues playing from there without any restart.
+
+  const handleAddAssetToTimeline = useCallback((asset: PixabayAsset, photoDuration?: number) => {
+    const sess = sessionRef.current;
+    const video = videoRef.current;
+    if (!sess || !video) return;
+
+    // Do NOT pause playback — the new segment is queued after the current one
+    // and will play automatically. Playback continues uninterrupted.
+
+    const assetUrl = asset._kind === 'video'
+      ? (asset.videos.small?.url || asset.videos.medium?.url || asset.videos.tiny?.url || '')
+      : (asset as PixabayPhoto).webformatURL;
+    const assetDuration = asset._kind === 'video' ? (asset as PixabayVideo).duration : (photoDuration ?? 5);
+
+    const insertPos = timelinePosRef.current; // where the playhead is right now
+
+    // Build the new segment
+    const newSeg: TimelineSegment = {
+      id: `asset-${asset._kind}-${asset.id}-${Date.now()}`,
+      sourceStart: 0, sourceEnd: assetDuration,
+      timelineStart: insertPos, // will be recalculated by rebuildTimeline
+      duration: assetDuration,
+      order: 0, // will be recalculated
+      name: asset.tags.split(',')[0].trim() || `${asset._kind} asset`,
+      assetUrl,
+      assetKind: asset._kind,
     };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
-  };
 
-  // Clips tab drag and drop handlers
-  const [draggedClipId, setDraggedClipId] = useState<string | null>(null);
-  const [dragOverClipId, setDragOverClipId] = useState<string | null>(null);
-  const [clipDropPosition, setClipDropPosition] = useState<'before' | 'after' | null>(null);
+    let newTimeline: TimelineSegment[];
 
-  const handleClipDragStart = (segmentId: string, e: React.DragEvent) => {
-    console.log('🚀 Clip Drag Start:', segmentId);
-    setDraggedClipId(segmentId);
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', segmentId);
-  };
+    if (asset._kind === 'photo') {
+      // Photos always go at the end
+      newTimeline = rebuildTimeline([...sess.timeline, { ...newSeg, order: sess.timeline.length }]);
+    } else {
+      // Videos: queue AFTER the end of the currently active segment so playback
+      // is never interrupted. Find the active segment and insert right after it.
+      const sorted = [...sess.timeline].sort((a, b) => a.order - b.order);
+      const activeSeg = sorted.find(s => s.id === activeSegIdRef.current);
 
-  const handleClipDragOver = (segmentId: string, e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    e.dataTransfer.dropEffect = 'move';
-    
-    console.log('🎯 Clip Drag Over:', segmentId);
-    
-    const rect = e.currentTarget.getBoundingClientRect();
-    const mouseY = e.clientY - rect.top;
-    const segmentHeight = rect.height;
-    
-    // Use vertical positioning for clips tab
-    const position: 'before' | 'after' = mouseY < segmentHeight / 2 ? 'before' : 'after';
-    console.log('📍 Clips position:', position, 'mouseY:', mouseY, 'height:', segmentHeight);
-    
-    setDragOverClipId(segmentId);
-    setClipDropPosition(position);
-  };
-
-  const handleClipDragLeave = (e: React.DragEvent) => {
-    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-      console.log('👋 Clip Drag Leave');
-      setDragOverClipId(null);
-      setClipDropPosition(null);
-    }
-  };
-
-  const handleClipDrop = (targetSegmentId: string, e: React.DragEvent) => {
-    e.preventDefault();
-    console.log('🎯 Clip Drop event:', targetSegmentId, 'dragged:', draggedClipId);
-    
-    if (!session || !draggedClipId || draggedClipId === targetSegmentId) {
-      console.log('❌ Clip Drop cancelled: invalid state');
-      setDraggedClipId(null);
-      setDragOverClipId(null);
-      setClipDropPosition(null);
-      return;
+      if (!activeSeg) {
+        // No active segment — append at the end
+        newTimeline = rebuildTimeline([...sess.timeline, { ...newSeg, order: sess.timeline.length }]);
+      } else {
+        // Insert immediately after the active segment
+        const insertAfterOrder = activeSeg.order;
+        const before = sorted.filter(s => s.order <= insertAfterOrder);
+        const after  = sorted.filter(s => s.order >  insertAfterOrder);
+        newTimeline = rebuildTimeline([
+          ...before,
+          { ...newSeg, order: insertAfterOrder + 1 },
+          ...after.map((s, i) => ({ ...s, order: insertAfterOrder + 2 + i })),
+        ]);
+      }
     }
 
-    // Sort timeline by current order to get correct positions
-    const sortedTimeline = [...session.timeline].sort((a, b) => a.order - b.order);
-    
-    // Find current positions
-    const draggedIndex = sortedTimeline.findIndex(seg => seg.id === draggedClipId);
-    const targetIndex = sortedTimeline.findIndex(seg => seg.id === targetSegmentId);
-    
-    console.log('🔄 Clips Drag & Drop Debug:');
-    console.log('Dragged:', sortedTimeline[draggedIndex]?.name || `Clip ${draggedIndex + 1}`, 'at index', draggedIndex);
-    console.log('Target:', sortedTimeline[targetIndex]?.name || `Clip ${targetIndex + 1}`, 'at index', targetIndex);
-    console.log('Drop position:', clipDropPosition);
-    console.log('📊 Before reorder:', sortedTimeline.map((seg, i) => `${seg.name || `Clip ${i + 1}`}(${i})`).join(' → '));
-    
-    if (draggedIndex === -1 || targetIndex === -1) {
-      console.log('❌ Clip Drop cancelled: segment not found');
-      setDraggedClipId(null);
-      setDragOverClipId(null);
-      setClipDropPosition(null);
-      return;
-    }
+    // The new total duration
+    const newTotal = totalDuration(newTimeline);
 
-    // Remove dragged segment
-    const [draggedSegment] = sortedTimeline.splice(draggedIndex, 1);
-    
-    // Calculate new insertion index
-    let newIndex = targetIndex;
-    
-    // Adjust for the removed item
-    if (draggedIndex < targetIndex) {
-      newIndex = targetIndex - 1;
-    }
-    
-    // Apply drop position (before/after)
-    if (clipDropPosition === 'after') {
-      newIndex = newIndex + 1;
-    }
-    
-    console.log('Calculated new index:', newIndex);
-    
-    // Insert at the new position
-    sortedTimeline.splice(newIndex, 0, draggedSegment);
-    
-    console.log('📈 After reorder:', sortedTimeline.map((seg, i) => `${seg.name || `Clip ${i + 1}`}(${i})`).join(' → '));
-    console.log('✅ Timeline will update automatically!');
-
-    // Update order property and recalculate timeline positions
-    let cumulativeTime = 0;
-    const reorderedTimeline = sortedTimeline.map((seg, index) => {
-      const updated = {
-        ...seg,
-        order: index,
-        timelineStart: cumulativeTime,
-      };
-      cumulativeTime += seg.duration;
-      return updated;
-    });
-
-    const updatedSession = {
-      ...session,
-      timeline: reorderedTimeline,
-      undoStack: [...session.undoStack, { 
-        type: 'MOVE' as const, 
-        segmentId: draggedClipId, 
-        oldOrder: draggedIndex, 
-        newOrder: newIndex
+    const updatedSession: SessionData = {
+      ...sess,
+      timeline: newTimeline,
+      // Keep session.duration in sync so the ruler is correct
+      duration: newTotal,
+      undoStack: [...sess.undoStack, {
+        type: 'CUT' as const,
+        segmentId: '',
+        cutTime: insertPos,
+        newSegmentId: newSeg.id,
       }],
       redoStack: [],
     };
 
+    // Update React state AND the ref immediately so the engine sees the new timeline.
+    // Do NOT seek or interrupt playback — the new segment is queued after the current
+    // one and will play automatically when the engine advances to it.
     setSession(updatedSession);
+    sessionRef.current = updatedSession;
     sessionManager.saveSession(sessionId, updatedSession);
-    setDraggedClipId(null);
-    setDragOverClipId(null);
-    setClipDropPosition(null);
-  };
+  }, [switchToSegment, sessionId]);
 
-  const handleClipDragEnd = () => {
-    setDraggedClipId(null);
-    setDragOverClipId(null);
-    setClipDropPosition(null);
-  };
+  // ── Misc handlers ────────────────────────────────────────────────────────────
 
-  const getDeletedSections = () => {
-    if (!session) return [];
-    
-    const deletedSections: Array<{ start: number; duration: number }> = [];
-    const sortedSegments = [...session.timeline].sort((a, b) => a.sourceStart - b.sourceStart);
-    
-    // Check for gaps between segments (deleted sections)
-    for (let i = 0; i < sortedSegments.length; i++) {
-      const currentSegment = sortedSegments[i];
-      const nextSegment = sortedSegments[i + 1];
-      
-      // Check gap before first segment
-      if (i === 0 && currentSegment.sourceStart > 0) {
-        deletedSections.push({
-          start: 0,
-          duration: currentSegment.sourceStart,
-        });
-      }
-      
-      // Check gap between segments
-      if (nextSegment && currentSegment.sourceEnd < nextSegment.sourceStart) {
-        deletedSections.push({
-          start: currentSegment.sourceEnd,
-          duration: nextSegment.sourceStart - currentSegment.sourceEnd,
-        });
-      }
-      
-      // Check gap after last segment
-      if (i === sortedSegments.length - 1 && currentSegment.sourceEnd < session.duration) {
-        deletedSections.push({
-          start: currentSegment.sourceEnd,
-          duration: session.duration - currentSegment.sourceEnd,
-        });
-      }
-    }
-    
-    return deletedSections;
-  };
-
-  const handleExport = () => {
-    alert('Export functionality will be implemented');
-  };
+  const handleExport = () => alert('Export functionality will be implemented');
 
   const handleTranscribe = async () => {
     if (!session) return;
-    
     setIsTranscribing(true);
-    
     try {
-      // Call the real Whisper API backend
       const apiClient = new APIClient('http://localhost:8000/api');
       const response = await apiClient.transcribeVideo(session.sessionId);
-      
-      // Format the transcript with timestamps if segments are available
-      let formattedTranscript = response.transcript;
-      
-      if (response.segments && response.segments.length > 0) {
-        formattedTranscript = response.segments
-          .map((seg: any) => {
-            const startTime = formatTime(seg.start);
-            const endTime = formatTime(seg.end);
-            return `[${startTime} - ${endTime}] ${seg.text}`;
-          })
-          .join('\n\n');
+      let formatted = response.transcript;
+      if (response.segments?.length > 0) {
+        formatted = response.segments.map((seg: { start: number; end: number; text: string }) =>
+          `[${formatTime(seg.start)} - ${formatTime(seg.end)}] ${seg.text}`
+        ).join('\n\n');
       }
-      
-      const updatedSession = {
-        ...session,
-        transcript: formattedTranscript,
-      };
-      
-      setSession(updatedSession);
-      await sessionManager.saveSession(sessionId, updatedSession);
-      setIsTranscribing(false);
+      const updated = { ...session, transcript: formatted };
+      setSession(updated);
+      await sessionManager.saveSession(sessionId, updated);
     } catch (error) {
-      console.error('Transcription failed:', error);
-      setIsTranscribing(false);
-      
-      // Show error message to user
-      let errorMessage = 'Transcription failed. ';
-      
+      let msg = 'Transcription failed. ';
       if (error instanceof Error) {
-        if (error.message.includes('OpenAI API key')) {
-          errorMessage += 'OpenAI API key not configured. Please set OPENAI_API_KEY in backend/.env';
-        } else if (error.message.includes('Video file not found')) {
-          errorMessage += 'Video file not found. Please upload the video to the backend first.';
-        } else if (error.message.includes('Connection failed')) {
-          errorMessage += 'Cannot connect to backend. Make sure the backend server is running on http://localhost:8000';
-        } else {
-          errorMessage += error.message;
-        }
+        if (error.message.includes('OpenAI API key')) msg += 'OpenAI API key not configured.';
+        else if (error.message.includes('Video file not found')) msg += 'Video file not found on backend.';
+        else if (error.message.includes('Connection failed')) msg += 'Cannot connect to backend.';
+        else msg += error.message;
       }
-      
-      alert(errorMessage);
-    }
+      alert(msg);
+    } finally { setIsTranscribing(false); }
   };
 
   const handleTranscriptChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (!session) return;
-    
-    const updatedSession = {
-      ...session,
-      transcript: e.target.value,
-    };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
-  };
-
-  const handleSegmentJump = async (segment: TimelineSegment) => {
-    if (!videoRef.current) return;
-    
-    const video = videoRef.current;
-    const wasPlaying = !video.paused;
-    
-    // Check if we're already at the target position (within 0.1 seconds)
-    const isAlreadyAtPosition = Math.abs(video.currentTime - segment.sourceStart) < 0.1;
-    
-    if (isAlreadyAtPosition) {
-      // Already at position, just select the segment
-      setSelectedSegmentId(segment.id);
-      return;
-    }
-    
-    // Show seeking indicator for this specific segment
-    setSeekingSegmentId(segment.id);
-    
-    // Pause first to avoid playback issues during seek
-    video.pause();
-    
-    // Set the time
-    video.currentTime = segment.sourceStart;
-    setCurrentTime(segment.sourceStart);
-    setSelectedSegmentId(segment.id);
-    
-    // Wait for seek to complete
-    await new Promise<void>((resolve) => {
-      const onSeeked = () => {
-        video.removeEventListener('seeked', onSeeked);
-        resolve();
-      };
-      video.addEventListener('seeked', onSeeked);
-      
-      // Timeout fallback
-      setTimeout(resolve, 500);
-    });
-    
-    // Hide seeking indicator
-    setSeekingSegmentId(null);
-    
-    // Resume playback if it was playing before
-    if (wasPlaying) {
-      try {
-        await video.play();
-        setIsPlaying(true);
-      } catch (error) {
-        console.log('Could not resume playback');
-      }
-    }
+    const updated = { ...session, transcript: e.target.value };
+    setSession(updated);
+    sessionManager.saveSession(sessionId, updated);
   };
 
   const handleResetConfirm = async () => {
-    if (session) {
-      await sessionManager.clearSession(session.sessionId);
-    }
+    if (session) await sessionManager.clearSession(session.sessionId);
     setShowResetDialog(false);
-    if (onReset) {
-      onReset();
-    }
+    if (onReset) onReset();
   };
 
+  // ── Derived values for rendering ─────────────────────────────────────────────
+
+  const tlTotal = session ? totalDuration(session.timeline) : 0;
+  const playheadPct = tlTotal > 0 ? (timelinePos / tlTotal) * 100 : 0;
+
+  // ── Render ───────────────────────────────────────────────────────────────────
+
   if (!session) {
-    return (
-      <div className="editor-page">
-        <div className="loading">Loading session...</div>
-      </div>
-    );
+    return <div className="editor-page"><div className="loading">Loading session…</div></div>;
   }
 
   return (
@@ -876,149 +1039,176 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       <header className="editor-header">
         <div className="header-left">
           <h1>AutoEdit</h1>
-          <span className="session-id">Session: {sessionId.substring(0, 8)}...</span>
         </div>
         <div className="header-right">
-          <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
-            Reset
-          </button>
-          <button className="btn btn-primary" onClick={handleExport}>
-            Export
-          </button>
+          <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>Reset</button>
+          <button className="btn btn-primary" onClick={handleExport}>Export</button>
         </div>
       </header>
 
       <div className="editor-content">
         <main className="editor-main">
-          {/* Video Player */}
           <div className="video-player">
+            {/* Single <video> element — never remounted, no native controls */}
             <video
               ref={videoRef}
-              src={session.videoUrl}
-              controls
               className="video-element"
               crossOrigin="anonymous"
               preload="auto"
-            >
-              Your browser does not support the video tag.
-            </video>
+            />
+            {/* Photo overlay rendered on top when active segment is a photo */}
+            {photoOverlay && (
+              <div className="video-photo-preview">
+                <img src={photoOverlay.url} alt={photoOverlay.name} className="video-photo-img"/>
+                <div className="video-photo-label">{photoOverlay.name}</div>
+              </div>
+            )}
           </div>
 
-          {/* Editing Controls */}
+          {/* ── Custom player controls showing MERGED timeline time ── */}
+          <div className="player-controls">
+            <button
+              className="player-btn"
+              onClick={() => {
+                const video = videoRef.current;
+                if (!video) return;
+                if (!video.paused || photoModeRef.current) {
+                  // ── Pause ──────────────────────────────────────────────────
+                  // Stop the video FIRST, then freeze all state.
+                  video.pause();
+
+                  const frozenPos = timelinePosRef.current;
+                  photoModeRef.current = false;
+                  advancingRef.current = false;
+                  isPlayingRef.current = false;
+
+                  // Keep the video-mode formula stable at frozenPos after pause:
+                  // newPos = activeSeg.timelineStart + (video.currentTime - segStartTimeRef)
+                  // Adjust segStartTimeRef so this always equals frozenPos.
+                  const sess = sessionRef.current;
+                  if (sess) {
+                    const activeSeg = sess.timeline.find(s => s.id === activeSegIdRef.current);
+                    if (activeSeg) {
+                      segStartTimeRef.current = video.currentTime - (frozenPos - activeSeg.timelineStart);
+                    }
+                  }
+
+                  setIsPlaying(false);
+                  setTimelinePos(frozenPos);
+                  timelinePosRef.current = frozenPos;
+                } else {
+                  // ── Play ───────────────────────────────────────────────────
+                  const sess = sessionRef.current;
+                  if (!sess) return;
+                  const resolved = resolveSegment(sess.timeline, timelinePosRef.current);
+                  if (resolved) {
+                    switchToSegment(resolved.segment, resolved.offsetInSegment, true);
+                  }
+                }
+              }}
+              title={isPlaying ? 'Pause' : 'Play'}
+            >
+              {isPlaying
+                ? <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                : <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>}
+            </button>
+
+            <span className="player-time">
+              {formatTime(timelinePos)} / {formatTime(tlTotal)}
+            </span>
+
+            {/* Scrubber — maps to merged timeline, not raw video time */}
+            <div
+              className="player-scrubber"
+              onClick={e => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                seekToTimelinePos(pct * tlTotal);
+              }}
+            >
+              <div className="player-scrubber-track">
+                <div
+                  className="player-scrubber-fill"
+                  style={{ width: `${tlTotal > 0 ? (timelinePos / tlTotal) * 100 : 0}%` }}
+                />
+                <div
+                  className="player-scrubber-thumb"
+                  style={{ left: `${tlTotal > 0 ? (timelinePos / tlTotal) * 100 : 0}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
           <div className="editing-controls">
-            <button className="btn btn-icon" title="Cut at playhead position" onClick={handleCut}>
+            <button className="btn btn-icon" title="Cut at playhead" onClick={handleCut}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="6" cy="6" r="3" />
-                <circle cx="6" cy="18" r="3" />
-                <line x1="20" y1="4" x2="8.12" y2="15.88" />
-                <line x1="14.47" y1="14.48" x2="20" y2="20" />
-                <line x1="8.12" y1="8.12" x2="12" y2="12" />
+                <circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
+                <line x1="20" y1="4" x2="8.12" y2="15.88"/>
+                <line x1="14.47" y1="14.48" x2="20" y2="20"/>
+                <line x1="8.12" y1="8.12" x2="12" y2="12"/>
               </svg>
             </button>
-            <button 
-              className="btn btn-icon" 
-              title="Delete selected segment" 
-              onClick={handleDelete}
-              disabled={!selectedSegmentId}
-            >
+            <button className="btn btn-icon" title="Delete selected segment" onClick={handleDelete} disabled={!selectedSegmentId}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                <polyline points="3 6 5 6 21 6"/>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
               </svg>
             </button>
-            <button 
-              className="btn btn-icon" 
-              title="Undo last action" 
-              onClick={handleUndo}
-              disabled={!session || session.undoStack.length === 0}
-            >
+            <button className="btn btn-icon" title="Undo" onClick={handleUndo} disabled={session.undoStack.length === 0}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polyline points="1 4 1 10 7 10" />
-                <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+                <polyline points="1 4 1 10 7 10"/>
+                <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
               </svg>
             </button>
-            <button 
-              className="btn btn-icon" 
-              title="Redo last undone action" 
-              onClick={handleRedo}
-              disabled={!session || session.redoStack.length === 0}
-            >
+            <button className="btn btn-icon" title="Redo" onClick={handleRedo} disabled={session.redoStack.length === 0}>
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polyline points="23 4 23 10 17 10" />
-                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
               </svg>
             </button>
           </div>
 
-          {/* Timeline */}
           <div className="timeline">
             <div className="timeline-header">
               <span>Timeline</span>
-              <span className="timeline-time">
-                {formatTime(currentTime)} / {formatTime(session.timeline.reduce((sum, seg) => sum + seg.duration, 0))}
-              </span>
+              <span className="timeline-time">{formatTime(timelinePos)} / {formatTime(tlTotal)}</span>
             </div>
-            <div className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`} ref={timelineRef} onClick={handleTimelineClick}>
-              {/* Timestamp ruler */}
+            <div
+              className={`timeline-content${isDraggingPlayhead ? ' dragging' : ''}`}
+              ref={timelineRef}
+              onClick={handleTimelineClick}
+            >
               <div className="timeline-ruler">
-                {Array.from({ length: 21 }).map((_, i) => {
-                  const totalEditedDuration = session.timeline.reduce((sum, seg) => sum + seg.duration, 0);
-                  const time = (totalEditedDuration / 20) * i;
+                {Array.from({ length: 11 }).map((_, i) => (
+                  <div key={i} className="timeline-tick" style={{ left: `${i * 10}%` }}>
+                    <span className="timeline-tick-label">{formatTime((tlTotal / 10) * i)}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="timeline-track">
+                {[...session.timeline].sort((a, b) => a.order - b.order).map(seg => {
+                  const left  = tlTotal > 0 ? (seg.timelineStart / tlTotal) * 100 : 0;
+                  const width = tlTotal > 0 ? (seg.duration / tlTotal) * 100 : 0;
+                  const isActive = displaySegId === seg.id;
                   return (
-                    <div
-                      key={i}
-                      className="timeline-tick"
-                      style={{ left: `${i * 5}%` }}
-                    >
-                      <span className="timeline-tick-label">{formatTime(time)}</span>
+                    <div key={seg.id}
+                      className={[
+                        'timeline-segment',
+                        selectedSegmentId === seg.id ? 'selected' : '',
+                        seg.assetKind === 'video' ? 'asset-video' : '',
+                        seg.assetKind === 'photo' ? 'asset-photo' : '',
+                        isActive ? 'active' : '',
+                      ].filter(Boolean).join(' ')}
+                      style={{ left: `${left}%`, width: `${Math.max(width, 0.5)}%` }}
+                      onClick={e => handleSegmentClick(seg.id, e)}>
+                      <span className="segment-label">{seg.name || `Clip ${seg.order + 1}`}</span>
                     </div>
                   );
                 })}
-              </div>
-              
-              <div className="timeline-track">
-                {/* Show deleted sections in gray */}
-                {getDeletedSections().map((section, index) => (
-                  <div
-                    key={`deleted-${index}`}
-                    className="timeline-deleted"
-                    style={{
-                      left: `${(section.start / session.duration) * 100}%`,
-                      width: `${(section.duration / session.duration) * 100}%`,
-                    }}
-                  />
-                ))}
-                
-                {/* Show active segments */}
-                {session.timeline
-                  .sort((a, b) => a.order - b.order)
-                  .map((segment, index, sortedSegments) => {
-                    // Calculate position based on order, not source time
-                    const totalDuration = sortedSegments.reduce((sum, seg) => sum + seg.duration, 0);
-                    let cumulativeTime = 0;
-                    for (let i = 0; i < index; i++) {
-                      cumulativeTime += sortedSegments[i].duration;
-                    }
-                    
-                    return (
-                      <div
-                        key={segment.id}
-                        className={`timeline-segment ${selectedSegmentId === segment.id ? 'selected' : ''}`}
-                        style={{
-                          left: `${(cumulativeTime / totalDuration) * 100}%`,
-                          width: `${(segment.duration / totalDuration) * 100}%`,
-                        }}
-                        onClick={(e) => handleSegmentClick(segment.id, e)}
-                      >
-                        <span className="segment-label">{segment.name || `Clip ${segment.order + 1}`}</span>
-                      </div>
-                    );
-                  })}
+                {/* Playhead */}
                 <div
-                  className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
-                  style={{
-                    left: `${getPlayheadPosition()}%`,
-                  }}
+                  className={`timeline-playhead${isDraggingPlayhead ? ' dragging' : ''}`}
+                  style={{ left: `${playheadPct}%` }}
                   onMouseDown={handlePlayheadMouseDown}
                 />
               </div>
@@ -1026,287 +1216,100 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           </div>
         </main>
 
-        {/* Sidebar */}
         <aside className="editor-sidebar">
           <div className="sidebar-tabs">
-            <button
-              className={`tab ${activeTab === 'clips' ? 'active' : ''}`}
-              onClick={() => setActiveTab('clips')}
-            >
-              Clips
-            </button>
-            <button
-              className={`tab ${activeTab === 'ai-edit' ? 'active' : ''}`}
-              onClick={() => setActiveTab('ai-edit')}
-            >
-              AI Edit
-            </button>
-            <button
-              className={`tab ${activeTab === 'assets' ? 'active' : ''}`}
-              onClick={() => setActiveTab('assets')}
-            >
-              Assets
-            </button>
+            <button className={`tab${activeTab === 'clips' ? ' active' : ''}`} onClick={() => setActiveTab('clips')}>Clips</button>
+            <button className={`tab${activeTab === 'ai-edit' ? ' active' : ''}`} onClick={() => setActiveTab('ai-edit')}>AI Edit</button>
+            <button className={`tab${activeTab === 'assets' ? ' active' : ''}`} onClick={() => setActiveTab('assets')}>Assets</button>
           </div>
-
           <div className="sidebar-content">
             {activeTab === 'clips' && (
               <div className="tab-panel">
                 <h3 className="panel-title">Video Clips</h3>
                 <p className="panel-description">
-                  {session.timeline.length} clip{session.timeline.length !== 1 ? 's' : ''} in timeline
+                  {session.timeline.length} clip{session.timeline.length !== 1 ? 's' : ''} · {formatTime(tlTotal)} total
                 </p>
-                
                 <div className="clips-list">
-                  {session.timeline
-                    .sort((a, b) => a.order - b.order)
-                    .map((segment) => (
-                      <div
-                        key={segment.id}
-                        className={`clip-item ${selectedSegmentId === segment.id ? 'selected' : ''} ${
-                          dragOverClipId === segment.id ? `drag-over drop-${clipDropPosition}` : ''
-                        }`}
-                        onDragOver={(e) => handleClipDragOver(segment.id, e)}
-                        onDragLeave={handleClipDragLeave}
-                        onDrop={(e) => handleClipDrop(segment.id, e)}
-                        onClick={() => handleSegmentJump(segment)}
-                      >
-                        <div 
-                          className="clip-drag-handle" 
-                          title="Drag to reorder"
-                          draggable
-                          onDragStart={(e) => handleClipDragStart(segment.id, e)}
-                          onDragEnd={handleClipDragEnd}
-                          onMouseDown={(e) => {
-                            // Ensure drag starts from handle
-                            e.stopPropagation();
-                          }}
-                        >
-                          ⋮⋮
-                        </div>
-                        <div className="clip-header">
-                          <input
-                            type="text"
-                            className="clip-name-input"
-                            value={segment.name ?? ''}
-                            onChange={(e) => {
-                              e.stopPropagation();
-                              handleClipRename(segment.id, e.target.value);
-                            }}
-                            onClick={(e) => e.stopPropagation()}
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onDragStart={(e) => e.preventDefault()}
-                            onKeyDown={(e) => {
-                              e.stopPropagation();
-                              // Allow complete clearing with backspace
-                              if (e.key === 'Backspace' && e.currentTarget.value === '') {
-                                handleClipRename(segment.id, '');
-                              }
-                            }}
-                            placeholder={`Clip ${segment.order + 1}`}
-                          />
-                          <span className="clip-duration">{formatTime(segment.duration)}</span>
-                        </div>
-                        <div className="clip-time-range">
-                          {formatTime(segment.sourceStart)} - {formatTime(segment.sourceEnd)}
-                        </div>
-                        <div className="clip-actions">
-                          <button
-                            className="btn-small"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSegmentJump(segment);
-                            }}
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onDragStart={(e) => e.preventDefault()}
-                            disabled={seekingSegmentId === segment.id}
-                          >
-                            {seekingSegmentId === segment.id ? 'Seeking...' : 'Jump to'}
-                          </button>
-                          <button
-                            className="btn-small btn-danger-small"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedSegmentId(segment.id);
-                              handleDelete();
-                            }}
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onDragStart={(e) => e.preventDefault()}
-                            disabled={seekingSegmentId !== null}
-                          >
-                            Delete
-                          </button>
-                        </div>
+                  {[...session.timeline].sort((a, b) => a.order - b.order).map(seg => (
+                    <div key={seg.id}
+                      className={`clip-item${selectedSegmentId === seg.id ? ' selected' : ''}`}
+                      onClick={() => handleSegmentJump(seg)}>
+                      <div className="clip-header">
+                        <input type="text" className="clip-name-input"
+                          value={seg.name || `Clip ${seg.order + 1}`}
+                          onChange={e => { e.stopPropagation(); handleClipRename(seg.id, e.target.value); }}
+                          onClick={e => e.stopPropagation()}
+                          placeholder={`Clip ${seg.order + 1}`}/>
+                        <span className="clip-duration">{formatTime(seg.duration)}</span>
                       </div>
-                    ))}
+                      <div className="clip-time-range">
+                        {seg.assetKind
+                          ? <span className={`clip-kind-badge ${seg.assetKind}`}>{seg.assetKind}</span>
+                          : `${formatTime(seg.sourceStart)} – ${formatTime(seg.sourceEnd)}`}
+                      </div>
+                      <div className="clip-actions">
+                        <button className="btn-small"
+                          onClick={e => { e.stopPropagation(); handleSegmentJump(seg); }}
+                          disabled={seekingSegmentId === seg.id}>
+                          {seekingSegmentId === seg.id ? 'Seeking…' : 'Jump to'}
+                        </button>
+                        <button className="btn-small btn-danger-small"
+                          onClick={e => { e.stopPropagation(); setSelectedSegmentId(seg.id); handleDelete(); }}
+                          disabled={seekingSegmentId !== null}>
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                
-                {session.timeline.length === 0 && (
-                  <div className="empty-state">
-                    <p>No clips in timeline</p>
-                    <p className="empty-state-hint">Upload a video to get started</p>
-                  </div>
-                )}
               </div>
             )}
-            
+
             {activeTab === 'ai-edit' && (
               <div className="tab-panel">
                 <h3 className="panel-title">AI Transcription</h3>
-                <p className="panel-description">
-                  Generate and edit video transcript
-                </p>
-                
-                <button
-                  className="btn btn-secondary btn-full"
-                  onClick={handleTranscribe}
-                  disabled={isTranscribing}
-                >
-                  {isTranscribing ? 'Transcribing...' : 'Transcribe Video'}
+                <p className="panel-description">Generate and edit video transcript</p>
+                <button className="btn btn-secondary btn-full" onClick={handleTranscribe} disabled={isTranscribing}>
+                  {isTranscribing ? 'Transcribing…' : 'Transcribe Video'}
                 </button>
-                
                 <div className="transcript-area">
                   {session.transcript ? (
                     <>
                       <label className="transcript-label">Transcript:</label>
-                      <textarea
-                        className="transcript-text"
-                        value={session.transcript}
-                        onChange={handleTranscriptChange}
-                        placeholder="Edit your transcript here..."
-                      />
-                      <p className="transcript-hint">
-                        Edit the transcript to modify your video content
-                      </p>
+                      <textarea className="transcript-text" value={session.transcript}
+                        onChange={handleTranscriptChange} placeholder="Edit your transcript here…"/>
+                      <p className="transcript-hint">Edit the transcript to modify your video content</p>
                     </>
                   ) : (
                     <div className="empty-state">
-                      <svg
-                        width="48"
-                        height="48"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        style={{ margin: '0 auto 1rem', opacity: 0.5 }}
-                      >
-                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                        <line x1="12" y1="19" x2="12" y2="23" />
-                        <line x1="8" y1="23" x2="16" y2="23" />
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ margin: '0 auto 1rem', opacity: 0.5 }}>
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
                       </svg>
                       <p>No transcript yet</p>
-                      <p className="empty-state-hint">
-                        Click "Transcribe Video" to generate a transcript using AI
-                      </p>
+                      <p className="empty-state-hint">Click "Transcribe Video" to generate a transcript using AI</p>
                     </div>
                   )}
                 </div>
               </div>
             )}
-            
+
             {activeTab === 'assets' && (
-              <div className="tab-panel">
-                <h3 className="panel-title">Media Assets</h3>
-                <p className="panel-description">
-                  Manage your video and audio files
-                </p>
-                
-                <div className="asset-list">
-                  <div className="asset-item">
-                    <div className="asset-icon">
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <polygon points="23 7 16 12 23 17 23 7" />
-                        <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                      </svg>
-                    </div>
-                    <div className="asset-info">
-                      <div className="asset-name">Original Video</div>
-                      <div className="asset-meta">
-                        {session.resolution.width}x{session.resolution.height} • {formatTime(session.duration)}
-                      </div>
-                    </div>
-                  </div>
-                  
-                  {session.transcript && (
-                    <div className="asset-item">
-                      <div className="asset-icon">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                          <polyline points="14 2 14 8 20 8" />
-                          <line x1="16" y1="13" x2="8" y2="13" />
-                          <line x1="16" y1="17" x2="8" y2="17" />
-                          <polyline points="10 9 9 9 8 9" />
-                        </svg>
-                      </div>
-                      <div className="asset-info">
-                        <div className="asset-name">Transcript</div>
-                        <div className="asset-meta">
-                          {session.transcript.length} characters
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  
-                  <div className="asset-item">
-                    <div className="asset-icon">
-                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <path d="M9 18V5l12-2v13" />
-                        <circle cx="6" cy="18" r="3" />
-                        <circle cx="18" cy="16" r="3" />
-                      </svg>
-                    </div>
-                    <div className="asset-info">
-                      <div className="asset-name">Audio Track</div>
-                      <div className="asset-meta">
-                        Embedded • {formatTime(session.duration)}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                
-                <div className="asset-stats">
-                  <h4>Project Stats</h4>
-                  <div className="stat-row">
-                    <span>Total Clips:</span>
-                    <span>{session.timeline.length}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Original Duration:</span>
-                    <span>{formatTime(session.duration)}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Edited Duration:</span>
-                    <span>
-                      {formatTime(
-                        session.timeline.reduce((sum, seg) => sum + seg.duration, 0)
-                      )}
-                    </span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Resolution:</span>
-                    <span>{session.resolution.width}x{session.resolution.height}</span>
-                  </div>
-                </div>
-              </div>
+              <AssetsTab onAddToTimeline={handleAddAssetToTimeline}/>
             )}
           </div>
         </aside>
       </div>
 
-      {/* Reset Confirmation Dialog */}
       {showResetDialog && (
         <div className="dialog-overlay" onClick={() => setShowResetDialog(false)}>
-          <div className="dialog" onClick={(e) => e.stopPropagation()}>
+          <div className="dialog" onClick={e => e.stopPropagation()}>
             <h2>Reset Session?</h2>
             <p>This will clear all editing data and return to the upload page.</p>
             <div className="dialog-actions">
-              <button className="btn btn-secondary" onClick={() => setShowResetDialog(false)}>
-                Cancel
-              </button>
-              <button className="btn btn-danger" onClick={handleResetConfirm}>
-                Reset
-              </button>
+              <button className="btn btn-secondary" onClick={() => setShowResetDialog(false)}>Cancel</button>
+              <button className="btn btn-danger" onClick={handleResetConfirm}>Reset</button>
             </div>
           </div>
         </div>
