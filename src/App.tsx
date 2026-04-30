@@ -5,8 +5,7 @@
 
 import { useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
-import { UploadPage } from './components/UploadPage';
-import { EditorPage } from './components/EditorPage';
+import { UploadPage, EditorPage, ErrorBoundary } from './components';
 
 function AppRoutes() {
   const navigate = useNavigate();
@@ -40,8 +39,10 @@ function EditorPageWrapper({ onReset }: { onReset: () => void }) {
 
 export function App() {
   return (
-    <BrowserRouter>
-      <AppRoutes />
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AppRoutes />
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }

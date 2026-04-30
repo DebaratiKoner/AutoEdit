@@ -3,3 +3,4 @@
  */
 
 export { formatTime } from './timeFormat';
+export { logger } from './logger';

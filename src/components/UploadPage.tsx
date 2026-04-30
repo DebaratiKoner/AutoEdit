@@ -4,7 +4,8 @@
  */
 
 import { useState, useRef, DragEvent, ChangeEvent } from 'react';
-import { FileValidator } from '../services';
+import { FileValidator, APIClient } from '../services';
+import { logger } from '../utils';
 import './UploadPage.css';
 
 interface UploadPageProps {
@@ -14,8 +15,10 @@ interface UploadPageProps {
 export function UploadPage({ onUploadComplete }: UploadPageProps) {
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const fileValidator = new FileValidator();
+  const apiClient = new APIClient();
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -45,10 +48,18 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
     if (files && files.length > 0) {
       await handleFile(files[0]);
     }
+    // Reset input so the same file can be re-selected if needed
+    e.target.value = '';
   };
 
   const handleFile = async (file: File) => {
+    if (isUploading) return; // lock — prevent duplicate calls
     setError(null);
+
+    if (!file) {
+      setError('No file selected.');
+      return;
+    }
 
     // Validate format
     const formatResult = fileValidator.validateFormat(file);
@@ -64,42 +75,27 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
       return;
     }
 
-    // Get video duration and metadata
-    const video = document.createElement('video');
-    video.preload = 'metadata';
-    
-    const videoUrl = URL.createObjectURL(file);
-    
-    video.onloadedmetadata = async () => {
-      const duration = video.duration;
-      const { width, height } = resolutionResult.details?.resolution || { width: 1920, height: 1080 };
-      
-      // Store the actual file in IndexedDB
-      try {
-        const db = await openVideoDatabase();
-        const transaction = db.transaction(['videos'], 'readwrite');
-        const store = transaction.objectStore('videos');
-        
-        const sessionId = `session-${Date.now()}`;
-        await store.put({ id: sessionId, file: file });
-        
-        URL.revokeObjectURL(videoUrl);
-        
-        if (onUploadComplete) {
-          onUploadComplete(sessionId);
-        }
-      } catch (error) {
-        console.error('Failed to store video:', error);
-        setError('Failed to store video. Please try again.');
+    try {
+      setIsUploading(true);
+      // 1. Upload file to backend — backend assigns the session ID
+      const uploadResponse = await apiClient.uploadVideo(file);
+      const sessionId = uploadResponse.sessionId;
+
+      // 2. Also cache in IndexedDB for local playback
+      const db = await openVideoDatabase();
+      const transaction = db.transaction(['videos'], 'readwrite');
+      const store = transaction.objectStore('videos');
+      await store.put({ id: sessionId, file: file });
+
+      if (onUploadComplete) {
+        onUploadComplete(sessionId);
       }
-    };
-    
-    video.onerror = () => {
-      URL.revokeObjectURL(videoUrl);
-      setError('Failed to load video metadata. Please try a different file.');
-    };
-    
-    video.src = videoUrl;
+    } catch (error) {
+      logger.error('Failed to upload video:', error);
+      setError('Failed to upload video. Please try again.');
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   // Helper function to open IndexedDB for video storage
@@ -120,6 +116,7 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
   };
 
   const handleClick = () => {
+    if (isUploading) return;
     fileInputRef.current?.click();
   };
 
@@ -131,11 +128,12 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
 
       <main className="upload-main">
         <div
-          className={`drop-zone ${dragActive ? 'drag-active' : ''}`}
+          className={`drop-zone ${dragActive ? 'drag-active' : ''} ${isUploading ? 'uploading' : ''}`}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           onClick={handleClick}
+          style={{ pointerEvents: isUploading ? 'none' : 'auto', opacity: isUploading ? 0.6 : 1 }}
         >
           <div className="drop-zone-content">
             <svg
@@ -151,8 +149,8 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
               <polyline points="17 8 12 3 7 8" />
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
-            <p className="drop-zone-text">Drop your video here</p>
-            <p className="drop-zone-subtext">or click to browse</p>
+            <p className="drop-zone-text">{isUploading ? 'Uploading...' : 'Drop your video here'}</p>
+            <p className="drop-zone-subtext">{isUploading ? 'Please wait' : 'or click to browse'}</p>
             <p className="drop-zone-formats">Supported: MP4, MOV, WebM (720p minimum)</p>
           </div>
         </div>

@@ -114,13 +114,75 @@ export class APIClient {
   /**
    * Request video transcription
    * @param sessionId - Session identifier
+   * @param clips - Optional: array of edited clips to transcribe (if omitted, transcribes full video)
    * @returns Promise resolving to transcript response
    */
-  async transcribeVideo(sessionId: string): Promise<TranscriptResponse> {
+  async transcribeVideo(
+    sessionId: string,
+    clips?: Array<{ start: number; end: number; title?: string }>
+  ): Promise<TranscriptResponse> {
     return this.requestWithRetry<TranscriptResponse>(
       `${this.baseUrl}/videos/${sessionId}/transcribe`,
       {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clips: clips || null }),
+      }
+    );
+  }
+
+  /**
+   * Generate AI edit actions from a natural language prompt
+   * @param sessionId - Session identifier
+   * @param prompt - Natural language editing instruction
+   * @param segments - Transcript segments with start/end/text
+   * @returns Promise resolving to enhanced response with actions, clips, operations, and warnings
+   */
+  async editWithAI(
+    sessionId: string,
+    prompt: string,
+    segments: Array<{ start: number; end: number; text: string; title?: string }>
+  ): Promise<{ 
+    actions: Array<Record<string, any>>;
+    clips?: Array<Record<string, any>>;
+    operations?: Array<Record<string, any>>;
+    warnings?: string[];
+  }> {
+    return this.requestWithRetry(
+      `${this.baseUrl}/videos/${sessionId}/edit-with-ai`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, segments }),
+      }
+    );
+  }
+
+  /**
+   * NEW: Plan edit operations using structured planner
+   * @param sessionId - Session identifier
+   * @param instruction - Natural language editing instruction
+   * @param clips - Array of clips with id, start, end, label
+   * @param transcript - Optional transcript segments
+   * @returns Promise resolving to { intent, operations, confidence, warnings }
+   */
+  async planEdit(
+    sessionId: string,
+    instruction: string,
+    clips: Array<{ id: string; start: number; end: number; label?: string }>,
+    transcript: Array<{ start: number; end: number; text: string }> = []
+  ): Promise<{
+    intent: string;
+    operations: Array<Record<string, any>>;
+    confidence: number;
+    warnings: string[];
+  }> {
+    return this.requestWithRetry(
+      `${this.baseUrl}/videos/${sessionId}/plan-edit`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instruction, clips, transcript }),
       }
     );
   }

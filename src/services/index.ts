@@ -5,3 +5,4 @@
 export { FileValidator } from './FileValidator';
 export { APIClient, APIError, NetworkError } from './APIClient';
 export { SessionManager } from './SessionManager';
+export { CompositionBuilder } from './CompositionBuilder';
