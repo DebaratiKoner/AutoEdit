@@ -17,6 +17,7 @@ export function arbitraryTimelineSegment(): fc.Arbitrary<TimelineSegment> {
       sourceEnd: fc.double({ min: 0, max: 3600, noNaN: true }),
       timelineStart: fc.double({ min: 0, max: 3600, noNaN: true }),
       order: fc.nat({ max: 1000 }),
+      track: fc.nat({ max: 10 }),
     })
     .filter((seg) => seg.sourceEnd > seg.sourceStart)
     .map((seg) => ({
@@ -68,6 +69,11 @@ export function arbitrarySessionData(): fc.Arbitrary<SessionData> {
     }),
     timeline: fc.array(arbitraryTimelineSegment(), { minLength: 0, maxLength: 50 }),
     transcript: fc.option(fc.string(), { nil: null }),
+    transcriptSegments: fc.option(fc.array(fc.record({
+      start: fc.double({ min: 0, max: 3600, noNaN: true }),
+      end: fc.double({ min: 0, max: 3600, noNaN: true }),
+      text: fc.string(),
+    })), { nil: null }),
     undoStack: fc.array(arbitraryEditAction(), { maxLength: 100 }),
     redoStack: fc.array(arbitraryEditAction(), { maxLength: 100 }),
     lastModified: fc

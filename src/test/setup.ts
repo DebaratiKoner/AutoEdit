@@ -9,11 +9,10 @@ global.ResizeObserver = class ResizeObserver {
 
 // Mock IndexedDB if needed
 if (typeof window !== 'undefined' && !window.indexedDB) {
-  // @ts-expect-error - Mock implementation
   window.indexedDB = {
     open: () => ({
       onsuccess: null,
       onerror: null,
-    }),
-  };
+    } as any),
+  } as any;
 }

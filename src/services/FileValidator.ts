@@ -7,7 +7,7 @@ import type { ValidationResult } from '../types';
 
 export class FileValidator {
   private static readonly SUPPORTED_FORMATS = ['mp4', 'mov', 'webm'];
-  private static readonly MIN_HEIGHT = 720;
+  private static readonly MIN_HEIGHT = 360;
 
   /**
    * Get list of supported video formats

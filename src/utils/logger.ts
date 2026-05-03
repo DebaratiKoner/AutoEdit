@@ -3,8 +3,8 @@
  * Only logs in development mode or when explicitly enabled
  */
 
-const isDevelopment = import.meta.env.DEV;
-const isDebugEnabled = localStorage.getItem('debug') === 'true';
+const isDevelopment = typeof import.meta !== 'undefined' && ((import.meta as any).env?.DEV ?? false);
+const isDebugEnabled = typeof localStorage !== 'undefined' && localStorage.getItem('debug') === 'true';
 
 export const logger = {
   debug: (message: string, ...args: any[]) => {

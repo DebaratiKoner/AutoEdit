@@ -4,14 +4,19 @@ Provides endpoints for video upload, transcription, and exportop
 """
 
 import os
+import sys
+# Force UTF-8 output on Windows to avoid emoji encoding errors
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 from dotenv import load_dotenv
 
-# Load .env file from the backend directory
+# Load .env file from the backend directory FIRST before anything else
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 if not os.getenv("OPENAI_API_KEY"):
-    print("❌ API Key not found")
+    print("[INFO] API Key not found")
 else:
-    print("✅ API Key loaded")
+    print("[INFO] API Key loaded")
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +33,12 @@ from datetime import datetime
 import socket
 
 app = FastAPI(title="Video Editor API")
+
+# Register routers AFTER app is created
+from routes.pixabay import router as pixabay_router
+from routes.freesound import router as freesound_router
+app.include_router(pixabay_router)
+app.include_router(freesound_router)
 
 # Global fallback — ensures no unhandled exception leaks a raw 500 without a message
 from fastapi import Request
@@ -217,6 +228,7 @@ async def test_export_info():
 
 class TranscribeRequest(BaseModel):
     clips: Optional[list] = None  # Optional: if provided, only transcribe these clips
+    quick: Optional[bool] = False  # If True, only transcribe first 90s for speed
     
     class Config:
         # Allow None values explicitly
@@ -366,8 +378,10 @@ async def transcribe_video(session_id: str, request: Request):
         
         # Parse body if provided - handle both None and empty body
         clips = None
+        quick_mode = True
         if body is not None and isinstance(body, dict):
             clips = body.get('clips', None)
+            quick_mode = body.get('quick', True)
         
         print(f"[transcribe] session_id={session_id}")
         print(f"[transcribe] clips provided: {len(clips) if clips else 0}")
@@ -377,7 +391,8 @@ async def transcribe_video(session_id: str, request: Request):
         print(f"[transcribe] cache_key={cache_key}")
         
         # Check if transcription is already cached
-        if cache_key in transcription_cache:
+        # Skip cache when clips are provided — timeline may have changed
+        if not clips and cache_key in transcription_cache:
             cached_result = transcription_cache[cache_key]
             print(f"[transcribe] CACHE HIT: Returning cached transcription")
             return JSONResponse({
@@ -432,118 +447,120 @@ async def transcribe_video(session_id: str, request: Request):
                 detail=f"Video file not found for session {session_id}"
             )
         
-        # CRITICAL FIX: Extract audio based on edited clips if provided
-        audio_path = UPLOAD_DIR / f"{session_id}_audio.mp3"
-        print(f"[transcribe] audio_path={audio_path}")
-        
+        # CRITICAL FIX: Extract audio and segment in one pass for max speed
+        clip_map = []  # built during clip extraction, used for timestamp remapping
+
+        chunk_dir = UPLOAD_DIR / f"{session_id}_chunks_{uuid.uuid4().hex[:8]}"
+        chunk_dir.mkdir(exist_ok=True)
+        chunk_pattern = str(chunk_dir / "chunk_%03d.mp3")
+
         try:
             if clips and len(clips) > 0:
-                # EDITED MODE: Extract and concatenate audio segments for each clip
+                # EDITED MODE: Extract audio only for the clips in the edited timeline.
+                # Use ultra-low bitrate (8kbps, 8kHz mono) so even long videos stay small
+                # and Whisper finishes in 10-20s regardless of video length.
                 print(f"[transcribe] Extracting audio for {len(clips)} edited clips...")
-                
-                # Create temporary files for each clip's audio
+
                 temp_audio_files = []
                 concat_list_path = UPLOAD_DIR / f"{session_id}_concat_list.txt"
-                
+
+                # Build clip_map as we extract — used later for timestamp remapping
+                clip_map = []   # {audio_start, audio_end, timeline_start}
+                audio_cursor = 0.0
+
                 try:
                     for i, clip in enumerate(clips):
-                        clip_start = clip.get("start", 0)
-                        clip_end = clip.get("end", 0)
-                        clip_duration = clip_end - clip_start
-                        
-                        if clip_duration <= 0:
-                            print(f"[transcribe] WARNING: Clip {i+1} has invalid duration, skipping")
+                        c_start    = float(clip.get("start", 0))
+                        c_end      = float(clip.get("end", 0))
+                        c_dur      = c_end - c_start
+                        tl_start   = float(clip.get("timelineStart", c_start))
+
+                        if c_dur <= 0:
+                            print(f"[transcribe] WARNING: Clip {i+1} has zero/negative duration, skipping")
                             continue
-                        
-                        # Extract this clip's audio segment
+
                         temp_clip_audio = UPLOAD_DIR / f"{session_id}_clip_{i+1}_audio.mp3"
                         temp_audio_files.append(temp_clip_audio)
-                        
-                        print(f"[transcribe] Extracting clip {i+1}: {clip_start:.2f}s - {clip_end:.2f}s (duration: {clip_duration:.2f}s)")
-                        
+
+                        clip_map.append({
+                            "audio_start":    audio_cursor,
+                            "audio_end":      audio_cursor + c_dur,
+                            "timeline_start": tl_start,
+                        })
+                        audio_cursor += c_dur
+
+                        print(f"[transcribe] Clip {i+1}: source {c_start:.2f}s-{c_end:.2f}s → timeline {tl_start:.2f}s (audio offset {clip_map[-1]['audio_start']:.2f}s)")
+
                         result = subprocess.run([
                             "ffmpeg",
-                            "-ss", str(clip_start),  # Start time
-                            "-t", str(clip_duration),  # Duration
-                            "-i", str(video_path),
-                            "-vn",  # No video
-                            "-acodec", "libmp3lame",  # MP3 codec
-                            "-ar", "16000",  # 16kHz sample rate (Whisper requirement)
-                            "-ac", "1",  # Mono
-                            "-y",  # Overwrite output file
+                            "-ss", str(c_start),
+                            "-t",  str(c_dur),
+                            "-i",  str(video_path),
+                            "-vn",
+                            "-acodec", "libmp3lame",
+                            "-ar", "8000",   # 8kHz — enough for speech, tiny file
+                            "-ac", "1",
+                            "-b:a", "8k",    # 8kbps — ~60KB/min
+                            "-threads", "0",
+                            "-y",
                             str(temp_clip_audio)
                         ], capture_output=True, text=True)
-                        
+
                         if result.returncode != 0:
-                            print(f"[transcribe] ffmpeg error for clip {i+1}:")
-                            print(f"[transcribe] stderr: {result.stderr}")
+                            print(f"[transcribe] ffmpeg error clip {i+1}: {result.stderr[-300:]}")
                             raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-                        
-                        print(f"[transcribe] Clip {i+1} audio extracted: {temp_clip_audio}")
-                    
-                    if len(temp_audio_files) == 0:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="No valid clips to transcribe"
-                        )
-                    
-                    # Concatenate all clip audio files
-                    print(f"[transcribe] Concatenating {len(temp_audio_files)} audio segments...")
-                    
-                    # Create concat list file for ffmpeg
+
+                    if not temp_audio_files:
+                        raise HTTPException(status_code=400, detail="No valid clips to transcribe")
+
+                    # Concatenate all clip audio files into one
+                    print(f"[transcribe] Concatenating {len(temp_audio_files)} segments (total audio: {audio_cursor:.1f}s)...")
                     with open(concat_list_path, 'w') as f:
-                        for temp_file in temp_audio_files:
-                            # Use forward slashes and escape special characters for ffmpeg
-                            escaped_path = str(temp_file.absolute()).replace('\\', '/')
-                            f.write(f"file '{escaped_path}'\n")
-                    
-                    # Concatenate using ffmpeg concat demuxer
+                        for tf in temp_audio_files:
+                            escaped = str(tf.absolute()).replace('\\', '/')
+                            f.write(f"file '{escaped}'\n")
+
                     result = subprocess.run([
-                        "ffmpeg",
-                        "-f", "concat",
-                        "-safe", "0",
+                        "ffmpeg", "-f", "concat", "-safe", "0",
                         "-i", str(concat_list_path),
-                        "-c", "copy",
-                        "-y",
-                        str(audio_path)
+                        "-f", "segment", "-segment_time", "10",
+                        "-c", "copy", "-y", chunk_pattern
                     ], capture_output=True, text=True)
-                    
+
                     if result.returncode != 0:
-                        print(f"[transcribe] ffmpeg concat error:")
-                        print(f"[transcribe] stderr: {result.stderr}")
+                        print(f"[transcribe] ffmpeg concat/segment error: {result.stderr[-300:]}")
                         raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-                    
-                    print(f"[transcribe] Audio concatenation complete: {audio_path}")
-                    
+
+                    print(f"[transcribe] Concatenation and segmentation done → {chunk_dir}")
+
                 finally:
-                    # Clean up temporary files
-                    for temp_file in temp_audio_files:
-                        if temp_file.exists():
-                            temp_file.unlink()
-                            print(f"[transcribe] Cleaned up: {temp_file}")
+                    for tf in temp_audio_files:
+                        if tf.exists():
+                            tf.unlink()
                     if concat_list_path.exists():
                         concat_list_path.unlink()
-                        print(f"[transcribe] Cleaned up: {concat_list_path}")
-            
+
             else:
-                # FULL MODE: Extract audio from entire original video
-                print(f"[transcribe] Extracting audio from full video...")
+                # FULL MODE: Extract entire original video audio at ultra-low bitrate directly into segments
+                print(f"[transcribe] Full-video mode, extracting and segmenting all audio at 8kbps...")
                 result = subprocess.run([
                     "ffmpeg", "-i", str(video_path),
-                    "-vn",  # No video
-                    "-acodec", "libmp3lame",  # MP3 codec
-                    "-ar", "16000",  # 16kHz sample rate (Whisper requirement)
-                    "-ac", "1",  # Mono
-                    "-y",  # Overwrite output file
-                    str(audio_path)
+                    "-vn",
+                    "-acodec", "libmp3lame",
+                    "-ar", "8000",
+                    "-ac", "1",
+                    "-b:a", "8k",
+                    "-f", "segment",
+                    "-segment_time", "10",
+                    "-threads", "0",
+                    "-y", chunk_pattern
                 ], capture_output=True, text=True)
-                
+
                 if result.returncode != 0:
-                    print(f"[transcribe] ffmpeg full extraction error:")
-                    print(f"[transcribe] stderr: {result.stderr}")
+                    print(f"[transcribe] ffmpeg full extraction/segmentation error: {result.stderr[-300:]}")
                     raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-                
-                print(f"[transcribe] Full audio extraction complete")
+
+                print(f"[transcribe] Full audio extraction and segmentation complete")
         
         except FileNotFoundError:
             raise HTTPException(
@@ -558,116 +575,119 @@ async def transcribe_video(session_id: str, request: Request):
                 detail=f"Failed to extract audio: {error_output}"
             )
         
-        # Transcribe using OpenAI Whisper API with retry logic
-        print(f"[transcribe] calling OpenAI Whisper API")
-        
-        max_retries = 3
-        retry_delay = 2  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                print(f"[transcribe] Attempt {attempt + 1}/{max_retries}")
-                
-                with open(audio_path, "rb") as audio_file:
-                    transcript_response = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        response_format="verbose_json"
-                    )
-                print(f"[transcribe] OpenAI call complete")
-                break  # Success, exit retry loop
-                
-            except Exception as api_error:
-                error_message = str(api_error)
-                print(f"[transcribe] Attempt {attempt + 1} failed: {error_message}")
-                
-                # If this is the last attempt, clean up and raise error
-                if attempt == max_retries - 1:
-                    if audio_path.exists():
-                        audio_path.unlink()
-                        print(f"[transcribe] Cleaned up: {audio_path}")
-                    
-                    # Handle different types of API errors
-                    if "Connection error" in error_message or "getaddrinfo failed" in error_message:
-                        raise HTTPException(
-                            status_code=503,
-                            detail="Unable to connect to OpenAI API after multiple attempts. Please check your internet connection, firewall settings, or try again later. See NETWORK_TROUBLESHOOTING.md for detailed solutions."
+        # Transcribe using OpenAI Whisper API — chunked for concurrent speed
+        print(f"[transcribe] Preparing concurrent OpenAI Whisper API calls")
+        import concurrent.futures
+
+        chunk_files = sorted(list(chunk_dir.glob("chunk_*.mp3")))
+        print(f"[transcribe] Discovered {len(chunk_files)} chunks")
+
+        def transcribe_chunk(chunk_file, index):
+            max_retries = 2
+            retry_delay = 1
+            for attempt in range(max_retries):
+                try:
+                    with open(chunk_file, "rb") as f:
+                        return client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=f,
+                            response_format="verbose_json",
+                            language="en"
                         )
-                    elif "API key" in error_message or "authentication" in error_message.lower():
-                        raise HTTPException(
-                            status_code=401,
-                            detail="OpenAI API authentication failed. Please check your API key in the .env file."
-                        )
-                    elif "quota" in error_message.lower() or "billing" in error_message.lower():
-                        raise HTTPException(
-                            status_code=402,
-                            detail="OpenAI API quota exceeded or billing issue. Please check your OpenAI account at https://platform.openai.com/account/usage"
-                        )
-                    else:
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"OpenAI API error: {error_message}"
-                        )
-                else:
-                    # Wait before retrying
+                except Exception as e:
+                    error_message = str(e)
+                    print(f"[transcribe] Attempt {attempt + 1} failed for chunk {index}: {error_message}")
+                    if attempt == max_retries - 1:
+                        if "Connection error" in error_message or "getaddrinfo failed" in error_message:
+                            raise HTTPException(status_code=503, detail="Unable to connect to OpenAI API.")
+                        elif "API key" in error_message or "authentication" in error_message.lower():
+                            raise HTTPException(status_code=401, detail="OpenAI API authentication failed.")
+                        else:
+                            raise HTTPException(status_code=500, detail=f"OpenAI API error: {error_message}")
                     import time
-                    print(f"[transcribe] Waiting {retry_delay} seconds before retry...")
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-        
-        # Clean up audio file
-        audio_path.unlink()
-        print(f"[transcribe] Cleaned up: {audio_path}")
-        
-        # Extract transcript and segments
-        transcript_text = transcript_response.text
+                    retry_delay *= 2
+
+        transcript_text = ""
+        raw_segs = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            future_to_chunk = {
+                executor.submit(transcribe_chunk, chunk_file, i): (i, chunk_file)
+                for i, chunk_file in enumerate(chunk_files)
+            }
+            
+            results = [None] * len(chunk_files)
+            for future in concurrent.futures.as_completed(future_to_chunk):
+                i, chunk_file = future_to_chunk[future]
+                results[i] = future.result()
+
+        for i, res in enumerate(results):
+            if not res: continue
+            transcript_text += res.text.strip() + " "
+            time_offset = i * 10.0
+            if hasattr(res, 'segments') and res.segments:
+                for seg in res.segments:
+                    if isinstance(seg, dict):
+                        raw_segs.append({
+                            "start": float(seg["start"]) + time_offset,
+                            "end": float(seg["end"]) + time_offset,
+                            "text": seg["text"]
+                        })
+                    else:
+                        raw_segs.append({
+                            "start": float(seg.start) + time_offset,
+                            "end": float(seg.end) + time_offset,
+                            "text": seg.text
+                        })
+
+        transcript_text = transcript_text.strip()
         segments = []
         mode = "edited" if clips else "full"
-        
-        if hasattr(transcript_response, 'segments'):
-            # CRITICAL: Adjust segment timestamps to match edited timeline
-            if clips and len(clips) > 0:
-                print(f"[transcribe] Adjusting segment timestamps for edited timeline...")
-                
-                # Build timeline mapping: transcription time → original video time
-                timeline_offset = 0.0
-                
-                for seg in transcript_response.segments:
-                    # Segment times are relative to the concatenated audio (edited timeline)
-                    # We keep them as-is since they now represent the edited timeline
-                    # Handle both dict and object formats for segments
-                    if isinstance(seg, dict):
-                        segments.append({
-                            "start": seg["start"],
-                            "end": seg["end"],
-                            "text": seg["text"]
-                        })
-                    else:
-                        segments.append({
-                            "start": seg.start,
-                            "end": seg.end,
-                            "text": seg.text
-                        })
-                
-                print(f"[transcribe] Adjusted {len(segments)} segments for edited timeline")
+        # Clean up audio files
+        for chunk_file in chunk_files:
+            if chunk_file.exists():
+                chunk_file.unlink()
+        try:
+            chunk_dir.rmdir()
+        except:
+            pass
+        print(f"[transcribe] Cleaned up chunks and original audio")
+
+        if raw_segs:
+            if clips and len(clips) > 0 and clip_map:
+                # Remap Whisper timestamps (relative to concatenated audio) → timeline positions
+                print(f"[transcribe] Remapping {len(raw_segs)} Whisper segments to timeline time...")
+                print(f"[transcribe] clip_map: {clip_map}")
+
+                for seg in raw_segs:
+                    w_start = seg["start"]
+                    w_end   = seg["end"]
+
+                    # Find which clip window this segment's start falls in
+                    matched = None
+                    for cm in clip_map:
+                        if w_start >= cm["audio_start"] and w_start < cm["audio_end"]:
+                            matched = cm
+                            break
+                    # If past the last clip (rounding), use the last one
+                    if matched is None:
+                        matched = clip_map[-1]
+
+                    offset_in_clip = w_start - matched["audio_start"]
+                    end_offset     = w_end   - matched["audio_start"]
+
+                    segments.append({
+                        "start": round(matched["timeline_start"] + offset_in_clip, 2),
+                        "end":   round(matched["timeline_start"] + end_offset,     2),
+                        "text":  seg["text"].strip(),
+                    })
+
+                print(f"[transcribe] Remapped {len(segments)} segments. First: {segments[0] if segments else 'none'}")
             else:
-                # Full video mode: timestamps are already correct
-                segments = []
-                for seg in transcript_response.segments:
-                    # Handle both dict and object formats for segments
-                    if isinstance(seg, dict):
-                        segments.append({
-                            "start": seg["start"],
-                            "end": seg["end"],
-                            "text": seg["text"]
-                        })
-                    else:
-                        segments.append({
-                            "start": seg.start,
-                            "end": seg.end,
-                            "text": seg.text
-                        })
-                print(f"[transcribe] Extracted {len(segments)} segments from full video")
+                # Full-video mode: Whisper timestamps are already correct
+                segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"].strip()} for s in raw_segs]
+                print(f"[transcribe] Full-video: {len(segments)} segments")
         
         # Cache the transcription result
         transcription_result = {
@@ -798,6 +818,122 @@ async def upload_video(file: UploadFile = File(...), session_id: Optional[str] =
             "height": height
         }
     })
+
+@app.post("/api/assets/upload")
+async def upload_asset(file: UploadFile = File(...)):
+    """
+    Upload an asset file (video or image) for use in editing.
+    """
+    # --- Step 1: Validate file is present ---
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided.")
+
+    print(f"[asset-upload] Uploading: {file.filename}")
+
+    # --- Step 2: Validate file type ---
+    ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+    ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    ALLOWED_EXTENSIONS = ALLOWED_VIDEO_EXTENSIONS | ALLOWED_IMAGE_EXTENSIONS
+    
+    raw_ext = os.path.splitext(file.filename)[1]
+    file_ext = raw_ext.lower() if raw_ext else ""
+
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type '{file_ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    # --- Step 3: Read content and enforce size limit (50 MB for assets) ---
+    MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+    try:
+        content = await file.read()
+    except Exception as e:
+        print(f"[asset-upload] Failed to read file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {str(e)}")
+
+    if len(content) > MAX_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({len(content) // (1024*1024)} MB). Maximum allowed size is 50 MB."
+        )
+
+    # --- Step 4: Ensure uploads folder exists ---
+    os.makedirs("uploads", exist_ok=True)
+
+    # --- Step 5: Generate asset ID and build file path ---
+    asset_id = str(uuid.uuid4())
+    file_path = UPLOAD_DIR / f"asset_{asset_id}{file_ext}"
+    print(f"[asset-upload] Saving to: {file_path}")
+
+    # --- Step 6: Save file safely ---
+    try:
+        with open(file_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        print(f"[asset-upload] Failed to save file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+    # --- Step 7: Determine asset type and URL ---
+    is_video = file_ext in ALLOWED_VIDEO_EXTENSIONS
+    asset_type = "video" if is_video else "photo"
+    asset_url = f"/api/assets/{asset_id}/stream"
+
+    # --- Step 8: Extract metadata if video ---
+    duration = 0.0
+    width = 0
+    height = 0
+    if is_video:
+        try:
+            import json
+            result = subprocess.run([
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,duration",
+                "-of", "json",
+                str(file_path)
+            ], capture_output=True, text=True, check=True)
+            metadata = json.loads(result.stdout)
+            stream = metadata.get("streams", [{}])[0]
+            duration = float(stream.get("duration", 0))
+            width = stream.get("width", 0)
+            height = stream.get("height", 0)
+        except (FileNotFoundError, subprocess.CalledProcessError, KeyError, IndexError) as e:
+            print(f"[asset-upload] ffprobe unavailable or failed, using defaults: {e}")
+
+    return JSONResponse({
+        "assetId": asset_id,
+        "assetType": asset_type,
+        "assetUrl": asset_url,
+        "duration": duration,
+        "resolution": {
+            "width": width,
+            "height": height
+        },
+        "filename": file.filename
+    })
+
+@app.get("/api/assets/{asset_id}/stream")
+async def stream_asset(asset_id: str, request: Request):
+    """
+    Stream asset file (video or image) with range request support
+    """
+    # Find the asset file
+    for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv", ".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+        asset_path = UPLOAD_DIR / f"asset_{asset_id}{ext}"
+        if asset_path.exists():
+            # For images, just return the file
+            if ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+                return FileResponse(
+                    asset_path,
+                    media_type=mimetypes.guess_type(str(asset_path))[0] or "image/jpeg"
+                )
+            # For videos, use range streaming
+            else:
+                return await stream_video_with_range(asset_path, request)
+    
+    raise HTTPException(status_code=404, detail="Asset not found")
+
 
 @app.get("/api/videos/{session_id}/stream")
 async def stream_video(session_id: str, request: Request):
@@ -1042,23 +1178,25 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     
     # Check if this is a content-based command that requires transcript
     content_based_keywords = [
-        'about', 'mention', 'discuss', 'talk', 'say', 'explain', 
+        'about', 'mention', 'discuss', 'talk', 'say', 'explain',
         'describe', 'topic', 'subject', 'content', 'word', 'phrase',
-        'name the clips', 'title', 'label', 'chapters', 'divide', 'split'
+        'name the clips', 'title', 'label', 'transcript', 'chapter names',
+        'name clips from transcript'
     ]
-    
+
     is_content_based = any(
-        keyword in body.prompt.lower() 
+        keyword in body.prompt.lower()
         for keyword in content_based_keywords
     )
-    
-    # Allow basic structural commands without transcript
+
+    # Allow basic structural commands without transcript (including chapter division)
     basic_structural_keywords = [
-        'delete clip', 'remove clip', 'merge clip', 'keep clip', 'reorder', 'move clip'
+        'delete clip', 'remove clip', 'merge clip', 'keep clip', 'reorder', 'move clip',
+        'chapters', 'divide', 'split', 'cut into', 'break into'
     ]
-    
+
     is_basic_structural = any(
-        keyword in body.prompt.lower() 
+        keyword in body.prompt.lower()
         for keyword in basic_structural_keywords
     )
     
@@ -1108,74 +1246,173 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     # Build numbered clip list — include title when present so AI can match by name
     segments_text = "\n".join(
         (
-            f"{i + 1}. [{seg.get('start', 0):.2f}s - {seg.get('end', 0):.2f}s] "
+            f"{i + 1}. [Timeline: {seg.get('timelineStart', 0):.2f}s - {seg.get('timelineStart', 0) + seg.get('duration', seg.get('end', 0) - seg.get('start', 0)):.2f}s] "
+            f"(Source: {seg.get('start', 0):.2f}s - {seg.get('end', 0):.2f}s) "
             f"Title: \"{seg.get('title', '').strip()}\" | Transcript: {seg.get('text', '').strip()}"
             if seg.get('title')
             else
-            f"{i + 1}. [{seg.get('start', 0):.2f}s - {seg.get('end', 0):.2f}s] {seg.get('text', '').strip()}"
+            f"{i + 1}. [Timeline: {seg.get('timelineStart', 0):.2f}s - {seg.get('timelineStart', 0) + seg.get('duration', seg.get('end', 0) - seg.get('start', 0)):.2f}s] "
+            f"(Source: {seg.get('start', 0):.2f}s - {seg.get('end', 0):.2f}s) {seg.get('text', '').strip()}"
         )
         for i, seg in enumerate(clips_with_ids)
     )
+
+    # Extract requested chapter/clip count from prompt
+    import re as _re
+    # Match ranges like "7-8 clips" → use the higher number
+    range_match = _re.search(r'\b(\d+)\s*[-–]\s*(\d+)\s*(?:chapters?|parts?|sections?|clips?|segments?)?\b', body.prompt.lower())
+    if range_match:
+        requested_chapters = int(range_match.group(2))  # use upper bound of range
+    else:
+        chapter_count_match = _re.search(r'\b(\d+)\s*(?:chapters?|parts?|sections?|pieces?|clips?|segments?|equal\s+parts?)\b', body.prompt.lower())
+        # Also match "divide into 8" or "split into 7" without a unit word
+        if not chapter_count_match:
+            chapter_count_match = _re.search(r'(?:divide|split|break|cut)\s+(?:the\s+)?(?:video\s+)?into\s+(\d+)', body.prompt.lower())
+        requested_chapters = int(chapter_count_match.group(1)) if chapter_count_match else None
+    splits_needed = (requested_chapters - 1) if requested_chapters else None
+
+    # Check if user explicitly asked for RENAMING (descriptive names from transcript)
+    # "chapter" alone in a divide/split context means count, not rename
+    is_rename_requested = any(word in body.prompt.lower() for word in [
+        'rename', 'give names', 'name the clips', 'chapter names', 'descriptive',
+        'name from transcript', 'name according', 'title the clips', 'label the clips'
+    ])
+    is_content_based_split = any(word in body.prompt.lower() for word in ['transcript', 'topic', 'content', 'subject', 'say'])
+
+    # Only apply chapter instruction for whole-video division, NOT for specific clip splits
+    is_specific_clip_split = bool(_re.search(r'clip\s*\d+', body.prompt.lower()))
+
+    # Build chapter-specific instruction
+    chapter_instruction = ""
+    if requested_chapters and splits_needed and not is_specific_clip_split:
+        total_duration = max((seg.get('end', 0) for seg in clips_with_ids), default=0)
+        if total_duration > 0:
+            if is_rename_requested:
+                name_directive = "followed by a 'name_clips' action giving each part a descriptive title based on the transcript."
+            else:
+                name_directive = f"followed by a 'name_clips' action naming each part 'Clip 1', 'Clip 2', ... 'Clip {requested_chapters}'."
+
+            if is_content_based_split:
+                chapter_instruction = (
+                    f"\n\nCRITICAL: User wants EXACTLY {requested_chapters} parts based on the transcript content. "
+                    f"You MUST output EXACTLY {splits_needed} split action(s). "
+                    f"Video is {total_duration}s. "
+                    f"Analyze the transcript to find logical topic transitions and use those timestamps for split_time. "
+                    f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
+                )
+            else:
+                split_points = [round(total_duration * i / requested_chapters, 2) for i in range(1, requested_chapters)]
+                chapter_instruction = (
+                    f"\n\nCRITICAL: User wants EXACTLY {requested_chapters} equal parts. "
+                    f"You MUST output EXACTLY {splits_needed} split action(s). "
+                    f"Video is {total_duration}s. "
+                    f"Use these EXACT split_time values: {', '.join(str(t) for t in split_points)}. "
+                    f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
+                )
+    elif requested_chapters and splits_needed and is_specific_clip_split:
+        # Specific clip split — find that clip and compute correct split points
+        clip_num_match = _re.search(r'clip\s*(\d+)', body.prompt.lower())
+        if clip_num_match:
+            clip_num = int(clip_num_match.group(1))
+            target_clip = next((s for s in clips_with_ids if s.get('index') == clip_num or s.get('id', '').endswith(f'-{clip_num}')), None)
+            if not target_clip and clip_num <= len(clips_with_ids):
+                target_clip = clips_with_ids[clip_num - 1]
+            if target_clip:
+                clip_start = target_clip.get('start', 0)
+                clip_end = target_clip.get('end', 0)
+                split_points = [round(clip_start + (clip_end - clip_start) * i / requested_chapters, 2) for i in range(1, requested_chapters)]
+                split_points_str = ", ".join(f"{t}s" for t in split_points)
+                
+                if is_rename_requested:
+                    name_directive = "After splitting, use name_clips to give each part a descriptive title based on the transcript."
+                else:
+                    name_directive = f"After splitting, use name_clips to name each part 'Clip 1', 'Clip 2', ... 'Clip {requested_chapters}'."
+                
+                chapter_instruction = (
+                    f"\n\nCRITICAL SPLIT REQUIREMENT:\n"
+                    f"Split clip {clip_num} (range: {clip_start}s to {clip_end}s) into EXACTLY {requested_chapters} parts.\n"
+                    f"This requires EXACTLY {splits_needed} split action(s).\n"
+                    f"Correct split_time values (within clip range): {split_points_str}\n"
+                    f"Use clip_index: {clip_num} for all split actions.\n"
+                    f"CRITICAL: split_time MUST be between {clip_start} and {clip_end}.\n"
+                    f"{name_directive}"
+                )
 
     system_prompt = (
         "You are an AI video editor.\n"
         "You are given clips with an index, a title, and a transcript excerpt.\n"
         "Your task: convert the user's instruction into structured JSON edit actions.\n\n"
-        "IMPORTANT CAPABILITIES:\n"
-        "- You can work with existing clips AND create new clips by splitting long clips into chapters/sections.\n"
-        "- For chapter division: analyze the transcript to identify natural topic breaks and use split actions.\n"
-        "- SMART TRIMMING: When dividing into chapters, automatically identify and remove unwanted content.\n"
-        "- Use semantic meaning — if the user says 'reliance', match a clip whose title or text contains similar concepts.\n"
-        "- Do NOT default to clip 1 unless it is genuinely the best match.\n\n"
-        "CHAPTER DIVISION WITH SMART TRIMMING STRATEGY:\n"
-        "- When user asks to 'divide into chapters' or 'cut into main chapters', analyze the transcript for:\n"
-        "  1. MAIN CONTENT: Core scenarios, lessons, or topics\n"
-        "  2. UNWANTED CONTENT: Intros, outros, transitions, repetitive content, channel promotions\n"
-        "- Look for phrases that indicate main content vs. filler:\n"
-        "  * KEEP: 'Scenario one', 'Scenario two', actual lesson content, examples, stories\n"
-        "  * TRIM: 'Hey everyone', 'subscribe to my channel', 'like the video', 'check out the link', repetitive instructions\n"
-        "- CRITICAL APPROACH FOR CLEAN CHAPTERS:\n"
-        "  1. First use cut_time to remove intro/outro (e.g., cut_time 0-60 removes first 60s intro)\n"
-        "  2. Then use MULTIPLE split actions to divide remaining content into clean chapters\n"
-        "  3. Finally use name_clips to give descriptive titles\n"
-        "- EXAMPLE WORKFLOW FOR 3 CHAPTERS:\n"
-        "  * cut_time: {start: 0, end: 60} → Remove intro\n"
-        "  * cut_time: {start: 700, end: 751} → Remove outro\n"
-        "  * split: {clip_index: 1, split_time: 250} → Split at first boundary\n"
-        "  * split: {clip_index: 1, split_time: 450} → Split at second boundary (system will find correct clip)\n"
-        "  * Result: 3 clean chapters from original single clip\n"
-        "  * name_clips: Give each chapter a proper title\n"
-        "- CRITICAL: Use ABSOLUTE timestamps from the original video (0-751s range).\n"
-        "- CRITICAL: Always use clip_index: 1 for splits - the system will find the right clip automatically.\n"
-        "- For 3 chapters: Use 2 split operations with different absolute timestamps.\n"
-        "- You must estimate timestamps based on text position in the transcript, not use the clip end time.\n"
-        "- For a transcript of length N, if 'Scenario two' appears at roughly 1/3 through the text, estimate the timestamp as 1/3 of the total duration.\n"
-        "- EXAMPLE: For 751s video with 3 scenarios, split at ~250s (1/3) and ~500s (2/3) to create 3 equal chapters.\n"
-        "- NEVER split at the very end of a clip - splits must be at least 5 seconds before the end.\n\n"
-        "SMART TRIMMING EXAMPLES:\n"
-        "- If transcript starts with 'Hey everyone, I'm Alex...', consider trimming the intro\n"
-        "- If transcript ends with 'subscribe to my channel...', consider trimming the outro\n"
-        "- If there are repetitive instructions between scenarios, consider trimming transitions\n"
-        "- Focus on keeping the core educational/entertainment content\n\n"
-        "Return ONLY valid JSON. No explanation, no markdown, no code fences.\n"
-        "Never return an empty actions array.\n\n"
+        "CAPABILITIES:\n"
+        "- RENAME: Change clip names using name_clips\n"
+        "- DELETE CLIP: Remove an entire clip using cut\n"
+        "- DELETE TIME RANGE: Remove a specific time range using cut_time\n"
+        "- SPLIT: Divide a clip at a specific time using split\n"
+        "- MERGE: Combine two clips using merge\n"
+        "- SWAP: Reorder two clips using swap\n"
+        "- CHAPTERS BY NUMBER: Split into exact N chapters using N-1 split actions\n"
+        "- CHAPTERS BY TRANSCRIPT: Analyze transcript text to find topic boundaries and split there\n\n"
+        "NAMING RULES — CRITICAL:\n"
+        "- SPLIT / DIVIDE operations: DEFAULT to naming the resulting clips 'Clip 1', 'Clip 2', 'Clip 3'... (sequential numbers only).\n"
+        "  Do NOT use descriptive names when splitting UNLESS the user explicitly asks to 'rename' or use 'chapters' or 'chapter names'.\n"
+        "  If asked for chapters/names, use a 'name_clips' action AFTER splitting to give each part a descriptive title based on the transcript.\n"
+        "- RENAME operations: Use descriptive chapter names derived from the transcript content.\n"
+        "  When user says 'rename', 'give chapter names', 'chapters', 'name from transcript', 'title the clips' etc.,\n"
+        "  analyze the transcript text for each clip's time range and give a meaningful title.\n"
+        "  Example: 'Introduction', 'Main Topic', 'Conclusion', 'Product Demo', etc.\n"
+        "- If no transcript is available for rename: use 'Chapter 1', 'Chapter 2'...\n\n"
+        "TRANSCRIPT-BASED CHAPTER DETECTION:\n"
+        "- When user says 'identify chapters from transcript' or 'create chapters based on content':\n"
+        "  1. Read the transcript text carefully\n"
+        "  2. Find where topics change — look for transition phrases like 'now let's talk about', 'moving on', 'next', 'the second topic', 'chapter two', etc.\n"
+        "  3. Estimate the timestamp of each topic change based on its position in the transcript relative to total duration\n"
+        "  4. Use split actions at those timestamps\n"
+        "  5. Use name_clips with descriptive chapter names (if asked) or 'Clip 1', 'Clip 2'... (if just splitting)\n"
+        "- EXAMPLE: If transcript is 600s long and 'Second topic' appears 40% through the text, split at 240s\n\n"
+        "CHAPTER DIVISION BY NUMBER:\n"
+        "- To create N chapters: use EXACTLY N-1 split actions\n"
+        "- For 6 chapters: 5 splits. For 7 chapters: 6 splits.\n"
+        "- Always use clip_index: 1 for all splits\n"
+        "- Use ABSOLUTE timestamps (seconds from video start)\n"
+        "- If transcript available: split at topic boundaries\n"
+        "- If no transcript: split at equal time intervals\n"
+        "- NEVER split within 5 seconds of clip end\n"
+        "- After splitting, use name_clips with sequential names: Clip 1, Clip 2, Clip 3...\n\n"
+        "DELETE TIME RANGE (REMOVES those seconds from the current timeline):\n"
+        "- 'delete the first 10 seconds' → cut_time {start: 0, end: 10}\n"
+        "- 'delete 10 to 20 seconds' → cut_time {start: 10, end: 20}\n"
+        "- 'delete 10 seconds of clip 1' → cut_time {start: clip1_timeline_start, end: clip1_timeline_start + 10}\n"
+        "- 'delete the last 20 seconds of clip 2' → cut_time {start: clip2_timeline_end - 20, end: clip2_timeline_end}\n"
+        "- CRITICAL: cut_time REMOVES the range. The remaining video plays without that section.\n"
+        "- CRITICAL: start and end for cut_time are TIMELINE seconds (see 'Timeline:' in segments).\n\n"
+        "DELETE FULL CLIP:\n"
+        "- 'delete clip 2' → cut {clip_index: 2}\n"
+        "- 'remove clip 3' → cut {clip_index: 3}\n\n"
+        "SPLIT (divides a clip into separate parts):\n"
+        "- 'split clip 1 at 10 seconds' → split {clip_index: 1, split_time: 10}\n"
+        "- 'split clip 1 at 1:30' → split {clip_index: 1, split_time: 90}\n"
+        "- 'split clip 1 into 2 parts' → split at midpoint of clip 1\n"
+        "- 'split clip 1 into 3 parts' → 2 split actions at 1/3 and 2/3 of clip 1\n"
+        "- For N parts: use N-1 split actions at equal intervals\n"
+        "- CRITICAL: split_time for split action should be the SOURCE time (see 'Source:' in segments).\n"
+        "- If user says 'split at 2:30', convert: 2*60+30 = 150\n\n"
+        "RENAME:\n"
+        "- 'rename clip 1 to Introduction' → name_clips [{index: 1, title: 'Introduction'}]\n"
+        "- 'name all clips' → name_clips with descriptive titles from transcript content\n"
+        "- 'rename clips with chapter names' → name_clips using transcript to create descriptive chapter titles\n"
+        "- 'name clips from transcript' → analyze transcript text for each clip's time range and give a descriptive title\n"
+        "- 'give chapter names' → name_clips with titles based on what each clip's transcript says\n\n"
         "AVAILABLE ACTIONS:\n"
-        "- name_clips: {\"type\": \"name_clips\", \"clips\": [{\"index\": 1, \"title\": \"Specific Title\"}]}\n"
+        "- name_clips: {\"type\": \"name_clips\", \"clips\": [{\"index\": 1, \"title\": \"Title\"}]}\n"
         "- cut:        {\"type\": \"cut\", \"clip_index\": <number>}\n"
         "- cut_time:   {\"type\": \"cut_time\", \"start\": <seconds>, \"end\": <seconds>}\n"
-        "- split:      {\"type\": \"split\", \"clip_index\": <number>, \"split_time\": <seconds>}\n"
+        "- split:      {\"type\": \"split\", \"clip_index\": 1, \"split_time\": <seconds>}\n"
         "- merge:      {\"type\": \"merge\", \"clip_indexes\": [<number>, <number>]}\n"
         "- swap:       {\"type\": \"swap\", \"clip_indexes\": [<number>, <number>]}\n"
         "- keep:       {\"type\": \"keep\", \"clip_indexes\": [<number>]}\n\n"
-        "TIME PARSING RULES:\n"
-        "- Convert MM:SS expressions to total seconds: 0:10 → 10, 1:30 → 90, 2:05 → 125.\n"
-        "- Use cut_time when you want to remove unwanted sections (e.g. 'cut_time from 0 to 30' removes first 30 seconds).\n"
-        "- Use cut when the user refers to a clip by index or name.\n"
-        "- Use split when the user wants to divide a clip into parts (e.g. 'split clip 1 at 2:30').\n"
-        "- For smart chapter division: combine cut_time (to remove unwanted parts) + split (to create chapters) + name_clips.\n"
-        "- ESTIMATE split times based on where topics change in the transcript relative to total duration.\n"
-        "- Use swap when the user wants to change the order of two clips.\n\n"
-        f"CRITICAL: Currently {len(clips_with_ids)} clip(s) exist. After splitting, you'll have more clips to work with."
+        "TIME PARSING: Convert MM:SS to seconds: 1:30 → 90, 2:05 → 125.\n\n"
+        "Return ONLY valid JSON. No explanation, no markdown, no code fences.\n"
+        f"CRITICAL: Currently {len(clips_with_ids)} clip(s) exist. Total duration: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
+        + chapter_instruction
     )
 
     # INTELLIGENT PREPROCESSING: Handle common single-clip scenarios
@@ -1222,13 +1459,8 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     user_message = (
         f"Segments:\n{segments_text}\n\n"
         f"User instruction: {body.prompt.strip()}\n\n"
-        f"Current state: {len(clips_with_ids)} clip(s) exist. "
-        f"For chapter division with smart trimming, analyze the transcript to:\n"
-        f"1. Identify main content sections (scenarios, lessons, core topics)\n"
-        f"2. Identify unwanted content (intros, outros, channel promotions, repetitive instructions)\n"
-        f"3. Use cut_time to remove unwanted sections and split to create clean chapters\n"
-        f"4. Estimate timestamps based on where content changes occur in the text relative to total duration\n"
-        f"Example: If intro ends at 'Alright, let's practice' (10% through text), use cut_time to remove 0 to 10% of duration"
+        f"Current state: {len(clips_with_ids)} clip(s) exist."
+        + (f"\nREMINDER: User wants EXACTLY {requested_chapters} chapters. Use EXACTLY {splits_needed} split actions." if requested_chapters else "")
     )
 
     try:
@@ -1251,14 +1483,31 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 raw = raw[4:]
             raw = raw.strip()
 
-        result = _json.loads(raw)
+        # Robust JSON parsing — handle all malformed cases from the AI
+        try:
+            result = _json.loads(raw)
+        except _json.JSONDecodeError:
+            # Try wrapping as array if it looks like comma-separated objects
+            # e.g. {"type":"split",...},{"type":"name_clips",...}
+            wrapped = f"[{raw}]"
+            try:
+                items = _json.loads(wrapped)
+                if isinstance(items, list) and all(isinstance(i, dict) for i in items):
+                    result = {"actions": items}
+                    print(f"[edit-with-ai] Recovered comma-separated objects as actions array")
+                else:
+                    raise ValueError("Could not recover JSON")
+            except Exception:
+                raise _json.JSONDecodeError(f"Failed to parse response", raw, 0)
 
         # Normalize: if model returned a bare action object instead of {"actions": [...]}
         if "actions" not in result:
             if "type" in result:
-                # Single action returned at top level — wrap it
                 result = {"actions": [result]}
-                print(f"[edit-with-ai] Normalized bare action into actions array: {result}")
+                print(f"[edit-with-ai] Normalized bare action into actions array")
+            elif isinstance(result, list):
+                result = {"actions": result}
+                print(f"[edit-with-ai] Normalized list into actions array")
             else:
                 raise ValueError("Response missing 'actions' array and no 'type' field found")
 
@@ -1290,7 +1539,54 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         # ROBUSTNESS LAYER: Apply operations and get final clips
         final_clips, apply_warnings = _apply_operations_with_validation(clips_with_ids, operations)
         warnings.extend(apply_warnings)
-        
+
+        # POST-PROCESSING: If user requested N clips but we got fewer, split manually
+        if requested_chapters and not is_specific_clip_split and len(final_clips) < requested_chapters:
+            print(f"[edit-with-ai] Need {requested_chapters} clips, have {len(final_clips)} — splitting manually")
+            # Collect all source segments from all current clips
+            all_source_segs = []
+            for c in final_clips:
+                if c.get("segments"):
+                    all_source_segs.extend(c["segments"])
+                else:
+                    all_source_segs.append({
+                        "sourceStart": c.get("sourceStart", c.get("start", 0)),
+                        "sourceEnd":   c.get("sourceEnd",  c.get("end",   0)),
+                    })
+            total_dur = sum(s["sourceEnd"] - s["sourceStart"] for s in all_source_segs)
+            if total_dur > 0:
+                seg_dur = total_dur / requested_chapters
+                new_clips = []
+                seg_idx = 0
+                seg_pos = all_source_segs[0]["sourceStart"] if all_source_segs else 0
+                for chapter_i in range(requested_chapters):
+                    remaining = seg_dur
+                    chapter_segs = []
+                    while remaining > 0.01 and seg_idx < len(all_source_segs):
+                        s = all_source_segs[seg_idx]
+                        available = s["sourceEnd"] - seg_pos
+                        take = min(available, remaining)
+                        chapter_segs.append({"sourceStart": seg_pos, "sourceEnd": seg_pos + take})
+                        remaining -= take
+                        seg_pos += take
+                        if seg_pos >= s["sourceEnd"] - 0.01:
+                            seg_idx += 1
+                            if seg_idx < len(all_source_segs):
+                                seg_pos = all_source_segs[seg_idx]["sourceStart"]
+                    if chapter_segs:
+                        new_clips.append({
+                            "id": f"chapter-{chapter_i + 1}",
+                            "title": f"Clip {chapter_i + 1}",
+                            "name":  f"Clip {chapter_i + 1}",
+                            "start": chapter_segs[0]["sourceStart"],
+                            "end":   chapter_segs[-1]["sourceEnd"],
+                            "sourceStart": chapter_segs[0]["sourceStart"],
+                            "sourceEnd":   chapter_segs[-1]["sourceEnd"],
+                        })
+                if len(new_clips) == requested_chapters:
+                    final_clips = new_clips
+                    print(f"[edit-with-ai] Manual split produced {len(final_clips)} clips")
+
         # ROBUSTNESS LAYER: Normalize timeline
         normalized_clips = _normalize_timeline(final_clips)
         
@@ -1614,29 +1910,23 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
         action_type = action.get("type")
         
         if action_type == "name_clips":
-            # Rename operations
+            # Rename operations — use position-based matching
+            # name_clips indexes refer to the FINAL clip order after all splits
+            # We store these as positional renames to be applied at the end
             valid_renames = 0
             for clip_data in action.get("clips", []):
                 idx = clip_data.get("index")
                 title = clip_data.get("title", "")
-                if idx in index_to_id:
+                if idx and title:
+                    # Store as positional rename (index 1-based)
                     operations.append({
-                        "type": "rename",
-                        "clipId": index_to_id[idx],
-                        "params": {"title": title}
+                        "type": "rename_by_position",
+                        "clipId": None,
+                        "params": {"position": idx, "title": title}
                     })
                     valid_renames += 1
                 else:
-                    warnings.append(f"name_clips: clip index {idx} out of range (valid: 1-{len(clips)}), skipped")
-            
-            # If no valid renames were made, create a fallback rename for the first clip
-            if valid_renames == 0 and len(clips) > 0:
-                operations.append({
-                    "type": "rename",
-                    "clipId": clips[0].get("id", "clip-1"),
-                    "params": {"title": "Main Content"}
-                })
-                warnings.append("Applied fallback rename to first clip since no valid indexes were found")
+                    warnings.append(f"name_clips: clip index {idx} missing title, skipped")
         
         elif action_type == "cut":
             # Delete operation
@@ -1743,18 +2033,25 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
     current_clips = [dict(c) for c in clips]  # Deep copy
     warnings = []
     
-    for op in operations:
+    # Separate operations to run rename_by_position last
+    standard_operations = [op for op in operations if op.get("type") != "rename_by_position"]
+    rename_operations = [op for op in operations if op.get("type") == "rename_by_position"]
+    
+    for op in standard_operations:
         op_type = op.get("type")
         clip_id = op.get("clipId")
         params = op.get("params", {})
         
         if op_type == "rename":
-            # Rename clip
+            # Rename clip by ID
             for clip in current_clips:
                 if clip.get("id") == clip_id:
-                    clip["title"] = params.get("title", "")
+                    new_title = params.get("title", "")
+                    clip["title"] = new_title
+                    clip["name"] = new_title
+                    print(f"[rename] Renamed clip {clip_id} to '{new_title}'")
                     break
-        
+
         elif op_type == "delete":
             # Delete clip by ID
             initial_count = len(current_clips)
@@ -1794,102 +2091,96 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
             current_timeline_pos = 0.0  # Track position in edited timeline
             
             for i, clip in enumerate(current_clips):
-                clip_source_start = clip.get("start", 0)
-                clip_source_end = clip.get("end", 0)
+                clip_source_start = clip.get("sourceStart", clip.get("start", 0))
+                clip_source_end = clip.get("sourceEnd", clip.get("end", 0))
                 clip_duration = clip_source_end - clip_source_start
-                
+
                 # Calculate this clip's position in the edited timeline
                 clip_timeline_start = current_timeline_pos
                 clip_timeline_end = current_timeline_pos + clip_duration
-                
+
                 print(f"[cut_time] Clip {i + 1}: source={clip_source_start}-{clip_source_end}, timeline={clip_timeline_start:.2f}-{clip_timeline_end:.2f}, duration={clip_duration:.2f}s")
-                
+
                 # Check if delete range overlaps with this clip's timeline position
                 if clip_timeline_end <= cut_start or clip_timeline_start >= cut_end:
                     # Outside cut range, keep as-is
                     print(f"[cut_time]   → Keep (outside delete range)")
                     new_clips.append(clip)
                     current_timeline_pos = clip_timeline_end
-                    
+
                 elif clip_timeline_start >= cut_start and clip_timeline_end <= cut_end:
                     # Fully inside cut range, delete
                     print(f"[cut_time]   → Delete (fully inside delete range)")
-                    # Don't add to new_clips, don't advance timeline position
-                    
+
                 elif clip_timeline_start < cut_start and clip_timeline_end > cut_end:
                     # Cut in middle, split into two
                     print(f"[cut_time]   → Split (delete range in middle)")
-                    
-                    # Calculate how much to keep from start and end
                     keep_start_duration = cut_start - clip_timeline_start
                     keep_end_duration = clip_timeline_end - cut_end
-                    
-                    # Left segment (before delete range)
+
                     left = dict(clip)
                     left["id"] = f"{clip.get('id', 'clip')}a"
                     left["start"] = clip_source_start
                     left["end"] = clip_source_start + keep_start_duration
-                    
-                    # Right segment (after delete range)
+                    left["sourceStart"] = clip_source_start
+                    left["sourceEnd"] = clip_source_start + keep_start_duration
+
                     right = dict(clip)
                     right["id"] = f"{clip.get('id', 'clip')}b"
                     right["start"] = clip_source_end - keep_end_duration
                     right["end"] = clip_source_end
-                    
-                    # Validate minimum duration
+                    right["sourceStart"] = clip_source_end - keep_end_duration
+                    right["sourceEnd"] = clip_source_end
+
                     if keep_start_duration >= 0.5:
-                        print(f"[cut_time]     → Keep left: {left['start']:.2f}-{left['end']:.2f} ({keep_start_duration:.2f}s)")
+                        print(f"[cut_time]     → Keep left: {left['sourceStart']:.2f}-{left['sourceEnd']:.2f} ({keep_start_duration:.2f}s)")
                         new_clips.append(left)
                         current_timeline_pos += keep_start_duration
                     else:
-                        print(f"[cut_time]     → Drop left (< 0.5s)")
-                        warnings.append(f"cut_time: left segment of {clip.get('id')} < 0.5s, dropped")
-                    
+                        warnings.append(f"cut_time: left segment < 0.5s, dropped")
+
                     if keep_end_duration >= 0.5:
-                        print(f"[cut_time]     → Keep right: {right['start']:.2f}-{right['end']:.2f} ({keep_end_duration:.2f}s)")
+                        print(f"[cut_time]     → Keep right: {right['sourceStart']:.2f}-{right['sourceEnd']:.2f} ({keep_end_duration:.2f}s)")
                         new_clips.append(right)
                         current_timeline_pos += keep_end_duration
                     else:
-                        print(f"[cut_time]     → Drop right (< 0.5s)")
-                        warnings.append(f"cut_time: right segment of {clip.get('id')} < 0.5s, dropped")
-                
+                        warnings.append(f"cut_time: right segment < 0.5s, dropped")
+
                 elif clip_timeline_start < cut_start:
                     # Trim end (delete range starts in middle of clip)
                     print(f"[cut_time]   → Trim end")
                     keep_duration = cut_start - clip_timeline_start
-                    
+
                     trimmed = dict(clip)
                     trimmed["start"] = clip_source_start
                     trimmed["end"] = clip_source_start + keep_duration
-                    
+                    trimmed["sourceStart"] = clip_source_start
+                    trimmed["sourceEnd"] = clip_source_start + keep_duration
+
                     if keep_duration >= 0.5:
-                        print(f"[cut_time]     → Keep: {trimmed['start']:.2f}-{trimmed['end']:.2f} ({keep_duration:.2f}s)")
+                        print(f"[cut_time]     → Keep: {trimmed['sourceStart']:.2f}-{trimmed['sourceEnd']:.2f} ({keep_duration:.2f}s)")
                         new_clips.append(trimmed)
                         current_timeline_pos += keep_duration
                     else:
-                        print(f"[cut_time]     → Drop (< 0.5s)")
-                        warnings.append(f"cut_time: trimmed {clip.get('id')} < 0.5s, dropped")
-                        
+                        warnings.append(f"cut_time: trimmed clip < 0.5s, dropped")
                 else:
                     # Trim start (delete range ends in middle of clip)
                     print(f"[cut_time]   → Trim start")
-                    
-                    # Calculate how much to delete from the start of this clip
                     delete_duration = cut_end - clip_timeline_start
                     keep_duration = clip_timeline_end - cut_end
-                    
+
                     trimmed = dict(clip)
-                    # FIXED: Add delete_duration to source start (not subtract from end)
                     trimmed["start"] = clip_source_start + delete_duration
                     trimmed["end"] = clip_source_end
-                    
+                    trimmed["sourceStart"] = clip_source_start + delete_duration
+                    trimmed["sourceEnd"] = clip_source_end
+
                     if keep_duration >= 0.5:
-                        print(f"[cut_time]     → Keep: {trimmed['start']:.2f}-{trimmed['end']:.2f} ({keep_duration:.2f}s, deleted {delete_duration:.2f}s from start)")
+                        print(f"[cut_time]     → Keep: {trimmed['sourceStart']:.2f}-{trimmed['sourceEnd']:.2f} ({keep_duration:.2f}s, deleted {delete_duration:.2f}s from start)")
                         new_clips.append(trimmed)
                         current_timeline_pos += keep_duration
                     else:
-                        print(f"[cut_time]     → Drop (< 0.5s)")
-                        warnings.append(f"cut_time: trimmed {clip.get('id')} < 0.5s, dropped")
+                        warnings.append(f"cut_time: trimmed clip < 0.5s, dropped")
             
             print(f"[cut_time] Result: {len(new_clips)} clips remaining")
             current_clips = new_clips
@@ -1940,9 +2231,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                         source_split_time = source_start + timeline_offset
                         print(f"[split] Converted timeline {split_time:.2f} to source {source_split_time:.2f}")
                     else:
-                        print(f"[split] Split time {split_time:.2f} not valid for this clip")
-                        warnings.append(f"split: split_time {split_time:.2f} not within clip bounds, skipped")
-                        continue
+                        # AUTO-CORRECT: use midpoint of the clip
+                        source_split_time = (source_start + source_end) / 2.0
+                        print(f"[split] AUTO-CORRECTED split_time to midpoint: {source_split_time:.2f}")
                 
                 # Validate split_time is within source bounds with better tolerance
                 if source_start + 1.0 < source_split_time < source_end - 1.0:
@@ -1965,21 +2256,25 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                                 break
                         
                         # Create two new clips with clean, non-overlapping source ranges
+                        original_title = clip_to_split.get('title') or clip_to_split.get('name') or ''
                         clip_a = dict(clip_to_split)
                         clip_a["id"] = f"{clip_to_split.get('id', 'clip')}-A"
-                        clip_a["start"] = start  # Keep original timeline start
-                        clip_a["end"] = start + duration_a  # Timeline end based on duration
+                        clip_a["start"] = start
+                        clip_a["end"] = start + duration_a
                         clip_a["sourceStart"] = source_start
-                        clip_a["sourceEnd"] = source_split_time  # Clean cut at split point
-                        clip_a["title"] = f"{clip_to_split.get('title', 'Clip')} - Part 1"
-                        
+                        clip_a["sourceEnd"] = source_split_time
+                        # Leave title empty — name_clips action will set proper names
+                        clip_a["title"] = ""
+                        clip_a["name"] = ""
+
                         clip_b = dict(clip_to_split)
                         clip_b["id"] = f"{clip_to_split.get('id', 'clip')}-B"
-                        clip_b["start"] = start + duration_a  # Continue timeline from where A ends
-                        clip_b["end"] = start + duration_a + duration_b  # Timeline end
-                        clip_b["sourceStart"] = source_split_time  # Start exactly where A ends
+                        clip_b["start"] = start + duration_a
+                        clip_b["end"] = start + duration_a + duration_b
+                        clip_b["sourceStart"] = source_split_time
                         clip_b["sourceEnd"] = source_end
-                        clip_b["title"] = f"{clip_to_split.get('title', 'Clip')} - Part 2"
+                        clip_b["title"] = ""
+                        clip_b["name"] = ""
                         
                         # Preserve external clip properties
                         if clip_to_split.get("externalId"):
@@ -2139,11 +2434,13 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                     # Swap clips in array
                     current_clips[idx1], current_clips[idx2] = current_clips[idx2], current_clips[idx1]
                     
-                    # Rebuild timeline positions
+                    # Rebuild timeline positions using source durations
                     print(f"[swap] Rebuilding timeline positions...")
                     current_time = 0.0
                     for i, clip in enumerate(current_clips):
-                        duration = clip.get("end", 0) - clip.get("start", 0)
+                        src_s = clip.get("sourceStart", clip.get("start", 0))
+                        src_e = clip.get("sourceEnd",   clip.get("end",   0))
+                        duration = max(0.0, src_e - src_s)
                         clip["start"] = current_time
                         clip["end"] = current_time + duration
                         current_time += duration
@@ -2171,6 +2468,19 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                 warnings.append(f"keep: no clips matched keep list, operation skipped")
                 current_clips = clips  # Restore original
     
+    # Apply positional renames AT THE END so they work on the post-split/merge timeline
+    for op in rename_operations:
+        params = op.get("params", {})
+        pos = params.get("position", 1)
+        title = params.get("title", "")
+        idx = pos - 1  # convert to 0-based
+        if 0 <= idx < len(current_clips):
+            current_clips[idx]["title"] = title
+            current_clips[idx]["name"] = title
+            print(f"[rename_by_position] Renamed position {pos} to '{title}'")
+        else:
+            warnings.append(f"rename_by_position: position {pos} out of range (have {len(current_clips)} clips), skipped")
+
     # Validate all clips
     validated_clips, validation_warnings = _validate_and_repair_clips(current_clips)
     warnings.extend(validation_warnings)
@@ -2238,40 +2548,53 @@ def _normalize_timeline(clips: list) -> list:
     """
     Normalize timeline: recalculate timeline positions to be continuous.
     PRESERVES ARRAY ORDER - does NOT sort clips.
-    
-    CRITICAL: Preserves sourceStart/sourceEnd (original video timestamps) separately
-    from start/end (normalized timeline positions).
+    Duration is always computed from sourceStart/sourceEnd (source video times).
     """
     if not clips:
         return []
-    
-    # DO NOT SORT - preserve array order for user-defined sequencing (e.g., swaps)
-    # Normalize timeline positions to remove gaps
+
     current_time = 0.0
     normalized_clips = []
-    
-    for clip in clips:
-        original_start = clip.get("start", 0)
-        original_end = clip.get("end", 0)
-        duration = original_end - original_start
-        
-        # Create normalized clip with continuous timeline
+
+    for i, clip in enumerate(clips):
         normalized_clip = dict(clip)
-        
-        # CRITICAL: Preserve or create sourceStart/sourceEnd (original video timestamps)
-        # These must NEVER be modified - they represent the actual video segments to extract
+
+        # Duration comes from source times — these are always correct
+        src_start = normalized_clip.get("sourceStart", normalized_clip.get("start", 0))
+        src_end   = normalized_clip.get("sourceEnd",   normalized_clip.get("end",   0))
+
+        # For merged clips, compute duration from segments array
+        if normalized_clip.get("segments"):
+            duration = sum(
+                s.get("sourceEnd", s.get("end", 0)) - s.get("sourceStart", s.get("start", 0))
+                for s in normalized_clip["segments"]
+            )
+        else:
+            duration = max(0.0, src_end - src_start)
+
+        # Ensure sourceStart/sourceEnd are set
         if "sourceStart" not in normalized_clip:
-            normalized_clip["sourceStart"] = original_start
+            normalized_clip["sourceStart"] = src_start
         if "sourceEnd" not in normalized_clip:
-            normalized_clip["sourceEnd"] = original_end
-        
-        # Update start/end for normalized timeline (for sequencing/display)
-        normalized_clip["start"] = round(current_time, 2)
-        normalized_clip["end"] = round(current_time + duration, 2)
-        
+            normalized_clip["sourceEnd"] = src_end
+
+        # Timeline positions
+        normalized_clip["timelineStart"] = round(current_time, 3)
+        normalized_clip["start"]         = round(current_time, 3)
+        normalized_clip["end"]           = round(current_time + duration, 3)
+        normalized_clip["duration"]      = round(duration, 3)
+
+        # Name: keep existing, or assign sequential
+        existing_title = normalized_clip.get("title", "") or normalized_clip.get("name", "")
+        if not existing_title:
+            normalized_clip["title"] = f"Clip {i + 1}"
+            normalized_clip["name"]  = f"Clip {i + 1}"
+        else:
+            normalized_clip["name"] = existing_title
+
         normalized_clips.append(normalized_clip)
         current_time += duration
-    
+
     return normalized_clips
 
 
@@ -2335,6 +2658,10 @@ async def build_composition(session_id: str, body: BuildCompositionRequest):
         print(f"[{timestamp}] [build-composition]   Clip {i+1}: start={clip.get('start')}, end={clip.get('end')}, sourceStart={clip.get('sourceStart')}, sourceEnd={clip.get('sourceEnd')}, title=\"{clip.get('title', 'N/A')}\"")
     
     for i, clip in enumerate(clips):
+        # Calculate Remotion start frame based on absolute timeline placement
+        timeline_start = float(clip.get("start", 0))
+        start_from_frame = int(timeline_start * fps)
+        
         # Check if this is a merged clip with multiple segments
         if "segments" in clip and clip["segments"]:
             # This is a merged clip with segment-based extraction
@@ -2347,7 +2674,7 @@ async def build_composition(session_id: str, body: BuildCompositionRequest):
             remotion_clip = {
                 "id": clip.get("id", f"clip-{i + 1}"),
                 "src": f"/api/videos/{session_id}/stream",
-                "startFrom": current_frame,
+                "startFrom": start_from_frame,
                 "durationInFrames": duration_frames,
                 "volume": 1.0,
                 "segments": clip["segments"]  # Pass through segments for extraction
@@ -2367,14 +2694,22 @@ async def build_composition(session_id: str, body: BuildCompositionRequest):
             
             print(f"[{timestamp}] [build-composition] Processing clip {i + 1}: sourceStart={source_start}s, sourceEnd={source_end}s (duration: {duration}s, {duration_frames} frames)")
             
+            asset_url = clip.get("assetUrl")
+            if asset_url:
+                # Proxy endpoints properly configured in rendering script later
+                src = asset_url
+            else:
+                src = f"/api/videos/{session_id}/stream"
+            
             remotion_clip = {
                 "id": clip.get("id", f"clip-{i + 1}"),
-                "src": f"/api/videos/{session_id}/stream",
-                "startFrom": current_frame,
+                "src": src,
+                "startFrom": start_from_frame,
                 "durationInFrames": duration_frames,
                 "sourceStart": source_start,
                 "sourceEnd": source_end,
-                "volume": 1.0
+                "volume": clip.get("volume", 1.0),
+                "assetKind": clip.get("assetKind")
             }
         
         # Preserve external clip properties
@@ -2384,7 +2719,6 @@ async def build_composition(session_id: str, body: BuildCompositionRequest):
             remotion_clip["externalId"] = clip["externalId"]
         
         remotion_clips.append(remotion_clip)
-        current_frame += duration_frames
         
         print(f"[{timestamp}] [build-composition] clip {i+1}: frames {remotion_clip['startFrom']}-{remotion_clip['startFrom'] + remotion_clip['durationInFrames']}")
     
@@ -2525,9 +2859,8 @@ async def export_video_remotion(session_id: str, body: RemotionExportRequest):
     try:
         for clip in composition.get("clips", []):
             src = clip.get("src", "")
-            # If src is a relative URL like /api/videos/{id}/stream, convert to absolute HTTP URL
-            if src.startswith("/api/videos/") and "/stream" in src:
-                # Convert to absolute HTTP URL that Remotion can access
+            # Ensure ANY relative /api URL becomes an absolute URL for Remotion to access
+            if src.startswith("/api/"):
                 clip["src"] = f"http://localhost:8000{src}"
                 print(f"[{timestamp}] [export-remotion] Converted clip src: {src} → {clip['src']}")
             elif src.startswith("http://") or src.startswith("https://"):
@@ -2780,15 +3113,14 @@ async def export_video(session_id: str, body: ExportRequest):
     for i, clip in enumerate(clips):
         print(f"[export]   {i}: id={clip.get('id')}, sourceStart={clip.get('sourceStart')}, sourceEnd={clip.get('sourceEnd')}")
 
-    # Build a temporary concat list using ffmpeg trim + concat filter
-    # Strategy: trim each clip to a temp file, then concatenate
-    tmp_dir = Path(tempfile.mkdtemp())
-    segment_paths = []
-
+    # Build a single-pass filter_complex for maximum speed
+    # Strategy: Do all trimming and concatenation in memory without temp files
     try:
+        filter_chains = []
+        concat_inputs = ""
+        valid_clip_count = 0
+
         for i, clip in enumerate(clips):
-            # CRITICAL: Use sourceStart/sourceEnd for extraction, NOT start/end
-            # start/end are timeline positions, sourceStart/sourceEnd are original video positions
             source_start = float(clip.get("sourceStart", clip.get("start", 0)))
             source_end = float(clip.get("sourceEnd", clip.get("end", 0)))
             duration = source_end - source_start
@@ -2797,49 +3129,40 @@ async def export_video(session_id: str, body: ExportRequest):
                 print(f"[export] Skipping clip {i} with zero/negative duration: {source_start}-{source_end}")
                 continue
 
-            seg_path = tmp_dir / f"seg_{i:04d}.mp4"
-            print(f"[export] Trimming clip {i}: {source_start}s → {source_end}s → {seg_path}")
+            # Video trim
+            filter_chains.append(f"[0:v]trim=start={source_start}:end={source_end},setpts=PTS-STARTPTS[v{valid_clip_count}];")
+            # Audio trim
+            filter_chains.append(f"[0:a]atrim=start={source_start}:end={source_end},asetpts=PTS-STARTPTS[a{valid_clip_count}];")
+            
+            concat_inputs += f"[v{valid_clip_count}][a{valid_clip_count}]"
+            valid_clip_count += 1
 
-            result = subprocess.run([
-                "ffmpeg", "-y",
-                "-ss", str(source_start),
-                "-i", str(video_path),
-                "-t", str(duration),
-                "-c:v", "libx264", "-c:a", "aac",
-                "-avoid_negative_ts", "make_zero",
-                str(seg_path)
-            ], capture_output=True)
-
-            if result.returncode != 0:
-                err = result.stderr.decode()
-                print(f"[export] ffmpeg trim failed for clip {i}: {err}")
-                raise HTTPException(status_code=500, detail=f"Failed to trim clip {i}: {err[:200]}")
-
-            segment_paths.append(seg_path)
-
-        if not segment_paths:
+        if valid_clip_count == 0:
             raise HTTPException(status_code=400, detail="No valid clips to export.")
 
-        # Write concat list file
-        concat_list = tmp_dir / "concat.txt"
-        concat_list.write_text("\n".join(f"file '{p}'" for p in segment_paths))
+        # Final concatenation node
+        filter_chains.append(f"{concat_inputs}concat=n={valid_clip_count}:v=1:a=1[outv][outa]")
+        filter_complex = "".join(filter_chains)
 
-        # Concatenate all segments
         output_path = UPLOAD_DIR / f"{session_id}_export.mp4"
-        print(f"[export] Concatenating {len(segment_paths)} segments → {output_path}")
+        print(f"[export] Exporting {valid_clip_count} segments via single-pass filter_complex → {output_path}")
 
         result = subprocess.run([
             "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy",
+            "-i", str(video_path),
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "[outa]",
+            "-c:v", "libx264", 
+            "-c:a", "aac",
+            "-preset", "fast",
             str(output_path)
         ], capture_output=True)
 
         if result.returncode != 0:
             err = result.stderr.decode()
-            print(f"[export] ffmpeg concat failed: {err}")
-            raise HTTPException(status_code=500, detail=f"Failed to concatenate clips: {err[:200]}")
+            print(f"[export] ffmpeg single-pass export failed: {err}")
+            raise HTTPException(status_code=500, detail=f"Failed to export video: {err[:200]}")
 
         print(f"[export] Export complete: {output_path}")
         return FileResponse(
@@ -2858,61 +3181,71 @@ async def export_video(session_id: str, body: ExportRequest):
     except Exception as e:
         print(f"[export] exception: {e}")
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
-    finally:
-        # Clean up temp segment files
-        for p in segment_paths:
-            try:
-                p.unlink()
-            except Exception:
-                pass
-        try:
-            (tmp_dir / "concat.txt").unlink()
-            tmp_dir.rmdir()
-        except Exception:
-            pass
 
 
-@app.get("/api/pixabay")
-async def pixabay_proxy(
-    type: str = "videos",
-    q: str = "",
-    per_page: int = 10,
-    page: int = 1,
-    safesearch: bool = True,
-    image_type: Optional[str] = None,
-):
+@app.get("/api/proxy-image")
+async def proxy_image(url: str):
     """
-    Proxy endpoint for Pixabay API (Moulika's feature).
-    Reads PIXABAY_API_KEY from environment so the key is never exposed to the frontend.
+    Proxy external images (Pixabay CDN) to avoid CORS issues in the browser.
     """
     import httpx
-    api_key = os.getenv("PIXABAY_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="PIXABAY_API_KEY not configured. Set it in backend/.env"
-        )
+    from fastapi.responses import Response
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            content_type = r.headers.get("content-type", "image/jpeg")
+            return Response(content=r.content, media_type=content_type)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to proxy image: {str(e)}")
 
-    url = "https://pixabay.com/api/videos/" if type == "videos" else "https://pixabay.com/api/"
-    params: dict = {
-        "key": api_key,
-        "q": q,
-        "per_page": per_page,
-        "page": page,
-        "safesearch": "true" if safesearch else "false",
-    }
-    if image_type:
-        params["image_type"] = image_type
+
+@app.get("/api/proxy-video")
+async def proxy_video(url: str, request: Request):
+    """
+    Proxy external video files (Pixabay CDN) to avoid CORS issues.
+    Streams chunk-by-chunk to support Range requests and fast seeking.
+    """
+    import httpx
+    from fastapi.responses import StreamingResponse
+
+    req_headers = {"User-Agent": "Mozilla/5.0"}
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["Range"] = range_header
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client_http:
-            response = await client_http.get(url, params=params)
-            response.raise_for_status()
-            return JSONResponse(content=response.json())
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"Pixabay API error: {e.response.text}")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to reach Pixabay: {str(e)}")
+        client_http = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+        upstream_req = client_http.build_request("GET", url, headers=req_headers)
+        upstream = await client_http.send(upstream_req, stream=True)
+
+        content_type = upstream.headers.get("content-type", "video/mp4")
+        resp_headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=3600",
+        }
+        for h in ("content-length", "content-range"):
+            if h in upstream.headers:
+                resp_headers[h.title()] = upstream.headers[h]
+
+        status = upstream.status_code if upstream.status_code in (200, 206) else 200
+
+        async def stream_gen():
+            try:
+                async for chunk in upstream.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client_http.aclose()
+
+        return StreamingResponse(
+            stream_gen(), status_code=status,
+            headers=resp_headers, media_type=content_type
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to proxy video: {str(e)}")
+
+
 
 
 if __name__ == "__main__":

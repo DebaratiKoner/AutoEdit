@@ -86,19 +86,25 @@ export class APIClient {
             reject(new NetworkError('Invalid JSON response', error));
           }
         } else {
-          reject(
-            new APIError(
-              xhr.status,
-              `Upload failed with status ${xhr.status}`,
-              xhr.responseText
-            )
-          );
+          // Try to extract the FastAPI detail message
+          let errorMessage = `Upload failed with status ${xhr.status}`;
+          try {
+            const errJson = JSON.parse(xhr.responseText);
+            if (errJson.detail) {
+              errorMessage = typeof errJson.detail === 'string'
+                ? errJson.detail
+                : JSON.stringify(errJson.detail);
+            }
+          } catch {
+            if (xhr.responseText) errorMessage = xhr.responseText;
+          }
+          reject(new APIError(xhr.status, errorMessage, xhr.responseText));
         }
       });
 
       // Handle network errors
       xhr.addEventListener('error', () => {
-        reject(new NetworkError('Network error during upload'));
+        reject(new NetworkError('Cannot connect to server. Make sure the backend is running on port 8000.'));
       });
 
       // Handle abort
@@ -119,14 +125,15 @@ export class APIClient {
    */
   async transcribeVideo(
     sessionId: string,
-    clips?: Array<{ start: number; end: number; title?: string }>
+    clips?: Array<{ start: number; end: number; title?: string }>,
+    quick?: boolean
   ): Promise<TranscriptResponse> {
     return this.requestWithRetry<TranscriptResponse>(
       `${this.baseUrl}/videos/${sessionId}/transcribe`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clips: clips || null }),
+        body: JSON.stringify({ clips: clips || null, quick: quick || false }),
       }
     );
   }
@@ -273,11 +280,20 @@ export class APIClient {
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new APIError(
-          response.status,
-          `Request failed with status ${response.status}`,
-          errorText
-        );
+        // Try to extract the detail message from FastAPI's JSON error response
+        let errorMessage = `Request failed with status ${response.status}`;
+        try {
+          const errorJson = JSON.parse(errorText);
+          if (errorJson.detail) {
+            errorMessage = typeof errorJson.detail === 'string'
+              ? errorJson.detail
+              : JSON.stringify(errorJson.detail);
+          }
+        } catch {
+          // Not JSON — use raw text if available
+          if (errorText) errorMessage = errorText;
+        }
+        throw new APIError(response.status, errorMessage, errorText);
       }
 
       return await response.json();
@@ -285,7 +301,7 @@ export class APIClient {
       if (error instanceof APIError) {
         throw error;
       }
-      throw new NetworkError('Connection failed', error);
+      throw new NetworkError('Connection failed — is the backend running on port 8000?', error);
     }
   }
 

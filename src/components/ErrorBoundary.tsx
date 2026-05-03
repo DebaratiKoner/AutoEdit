@@ -3,7 +3,7 @@
  * Catches JavaScript errors in the component tree and displays fallback UI
  */
 
-import React, { Component, ErrorInfo, ReactNode } from 'react';
+import { Component, ErrorInfo, ReactNode } from 'react';
 import { logger } from '../utils';
 
 interface Props {

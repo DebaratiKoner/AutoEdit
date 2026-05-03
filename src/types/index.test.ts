@@ -10,6 +10,7 @@ describe('Type definitions', () => {
       timelineStart: 0,
       duration: 10,
       order: 0,
+      track: 0,
     };
 
     expect(segment.id).toBe('test-id');
@@ -24,6 +25,7 @@ describe('Type definitions', () => {
       resolution: { width: 1920, height: 1080 },
       timeline: [],
       transcript: null,
+      transcriptSegments: null,
       undoStack: [],
       redoStack: [],
       lastModified: Date.now(),

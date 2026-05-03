@@ -17,6 +17,7 @@ export interface TimelineSegment {
   color?: string;          // Permanent color for visual identification
   assetKind?: 'video' | 'photo' | 'audio'; // Type of asset if this is an imported asset
   assetUrl?: string;       // URL for imported assets
+  volume?: number;         // Volume level for audio tracks (0-2, default 1)
   segments?: Array<{       // For merged clips: array of source segments
     sourceStart: number;
     sourceEnd: number;
@@ -33,15 +34,16 @@ export type EditAction =
   | { type: 'DELETE'; segment: TimelineSegment }
   | { type: 'MOVE'; segmentId: string; oldOrder: number; newOrder: number }
   | { type: 'REORDER'; previousTimeline: TimelineSegment[] }
-  | { type: 'ADD_ASSET'; previousTimeline: TimelineSegment[] }
+  | { type: 'ADD_ASSET'; previousTimeline: TimelineSegment[]; asset?: TimelineSegment }
+  | { type: 'RESIZE'; previousTimeline: TimelineSegment[] }
   | { type: 'TRANSCRIPT_EDIT'; oldText: string; newText: string }
   | { 
       type: 'AI_EDIT'; 
       previousTimeline: TimelineSegment[];
       previousTranscript: string | null;
       previousTranscriptSegments: Array<{ start: number; end: number; text: string }> | null;
-      prompt: string;
-      operations: Array<Record<string, any>>;
+      prompt?: string;
+      operations?: Array<Record<string, any>>;
     };
 
 /**

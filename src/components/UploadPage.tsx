@@ -81,18 +81,31 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
       const uploadResponse = await apiClient.uploadVideo(file);
       const sessionId = uploadResponse.sessionId;
 
-      // 2. Also cache in IndexedDB for local playback
-      const db = await openVideoDatabase();
-      const transaction = db.transaction(['videos'], 'readwrite');
-      const store = transaction.objectStore('videos');
-      await store.put({ id: sessionId, file: file });
+      // 2. Also cache in IndexedDB for local playback (non-fatal)
+      try {
+        const db = await openVideoDatabase();
+        const transaction = db.transaction(['videos'], 'readwrite');
+        const store = transaction.objectStore('videos');
+        await store.put({ id: sessionId, file: file });
+      } catch (dbError) {
+        logger.warn('IndexedDB cache failed (non-fatal):', dbError);
+      }
 
       if (onUploadComplete) {
         onUploadComplete(sessionId);
       }
-    } catch (error) {
+    } catch (error: unknown) {
       logger.error('Failed to upload video:', error);
-      setError('Failed to upload video. Please try again.');
+      if (error && typeof error === 'object' && 'message' in error) {
+        const msg = (error as { message: string }).message;
+        if (msg.toLowerCase().includes('network') || msg.toLowerCase().includes('connection') || msg.toLowerCase().includes('fetch')) {
+          setError('Cannot connect to server. Make sure the backend is running on port 8000.');
+        } else {
+          setError(`Upload failed: ${msg}`);
+        }
+      } else {
+        setError('Failed to upload video. Make sure the backend server is running on port 8000.');
+      }
     } finally {
       setIsUploading(false);
     }
@@ -151,7 +164,7 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
             </svg>
             <p className="drop-zone-text">{isUploading ? 'Uploading...' : 'Drop your video here'}</p>
             <p className="drop-zone-subtext">{isUploading ? 'Please wait' : 'or click to browse'}</p>
-            <p className="drop-zone-formats">Supported: MP4, MOV, WebM (720p minimum)</p>
+            <p className="drop-zone-formats">Supported: MP4, MOV, WebM</p>
           </div>
         </div>
 

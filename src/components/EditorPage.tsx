@@ -1,13 +1,14 @@
-/**
+  /**
  * Editor Page Component
  * Main editing interface with video player, timeline, and controls
  */
 
-import { useState, useEffect, useRef } from 'react';
-import { SessionManager, APIClient, CompositionBuilder } from '../services';
+import React, { useState, useEffect, useRef } from 'react';
+import { SessionManager, CompositionBuilder } from '../services';
 import { formatTime, logger } from '../utils';
 import type { SessionData, TimelineSegment, CompositionSchema } from '../types';
 import { RemotionPreview } from './RemotionPreview';
+import { AssetsTab } from './AssetsTab';
 import './EditorPage.css';
 
 interface EditorPageProps {
@@ -18,48 +19,386 @@ interface EditorPageProps {
 export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [session, setSession] = useState<SessionData | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
+  const [activeAssetClip, setActiveAssetClip] = useState<TimelineSegment | null>(null);
+  const [activeOverlayClip, setActiveOverlayClip] = useState<TimelineSegment | null>(null);
+  const [photoOverlay, setPhotoOverlay] = useState<{ url: string; name: string } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [activeTab, setActiveTab] = useState<'clips' | 'ai-edit' | 'assets'>('clips');
   const [showResetDialog, setShowResetDialog] = useState(false);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [seekingSegmentId, setSeekingSegmentId] = useState<string | null>(null);
-  const [aiPrompt, setAiPrompt] = useState('');
-  const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; actions?: Array<Record<string, any>> }>>([]);
-  const [isAiEditing, setIsAiEditing] = useState(false);
-  const [aiError, setAiError] = useState<string | null>(null);
-  const [showRemotionPreview, setShowRemotionPreview] = useState(false);
+  const showRemotionPreview = false;
   const [compositionSchema, setCompositionSchema] = useState<CompositionSchema | null>(null);
-  const [showTranscribeButton, setShowTranscribeButton] = useState(true);
   const [draggedSegmentId, setDraggedSegmentId] = useState<string | null>(null);
   const [dragOverSegmentId, setDragOverSegmentId] = useState<string | null>(null);
   const [dragOverPosition, setDragOverPosition] = useState<number | null>(null);
-  const [assets, setAssets] = useState<Array<{ id: string; name: string; type: 'photo' | 'video' | 'audio'; url: string; duration?: number }>>([]);
-  const [uploadingAsset, setUploadingAsset] = useState(false);
-  const [transcriptionVisible, setTranscriptionVisible] = useState(true);
-  const [isEditPanelFullscreen, setIsEditPanelFullscreen] = useState(true);
+  const [dragOverSide, setDragOverSide] = useState<'left' | 'right' | null>(null);
+  const [resizingSegmentId, setResizingSegmentId] = useState<string | null>(null);
+  const [resizeType, setResizeType] = useState<'left' | 'right' | null>(null);
+  const [resizeInitialX, setResizeInitialX] = useState<number>(0);
+  const [resizeInitialStart, setResizeInitialStart] = useState<number>(0);
+  const [resizeInitialDuration, setResizeInitialDuration] = useState<number>(0);
+  const [dragOffset, setDragOffset] = useState<number>(0);
+  const [isUploadingAsset, setIsUploadingAsset] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const insertAfterClipIdRef = useRef<string | null>(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcribeTimer, setTranscribeTimer] = useState(0);
+  const [showTranscript, setShowTranscript] = useState(true);
+  const [isAiEditing, setIsAiEditing] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [chatHistory, setChatHistory] = useState<Array<{role: 'user' | 'assistant', content: string}>>([]);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const currentClipIndexRef = useRef(0);      // current clip index — stable across re-renders
-  const isJumpingRef = useRef(false);  // guard against programmatic-seek → seeked loops
+  const currentClipIndexRef = useRef<number>(0);
+  const isJumpingRef = useRef<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const assetVideoRef = useRef<HTMLVideoElement>(null);  // dedicated element for asset clips
   const timelineRef = useRef<HTMLDivElement>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
-  const sessionRef = useRef<SessionData | null>(null); // always holds latest session for async closures
+  const sessionRef = useRef<SessionData | null>(null);
+  const isSwitchingRef = useRef<boolean>(false);
+  const currentSrcRef = useRef<string>('');
+  const assetSrcRef = useRef<string>('');               // tracks current asset video src
+  const [assetVideoOpacity, setAssetVideoOpacity] = useState(0);
+  // photo timer ref
+  const photoTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const systemActionRef = useRef<boolean>(false);
+  const isPlayingRef = useRef<boolean>(false);
+  const photoElapsedRef = useRef<number>(0);
+  const lastFrameTimeRef = useRef<number>(performance.now());
+  const snapshotImgRef = useRef<HTMLImageElement>(null);
+
+  const takeTransitionSnapshot = () => {
+    if (!snapshotImgRef.current || !videoRef.current) return;
+    const video = videoRef.current;
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 1920;
+      canvas.height = video.videoHeight || 1080;
+      const ctx = canvas.getContext('2d');
+      if (ctx && canvas.width > 0 && canvas.height > 0) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        snapshotImgRef.current.src = canvas.toDataURL('image/jpeg');
+        snapshotImgRef.current.style.opacity = '1';
+      }
+    } catch(e) {
+      // Ignore cross-origin errors
+    }
+  };
+
+  const clearTransitionSnapshot = () => {
+    if (!snapshotImgRef.current) return;
+    snapshotImgRef.current.style.opacity = '0';
+    // Let transition finish before clearing src to avoid flash
+    setTimeout(() => {
+      if (snapshotImgRef.current && snapshotImgRef.current.style.opacity === '0') {
+        snapshotImgRef.current.src = '';
+      }
+    }, 200);
+  };
+
+  const handleLocalFileInsert = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0 || !session) return;
+    const file = files[0];
+    try {
+      setIsUploadingAsset(true);
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/assets/upload', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('Upload failed');
+      const data = await res.json();
+
+      const isAudio = data.assetType === 'audio' || file.type.startsWith('audio/');
+      const assetDuration = data.assetType === 'video' ? (data.duration || 5) : 5;
+      const assetUrl = data.assetUrl || `/api/assets/${data.assetId}/stream`;
+
+      if (isAudio) {
+        // Audio → track 1 at current playhead
+        const track0Segs = session.timeline.filter(s => s.track === 0);
+        const totalDur = track0Segs.reduce((sum, s) => sum + s.duration, 0);
+        const insertAt = Math.min(currentTime, totalDur);
+        const newSeg: TimelineSegment = {
+          id: `local-${Date.now()}`, name: file.name,
+          assetUrl, assetKind: 'audio',
+          duration: assetDuration, timelineStart: insertAt,
+          sourceStart: 0, sourceEnd: assetDuration,
+          order: session.timeline.filter(s => s.track === 1).length,
+          track: 1, color: getAssetColor('audio'), volume: 1,
+        };
+        setSession({ ...session, timeline: [...session.timeline, newSeg],
+          undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSeg }],
+          redoStack: [] });
+        return;
+      }
+
+      const track0Segs = session.timeline.filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+      let newTrack0: TimelineSegment[] = [];
+
+      const newSeg: TimelineSegment = {
+        id: `local-${Date.now()}`, name: file.name,
+        assetUrl, assetKind: data.assetType === 'video' ? 'video' : 'photo',
+        duration: assetDuration, timelineStart: 0,
+        sourceStart: 0, sourceEnd: assetDuration,
+        order: 0, track: 0, color: getAssetColor(data.assetType || 'video'),
+      };
+
+      if (insertAfterClipIdRef.current) {
+        const i = track0Segs.findIndex(s => s.id === insertAfterClipIdRef.current);
+        const idx = i >= 0 ? i : track0Segs.length - 1;
+        newTrack0 = [
+          ...track0Segs.slice(0, idx + 1),
+          newSeg,
+          ...track0Segs.slice(idx + 1),
+        ];
+      } else {
+        let cutMade = false;
+        for (let i = 0; i < track0Segs.length; i++) {
+          const seg = track0Segs[i];
+          const start = seg.timelineStart ?? 0;
+          const end = start + seg.duration;
+          
+          if (currentTime > start + 0.05 && currentTime < end - 0.05) {
+            const cutOffset = currentTime - start;
+            const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
+            
+            const segment1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
+            const segment2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: seg.duration - cutOffset };
+            
+            newTrack0 = [
+              ...track0Segs.slice(0, i),
+              segment1,
+              newSeg,
+              segment2,
+              ...track0Segs.slice(i + 1),
+            ];
+            cutMade = true;
+            break;
+          }
+        }
+        
+        if (!cutMade) {
+          let insertIdx = track0Segs.length;
+          for (let i = 0; i < track0Segs.length; i++) {
+            if (currentTime <= (track0Segs[i].timelineStart ?? 0) + 0.05) {
+              insertIdx = i;
+              break;
+            }
+          }
+          newTrack0 = [
+            ...track0Segs.slice(0, insertIdx),
+            newSeg,
+            ...track0Segs.slice(insertIdx),
+          ];
+        }
+      }
+
+      let t = 0;
+      const adjusted = newTrack0.map((s, i) => { const r = { ...s, order: i, timelineStart: t }; t += s.duration; return r; });
+      const others = session.timeline.filter(s => s.track !== 0);
+      setSession({ ...session, timeline: [...adjusted, ...others],
+        undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSeg }],
+        redoStack: [] });
+    } catch (err) {
+      console.error(err);
+      alert('Failed to upload file');
+    } finally {
+      setIsUploadingAsset(false);
+      insertAfterClipIdRef.current = null;
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleTranscribe = async () => {
+    if (!session) return;
+    setIsTranscribing(true);
+    try {
+      // Send the actual edited timeline clips so Whisper transcribes only kept segments
+      // Timestamps are mapped back to timeline positions after transcription
+      const track0Clips = session.timeline
+        .filter(s => s.track === 0 && !s.assetUrl) // only original video segments
+        .sort((a, b) => a.order - b.order)
+        .map(s => ({
+          start: s.sourceStart ?? 0,
+          end: s.sourceEnd ?? s.duration,
+          timelineStart: s.timelineStart ?? 0,
+        }));
+
+      const response = await fetch(`/api/videos/${sessionId}/transcribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clips: track0Clips.length > 0 ? track0Clips : null,
+          quick: false,  // full transcription — audio is compressed to tiny size so it's still fast
+        })
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.detail || 'Transcription failed');
+      }
+      const data = await response.json();
+
+      // Backend already remaps Whisper timestamps to timeline positions.
+      // Segments arrive with start/end matching the edited timeline.
+      const updatedSession = {
+        ...session,
+        transcript: data.transcript,
+        transcriptSegments: data.segments || [],
+      };
+      setSession(updatedSession);
+      void sessionManager.saveSession(sessionId, updatedSession);
+      setChatHistory(prev => [...prev, { role: 'assistant', content: 'Transcription complete!' }]);
+    } catch (e: any) {
+      console.error(e);
+      alert(`Failed to transcribe video: ${e.message}`);
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  const handleAiEditSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!session || !aiPrompt.trim()) return;
+    setIsAiEditing(true);
+    const currentPrompt = aiPrompt;
+    setAiPrompt('');
+    setChatHistory(prev => [...prev, { role: 'user', content: currentPrompt }]);
+
+    try {
+      const response = await fetch(`/api/videos/${sessionId}/edit-with-ai`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: currentPrompt,
+          // Map to the format the backend expects: {start, end, id, title, text}
+          segments: session.timeline
+            .filter(s => s.track === 0)
+            .sort((a, b) => a.order - b.order)
+            .map((s, i) => {
+              // Extract transcript text for this specific segment based on timeline overlap
+              let text = '';
+              if (session.transcriptSegments) {
+                const segStart = s.timelineStart ?? 0;
+                const segEnd = segStart + s.duration;
+                text = session.transcriptSegments
+                  .filter(ts => ts.start < segEnd && ts.end > segStart)
+                  .map(ts => ts.text)
+                  .join(' ')
+                  .trim();
+              }
+              return {
+                id: s.id,
+                index: i + 1,
+                start: s.sourceStart ?? 0,
+                end: s.sourceEnd ?? s.duration,
+                timelineStart: s.timelineStart ?? 0,
+                duration: s.duration,
+                title: s.name || `Clip ${i + 1}`,
+                text,
+                order: s.order,
+                track: s.track,
+                color: s.color,
+                assetUrl: s.assetUrl,
+                assetKind: s.assetKind,
+              };
+            })
+        })
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.detail?.message || err.detail || 'AI Edit failed');
+      }
+
+      const data = await response.json();
+      
+      // Map backend clips back to TimelineSegment format
+      const track0 = (data.clips || []).map((clip: any, i: number) => {
+        const origSeg = session.timeline.find(s => s.id === clip.id);
+        const assetUrl = clip.assetUrl ?? origSeg?.assetUrl;
+        const assetKind = clip.assetKind ?? origSeg?.assetKind;
+        const srcStart = clip.sourceStart ?? origSeg?.sourceStart ?? 0;
+        const srcEnd   = clip.sourceEnd   ?? origSeg?.sourceEnd   ?? 0;
+        // Duration from source times (always reliable); fall back to backend duration field
+        const duration = clip.duration ?? (srcEnd - srcStart);
+        return {
+          id: clip.id || origSeg?.id || `ai-clip-${i}`,
+          sourceStart: srcStart,
+          sourceEnd:   srcEnd,
+          timelineStart: clip.timelineStart ?? 0,
+          duration,
+          order: i,
+          track: 0,
+          color: assetUrl ? getAssetColor(assetKind || 'video') : getClipColor(i),
+          name: clip.name || clip.title || `Clip ${i + 1}`,
+          assetUrl,
+          assetKind,
+          volume: clip.volume ?? origSeg?.volume,
+        };
+      });
+      // Recalculate timelineStart for all clips
+      let t = 0;
+      const adjustedTrack0 = track0.map((seg: any) => {
+        const s = { ...seg, timelineStart: t };
+        t += seg.duration;
+        return s;
+      });
+      const otherTracks = session.timeline.filter(s => s.track !== 0);
+      const newTimeline = [...adjustedTrack0, ...otherTracks];
+      
+      const updatedSession = {
+         ...session,
+         timeline: newTimeline,
+         undoStack: [...session.undoStack, { 
+           type: 'AI_EDIT' as const, 
+           previousTimeline: session.timeline, 
+           previousTranscript: session.transcript, 
+           previousTranscriptSegments: session.transcriptSegments 
+         }],
+         redoStack: []
+      };
+
+      setSession(updatedSession);
+      void sessionManager.saveSession(sessionId, updatedSession);
+
+      setChatHistory(prev => [...prev, { 
+        role: 'assistant', 
+        content: 'Done' 
+      }]);
+      
+    } catch (e: any) {
+      console.error(e);
+      setChatHistory(prev => [...prev, { role: 'assistant', content: `Error: ${e.message}` }]);
+    } finally {
+      setIsAiEditing(false);
+    }
+  };
 
   const sessionManager = new SessionManager();
+
+  const getShortName = (name: string | undefined | null, fallback: string) => {
+    if (!name || typeof name !== 'string') return fallback;
+    const trimmed = name.trim();
+    if (/^clip\s+\d+$/i.test(trimmed)) return trimmed;
+    const firstWord = trimmed.split(/[\s_-]+/)[0];
+    return firstWord || fallback;
+  };
+
+  const getAssetPreviewUrl = (url?: string | null) => {
+    if (!url || typeof url !== 'string') return '';
+    return url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('/api/') ? url : `/api/proxy-image?url=${encodeURIComponent(url)}`;
+  };
 
   // Helper function to add transcript history entry after editing operations
   const addTranscriptHistoryEntry = (session: SessionData, operation: string): SessionData => {
     if (!session.transcript) return session;
-    
     const historyEntry = {
       timestamp: Date.now(),
       operation,
       transcript: session.transcript,
       segments: session.transcriptSegments,
     };
-    
     return {
       ...session,
       transcriptHistory: [...(session.transcriptHistory || []), historyEntry],
@@ -68,47 +407,111 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   useEffect(() => {
     loadSession();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (isTranscribing) {
+      setTranscribeTimer(0);
+      interval = setInterval(() => {
+        setTranscribeTimer(prev => prev + 0.1);
+      }, 100);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isTranscribing]);
 
   // Check if session has transcript on load to determine button visibility
   useEffect(() => {
     if (session) {
       const hasExistingTranscript = !!(session.transcript && session.transcript.trim().length > 0);
       logger.debug('Session loaded - hasTranscript:', hasExistingTranscript);
-      setShowTranscribeButton(!hasExistingTranscript);
-      
-      // Always show transcript area if transcript exists
-      if (hasExistingTranscript) {
-        setTranscriptionVisible(true);
-      }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.sessionId]); // Only run when session ID changes (initial load)
 
   // Keep ref in sync so async handlers always read the latest session
   useEffect(() => {
     sessionRef.current = session;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session]);
+
+  // Set the video src imperatively on initial load — never via React prop
+  // This prevents React re-renders from resetting the src during asset playback
+  useEffect(() => {
+    if (!session?.videoUrl || !videoRef.current) return;
+    const video = videoRef.current;
+    // Only set if not already on this src (don't interrupt asset playback)
+    if (currentSrcRef.current === '' || currentSrcRef.current === session.videoUrl) {
+      video.src = session.videoUrl;
+      currentSrcRef.current = session.videoUrl;
+      video.load();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.sessionId]); // Only on session change, not every render
 
   // Sync video position when session loads or clips change
   useEffect(() => {
     if (!session || !videoRef.current) return;
     const video = videoRef.current;
-    const sortedClips = [...session.timeline].sort((a, b) => a.order - b.order);
+    const sortedClips = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
     if (sortedClips.length === 0) return;
-    const t = video.currentTime;
-    const inValidClip = sortedClips.some(c => t >= c.sourceStart && t < c.sourceEnd);
-    logger.debug('Video init - currentTime:', t, 'clips:', sortedClips.map(c => `${c.sourceStart}-${c.sourceEnd}`));
-    if (!inValidClip) {
-      video.currentTime = sortedClips[0].sourceStart;
-      setCurrentTime(sortedClips[0].sourceStart);
-      logger.debug('Video init - snapped to first clip start:', sortedClips[0].sourceStart);
+    
+    try {
+      const t = video.currentTime;
+      const inValidClip = sortedClips.some(c => !c.assetUrl && t >= (c.sourceStart ?? 0) && t < (c.sourceEnd ?? 0));
+      if (!inValidClip) {
+        if (video.readyState > 0) {
+          video.currentTime = sortedClips[0].sourceStart ?? 0;
+        }
+        setCurrentTime(sortedClips[0].timelineStart ?? 0);
+      }
+    } catch (e) {
+      logger.error('Video sync error:', e);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.sessionId, session?.timeline.length]);
 
   // Auto-scroll chat to bottom when new messages arrive
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages, isAiEditing]);
+  }, [chatHistory, isAiEditing]);
+
+  // Track which asset clip is currently active — based on clip index, not raw video time
+  // This fires whenever currentTime changes (every RAF frame during playback)
+  useEffect(() => {
+    if (!session) { setActiveAssetClip(null); setPhotoOverlay(null); return; }
+    const sorted = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+    const idx = currentClipIndexRef.current;
+    const activeSeg = sorted[idx] ?? null;
+
+    if (activeSeg?.assetUrl) {
+      setActiveAssetClip(activeSeg);
+      // Fallback: If legacy session had a photo on Track 0, display it
+      if (activeSeg.assetKind === 'photo') {
+        setPhotoOverlay(prev => {
+          const newUrl = getAssetPreviewUrl(activeSeg.assetUrl);
+          const newName = activeSeg.name ?? 'Photo';
+          if (prev?.url === newUrl && prev?.name === newName) return prev;
+          return { url: newUrl, name: newName };
+        });
+      } else {
+        setPhotoOverlay(null);
+      }
+    } else {
+      setActiveAssetClip(null);
+      setPhotoOverlay(null);
+    }
+
+    // Evaluate active free-positioned overlays on Track 1
+    const track1Clips = (session.timeline || []).filter(s => s.track === 1 && s.assetKind !== 'audio');
+    const activeOverlay = track1Clips.find(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0));
+    
+    setActiveOverlayClip(activeOverlay && activeOverlay.assetUrl ? activeOverlay : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime, session?.timeline]);
 
   // Build Remotion composition when timeline or transcriptSegments change
   useEffect(() => {
@@ -122,127 +525,280 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         setCompositionSchema(null);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.timeline, session?.transcriptSegments, showRemotionPreview]);
 
   useEffect(() => {
-    // Controlled playback: enforce clip boundaries during play and on seek
+    // ── Single-video playback engine ──────────────────────────────────────────
+    // Uses ONE <video> element. When an asset clip is active, we swap its src.
+    // When done, we swap back to the original video src.
     if (!session || !videoRef.current) return;
 
     const video = videoRef.current;
-    const sortedClips = [...session.timeline].sort((a, b) => a.order - b.order);
-    const EPS = 0.1; // float precision buffer
+    const sortedClips = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+    const EPS = 0.03; // Tighter tolerance for precise playback transitions
 
     let rafId = 0;
     let rafRunning = false;
 
-    const jump = (time: number) => {
-      if (isJumpingRef.current) return;
-      isJumpingRef.current = true;
-      video.currentTime = time;
-      setCurrentTime(time);
-      setTimeout(() => { isJumpingRef.current = false; }, 50);
+    const clearPhotoTimer = () => {
+      if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
     };
 
-    const enforce = () => {
-      if (video.paused || isJumpingRef.current) return;
-      if (sortedClips.length === 0) { video.pause(); setIsPlaying(false); return; }
+    // ── Load a clip into the video element ────────────────────────────────────
+    const loadClip = async (clip: typeof sortedClips[0], shouldPlay: boolean) => {
+      isSwitchingRef.current = true;
+      clearPhotoTimer();
 
-      const t = video.currentTime;
-      setCurrentTime(t);
-
-      // Find clip with epsilon buffer for float precision
-      const currentClip = sortedClips.find(
-        c => t >= c.sourceStart - EPS && t < c.sourceEnd + EPS
-      );
-
-      if (!currentClip) {
-        // In a gap — jump aggressively to next clip by index
-        const nextIndex = currentClipIndexRef.current + 1;
-        const nextClip = nextIndex < sortedClips.length ? sortedClips[nextIndex] : sortedClips[0];
-        currentClipIndexRef.current = nextIndex < sortedClips.length ? nextIndex : 0;
-        if (nextIndex < sortedClips.length) {
-          jump(nextClip.sourceStart);
-        } else {
-          video.pause();
-          setIsPlaying(false);
-          jump(sortedClips[0].sourceStart);
+      // ── PHOTO: show as overlay, keep original video paused ──────────────────
+      if (clip.assetKind === 'photo' && clip.assetUrl) {
+        // Pause original video but keep its position
+        systemActionRef.current = true;
+        video.pause();
+        setPhotoOverlay({ url: getAssetPreviewUrl(clip.assetUrl), name: clip.name ?? 'Photo' });
+        setActiveAssetClip(clip);
+        setAssetVideoOpacity(0);
+        isSwitchingRef.current = false;
+        photoElapsedRef.current = 0;
+        if (shouldPlay) {
+          setIsPlaying(true);
+          isPlayingRef.current = true;
+          photoTimerRef.current = setTimeout(() => {
+            advanceToNextClip(true);
+          }, clip.duration * 1000);
         }
         return;
       }
 
-      // Near or past clip end — jump to next
-      if (t >= currentClip.sourceEnd - EPS) {
-        const nextIndex = currentClipIndexRef.current + 1;
-        const nextClip = nextIndex < sortedClips.length ? sortedClips[nextIndex] : null;
-        if (nextClip) {
-          currentClipIndexRef.current = nextIndex;
-          jump(nextClip.sourceStart);
-        } else {
-          // End of timeline, loop back to first clip
-          currentClipIndexRef.current = 0;
-          video.pause();
-          setIsPlaying(false);
-          jump(sortedClips[0].sourceStart);
+      // ── ASSET VIDEO: play in the overlay video element ──────────────────────
+      if (clip.assetUrl && clip.assetKind === 'video') {
+        const av = assetVideoRef.current;
+        if (!av) { isSwitchingRef.current = false; return; }
+
+        // Pause original video, keep its position
+        systemActionRef.current = true;
+        video.pause();
+        setPhotoOverlay(null);
+        setActiveAssetClip(clip);
+
+        // Pre-seek the original video to the NEXT clip's start position
+        // so when we return to it after the asset, there's no seek delay
+        const nextIdx = currentClipIndexRef.current + 1;
+        if (nextIdx < sortedClips.length) {
+          const nextClip = sortedClips[nextIdx];
+          if (!nextClip.assetUrl) {
+            try { video.currentTime = nextClip.sourceStart ?? 0; } catch(e) {}
+          }
         }
+
+        // Load asset into the overlay video
+        if (assetSrcRef.current !== clip.assetUrl) {
+          av.src = clip.assetUrl;
+          assetSrcRef.current = clip.assetUrl;
+          av.load();
+          await new Promise<void>(resolve => {
+            const onMeta = () => { av.removeEventListener('loadedmetadata', onMeta); resolve(); };
+            av.addEventListener('loadedmetadata', onMeta);
+            setTimeout(() => { av.removeEventListener('loadedmetadata', onMeta); resolve(); }, 3000);
+          });
+        }
+        av.currentTime = 0;
+
+        // Wait for canplay then fade in
+        await new Promise<void>(resolve => {
+          const onReady = () => { av.removeEventListener('canplay', onReady); resolve(); };
+          av.addEventListener('canplay', onReady);
+          setTimeout(() => { av.removeEventListener('canplay', onReady); resolve(); }, 2000);
+        });
+
+        setAssetVideoOpacity(1);  // fade in asset video
+        isSwitchingRef.current = false;
+        lastFrameTimeRef.current = performance.now();
+
+        if (shouldPlay) {
+          av.play().catch(() => {});
+          setIsPlaying(true);
+          isPlayingRef.current = true;
+          // Ensure rAF loop is running to track asset video time
+          if (!rafRunning) {
+            rafRunning = true;
+            rafId = requestAnimationFrame(rafLoop);
+          }
+        }
+        return;
+      }
+
+      // ── ORIGINAL VIDEO CLIP ─────────────────────────────────────────────────
+      const targetTime = clip.sourceStart ?? 0;
+
+      // Fade out asset video overlay
+      setAssetVideoOpacity(0);
+      setPhotoOverlay(null);
+      setActiveAssetClip(null);
+
+      // Stop asset video
+      const av = assetVideoRef.current;
+      if (av && !av.paused) {
+        av.pause();
+      }
+
+      // Seek original video to the correct position (may already be pre-seeked)
+      if (Math.abs(video.currentTime - targetTime) > 0.15) {
+        takeTransitionSnapshot();
+        try {
+          video.currentTime = targetTime;
+          await new Promise<void>(resolve => {
+            const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); };
+            video.addEventListener('seeked', onSeeked);
+            setTimeout(() => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); }, 800);
+          });
+        } catch(e) { clearTransitionSnapshot(); }
+      }
+
+      isSwitchingRef.current = false;
+      lastFrameTimeRef.current = performance.now();
+
+      if (shouldPlay) {
+        systemActionRef.current = true;
+        video.play().catch(() => {});
+        setIsPlaying(true);
+        isPlayingRef.current = true;
       }
     };
 
-    // rAF loop — runs every frame (~16ms) while playing, much faster than timeupdate (~250ms)
+    const advanceToNextClip = (shouldPlay: boolean) => {
+      const next = currentClipIndexRef.current + 1;
+      if (next < sortedClips.length) {
+        currentClipIndexRef.current = next;
+        loadClip(sortedClips[next], shouldPlay);
+      } else {
+        // End of timeline — reset to start
+        currentClipIndexRef.current = 0;
+        systemActionRef.current = true;
+        video.pause();
+        clearPhotoTimer();
+        setPhotoOverlay(null);
+        setActiveAssetClip(null);
+        setAssetVideoOpacity(0);
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        // Stop asset video
+        const av = assetVideoRef.current;
+        if (av && !av.paused) av.pause();
+        // Seek original video back to first clip start
+        const firstClip = sortedClips[0];
+        if (firstClip && !firstClip.assetUrl) {
+          video.currentTime = firstClip.sourceStart ?? 0;
+        }
+        setCurrentTime(sortedClips[0].timelineStart ?? 0);
+      }
+    };
+
+    // ── rAF enforce loop ──────────────────────────────────────────────────────
+    const enforce = () => {
+      if (isSwitchingRef.current) {
+        lastFrameTimeRef.current = performance.now();
+        return;
+      }
+      if (sortedClips.length === 0) return;
+
+      const idx = currentClipIndexRef.current;
+      const clip = sortedClips[idx];
+      if (!clip) return;
+
+      lastFrameTimeRef.current = performance.now();
+
+      // Photo clips are handled by timer — skip
+      if (clip.assetKind === 'photo') return;
+
+      // Asset video clip — track time from the asset video element
+      if (clip.assetKind === 'video' && clip.assetUrl) {
+        const av = assetVideoRef.current;
+        if (!av || av.paused || isJumpingRef.current) return;
+        const t = av.currentTime;
+        setCurrentTime((clip.timelineStart ?? 0) + Math.max(0, t));
+        if (t >= clip.duration - EPS) {
+          advanceToNextClip(true);
+        }
+        return;
+      }
+
+      // Original video clip
+      if (video.paused || isJumpingRef.current) return;
+      const t = video.currentTime;
+      const clipSourceStart = clip.sourceStart ?? 0;
+      setCurrentTime((clip.timelineStart ?? 0) + Math.max(0, t - clipSourceStart));
+
+      const clipEnd = clip.sourceEnd ?? 0;
+      if (t >= clipEnd - EPS) {
+        advanceToNextClip(true);
+      }
+    };
+
     const rafLoop = () => {
       enforce();
       if (rafRunning) rafId = requestAnimationFrame(rafLoop);
     };
 
-    const handlePlay = () => {
-      if (sortedClips.length === 0) return;
-      const t = video.currentTime;
-      // Find current clip's index in sortedClips
-      const currentIndex = sortedClips.findIndex(c => t >= c.sourceStart - EPS && t < c.sourceEnd + EPS);
-      if (currentIndex >= 0) {
-        currentClipIndexRef.current = currentIndex;
-      } else {
-        // Not in a clip, set index to 0 and jump to first clip
-        currentClipIndexRef.current = 0;
-        jump(sortedClips[0].sourceStart);
-      }
-      // Start rAF loop
-      rafRunning = true;
-      rafId = requestAnimationFrame(rafLoop);
-    };
-
-    const handlePause = () => {
-      rafRunning = false;
-      cancelAnimationFrame(rafId);
-    };
-
-    const handleSeeked = () => {
-      if (isJumpingRef.current) return;
-      const t = video.currentTime;
-      if (sortedClips.length === 0) return;
-      const clipIndex = sortedClips.findIndex(c => t >= c.sourceStart - EPS && t < c.sourceEnd + EPS);
-      if (clipIndex >= 0) {
-        currentClipIndexRef.current = clipIndex;
+    const handlePlayEvent = () => {
+      if (systemActionRef.current) {
+        systemActionRef.current = false;
         return;
       }
-      // Not in a clip, find next clip by index
-      const nextIndex = sortedClips.findIndex(c => c.sourceStart > t);
-      if (nextIndex >= 0) {
-        currentClipIndexRef.current = nextIndex;
-        jump(sortedClips[nextIndex].sourceStart);
-      } else {
-        currentClipIndexRef.current = sortedClips.length - 1;
-        jump(sortedClips[sortedClips.length - 1].sourceStart);
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      lastFrameTimeRef.current = performance.now();
+
+      // If current clip is an asset, load it now (user pressed play)
+      const idx = currentClipIndexRef.current;
+      const clip = sortedClips[idx];
+      if (clip && clip.assetUrl) {
+        loadClip(clip, true);
+        return;
+      }
+
+      if (!rafRunning) {
+        rafRunning = true;
+        rafId = requestAnimationFrame(rafLoop);
       }
     };
 
-    // Also keep timeupdate as a fallback for browsers that throttle rAF
-    video.addEventListener('timeupdate', enforce);
-    video.addEventListener('play', handlePlay);
-    video.addEventListener('pause', handlePause);
-    video.addEventListener('seeked', handleSeeked);
+    const handlePauseEvent = () => {
+      if (systemActionRef.current) {
+        systemActionRef.current = false;
+        return;
+      }
+      // Only stop rAF if we're not in the middle of asset playback
+      const idx = currentClipIndexRef.current;
+      const clip = sortedClips[idx];
+      const isAssetPlaying = clip?.assetUrl && assetVideoRef.current && !assetVideoRef.current.paused;
+      if (!isAssetPlaying) {
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        rafRunning = false;
+        cancelAnimationFrame(rafId);
+        clearPhotoTimer();
+      }
+    };
 
-    // If video is already playing when effect runs (e.g. after edit), start loop immediately
-    if (!video.paused) {
+    const handleEndedEvent = () => {
+      advanceToNextClip(true);
+    };
+
+    // Asset video ended → advance to next clip
+    const handleAssetEnded = () => {
+      advanceToNextClip(true);
+    };
+
+    const av = assetVideoRef.current;
+
+    video.addEventListener('timeupdate', enforce);
+    video.addEventListener('play', handlePlayEvent);
+    video.addEventListener('pause', handlePauseEvent);
+    video.addEventListener('ended', handleEndedEvent);
+    if (av) av.addEventListener('ended', handleAssetEnded);
+
+    if (!video.paused || isPlayingRef.current) {
       rafRunning = true;
       rafId = requestAnimationFrame(rafLoop);
     }
@@ -250,11 +806,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     return () => {
       rafRunning = false;
       cancelAnimationFrame(rafId);
+      clearPhotoTimer();
       video.removeEventListener('timeupdate', enforce);
-      video.removeEventListener('play', handlePlay);
-      video.removeEventListener('pause', handlePause);
-      video.removeEventListener('seeked', handleSeeked);
+      video.removeEventListener('play', handlePlayEvent);
+      video.removeEventListener('pause', handlePauseEvent);
+      video.removeEventListener('ended', handleEndedEvent);
+      if (av) av.removeEventListener('ended', handleAssetEnded);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session]);
 
   const loadSession = async () => {
@@ -277,7 +836,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       
       // Save migrated session
       if (migratedTimeline.some((seg, i) => seg.color !== data.timeline[i].color)) {
-        await sessionManager.saveSession(sessionId, restoredSession);
+        void sessionManager.saveSession(sessionId, restoredSession);
       }
       return;
     }
@@ -325,23 +884,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
     logger.operation('Session created:', { sessionId, duration });
     setSession(newSession);
-    await sessionManager.saveSession(sessionId, newSession);
-  };
-
-  const handlePlayPause = () => {
-    setIsPlaying(!isPlaying);
-  };
-
-  const handleTimelineClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!session || !videoRef.current || isDraggingPlayhead) return;
-    
-    const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const percentage = clickX / rect.width;
-    const newTime = percentage * session.duration;
-    
-    videoRef.current.currentTime = newTime;
-    setCurrentTime(newTime);
+    void sessionManager.saveSession(sessionId, newSession);
   };
 
   const handlePlayheadMouseDown = (e: React.MouseEvent) => {
@@ -350,23 +893,152 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   };
 
   const handleMouseMove = (e: MouseEvent) => {
-    if (!isDraggingPlayhead || !session || !videoRef.current || !timelineRef.current) return;
+    if (!timelineRef.current || !sessionRef.current) return;
     
     const rect = timelineRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
-    const newTime = percentage * session.duration;
-    
-    videoRef.current.currentTime = newTime;
-    setCurrentTime(newTime);
+    const track0Segments = sessionRef.current.timeline.filter(s => s.track === 0);
+    const totalDur = Math.max(
+      track0Segments.reduce((sum, s) => sum + s.duration, 0),
+      sessionRef.current.duration || 1
+    );
+
+    if (isDraggingPlayhead && videoRef.current) {
+      const mouseX = e.clientX - rect.left;
+      const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
+      const newTime = percentage * totalDur;
+      
+      void jumpToTimelineTime(newTime, sessionRef.current);
+    }
+
+    if (resizingSegmentId && resizeType) {
+      const session = sessionRef.current;
+      const deltaX = e.clientX - resizeInitialX;
+      const deltaTime = (deltaX / rect.width) * totalDur;
+      
+      let newStart = resizeInitialStart;
+      let newDuration = resizeInitialDuration;
+      
+      if (resizeType === 'left') {
+        newStart = Math.max(0, resizeInitialStart + deltaTime);
+        const effectiveDelta = newStart - resizeInitialStart;
+        newDuration = Math.max(0.5, resizeInitialDuration - effectiveDelta);
+        if (newDuration === 0.5) {
+          newStart = resizeInitialStart + (resizeInitialDuration - 0.5);
+        }
+      } else {
+        newDuration = Math.max(0.5, resizeInitialDuration + deltaTime);
+      }
+      
+      const updatedTimeline = session.timeline.map(seg => 
+        seg.id === resizingSegmentId 
+          ? { ...seg, timelineStart: newStart, duration: newDuration, sourceEnd: (seg.sourceStart ?? 0) + newDuration } 
+          : seg
+      );
+      
+      setSession({ ...session, timeline: updatedTimeline });
+    }
   };
 
   const handleMouseUp = () => {
-    setIsDraggingPlayhead(false);
+    if (isDraggingPlayhead) {
+      setIsDraggingPlayhead(false);
+    }
+    if (resizingSegmentId) {
+      if (sessionRef.current) {
+         const updatedSession = {
+            ...sessionRef.current,
+            undoStack: [...sessionRef.current.undoStack, { type: 'RESIZE' as const, previousTimeline: sessionRef.current.timeline }],
+            redoStack: []
+         };
+         void sessionManager.saveSession(sessionId, updatedSession);
+      }
+      setResizingSegmentId(null);
+      setResizeType(null);
+    }
+  };
+
+  const jumpToTimelineTime = async (timelineTime: number, sourceSession: SessionData = session!) => {
+    if (!videoRef.current || !sourceSession) return;
+
+    const video = videoRef.current;
+    const av = assetVideoRef.current;
+    const sorted = [...(sourceSession.timeline || [])]
+      .filter(seg => seg.track === 0)
+      .sort((a, b) => a.order - b.order);
+    if (sorted.length === 0) return;
+
+    const clampedTime = Math.max(0, Math.min(timelineTime, sorted.reduce((sum, seg) => sum + seg.duration, 0)));
+    const segmentIndex = sorted.findIndex(
+      seg => clampedTime >= (seg.timelineStart ?? 0) && clampedTime <= (seg.timelineStart ?? 0) + seg.duration
+    );
+    const targetIndex = segmentIndex >= 0 ? segmentIndex : sorted.length - 1;
+    const segment = sorted[targetIndex];
+    const offset = Math.max(0, Math.min(segment.duration, clampedTime - (segment.timelineStart ?? 0)));
+
+    currentClipIndexRef.current = targetIndex;
+    setSelectedSegmentId(segment.id);
+    setCurrentTime((segment.timelineStart ?? 0) + offset);
+
+    if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
+
+    // Photo
+    if (segment.assetKind === 'photo' && segment.assetUrl) {
+      video.pause();
+      if (av && !av.paused) av.pause();
+      setAssetVideoOpacity(0);
+      setPhotoOverlay({ url: getAssetPreviewUrl(segment.assetUrl), name: segment.name ?? 'Photo' });
+      setActiveAssetClip(segment);
+      return;
+    }
+
+    // Asset video
+    if (segment.assetKind === 'video' && segment.assetUrl && av) {
+      const wasPlaying = !video.paused || (av && !av.paused);
+      video.pause();
+      setPhotoOverlay(null);
+      setActiveAssetClip(segment);
+      if (assetSrcRef.current !== segment.assetUrl) {
+        av.src = segment.assetUrl;
+        assetSrcRef.current = segment.assetUrl;
+        av.load();
+        await new Promise<void>(resolve => {
+          const onMeta = () => { av.removeEventListener('loadedmetadata', onMeta); resolve(); };
+          av.addEventListener('loadedmetadata', onMeta);
+          setTimeout(() => { av.removeEventListener('loadedmetadata', onMeta); resolve(); }, 2000);
+        });
+      }
+      av.currentTime = offset;
+      setAssetVideoOpacity(1);
+      if (wasPlaying) { av.play().catch(() => {}); setIsPlaying(true); }
+      return;
+    }
+
+    // Original video clip
+    setPhotoOverlay(null);
+    setActiveAssetClip(null);
+    setAssetVideoOpacity(0);
+    if (av && !av.paused) av.pause();
+
+    const targetTime = (segment.sourceStart ?? 0) + offset;
+    const wasPlaying = !video.paused;
+    takeTransitionSnapshot();
+    video.pause();
+    try {
+      video.currentTime = targetTime;
+      await new Promise<void>(resolve => {
+        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); };
+        video.addEventListener('seeked', onSeeked);
+        setTimeout(() => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); }, 1000);
+      });
+    } catch(e) { clearTransitionSnapshot(); }
+
+    if (wasPlaying) {
+      try { await video.play(); setIsPlaying(true); } catch {}
+    }
   };
 
   useEffect(() => {
-    if (isDraggingPlayhead) {
+    if (isDraggingPlayhead || resizingSegmentId) {
       window.addEventListener('mousemove', handleMouseMove);
       window.addEventListener('mouseup', handleMouseUp);
       
@@ -375,17 +1047,23 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         window.removeEventListener('mouseup', handleMouseUp);
       };
     }
-  }, [isDraggingPlayhead, session]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDraggingPlayhead, resizingSegmentId, resizeType, resizeInitialX, resizeInitialStart, resizeInitialDuration]);
 
   const handleCut = () => {
     if (!session) return;
     
-    // Find which segment contains the current time
-    const segmentToCut = session.timeline.find(
-      seg => currentTime >= seg.sourceStart && currentTime <= seg.sourceEnd
-    );
-    
-    if (!segmentToCut || currentTime === segmentToCut.sourceStart || currentTime === segmentToCut.sourceEnd) {
+    // Only cut track 0 (main video) segments
+    const segmentToCut = session.timeline
+      .filter(seg => seg.track === 0)
+      .find(seg => currentTime >= (seg.timelineStart ?? 0) && currentTime < (seg.timelineStart ?? 0) + seg.duration);
+
+    if (!segmentToCut) return;
+
+    const cutOffset = currentTime - (segmentToCut.timelineStart ?? 0);
+    const sourceCutTime = (segmentToCut.sourceStart ?? 0) + cutOffset;
+
+    if (cutOffset <= 0 || cutOffset >= segmentToCut.duration) {
       alert('Cannot cut at segment boundaries. Please position the playhead within a segment.');
       return;
     }
@@ -393,8 +1071,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     // Get next available color for the second segment only
     const existingColors = session.timeline.map(seg => seg.color).filter(c => c !== undefined) as string[];
     const availableColors = [
-      '#4a90e2', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6',
-      '#1abc9c', '#e67e22', '#34495e', '#16a085', '#27ae60'
+      '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6',
+      '#1abc9c', '#e67e22', '#16a085', '#27ae60'
     ];
     
     // First segment keeps the original color
@@ -418,10 +1096,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     // Create two new segments from the cut
     const segment1: TimelineSegment = {
       id: `${segmentToCut.id}-1`,
-      sourceStart: segmentToCut.sourceStart,
-      sourceEnd: currentTime,
-      timelineStart: segmentToCut.timelineStart,
-      duration: currentTime - segmentToCut.sourceStart,
+      sourceStart: segmentToCut.sourceStart ?? 0,
+      sourceEnd: sourceCutTime,
+      timelineStart: segmentToCut.timelineStart ?? 0,
+      duration: cutOffset,
       order: segmentToCut.order,
       track: segmentToCut.track, // Preserve track
       color: color1, // Assign new unique color
@@ -430,10 +1108,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     
     const segment2: TimelineSegment = {
       id: `${segmentToCut.id}-2`,
-      sourceStart: currentTime,
-      sourceEnd: segmentToCut.sourceEnd,
-      timelineStart: segmentToCut.timelineStart + segment1.duration,
-      duration: segmentToCut.sourceEnd - currentTime,
+      sourceStart: sourceCutTime,
+      sourceEnd: segmentToCut.sourceEnd ?? 0,
+      timelineStart: (segmentToCut.timelineStart ?? 0) + segment1.duration,
+      duration: segmentToCut.duration - cutOffset,
       order: segmentToCut.order + 1,
       track: segmentToCut.track, // Preserve track
       color: color2, // Assign new unique color
@@ -494,26 +1172,35 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
     
     setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
   };
 
-  const handleDelete = () => {
-    if (!session || !selectedSegmentId) {
-      alert('Please select a segment to delete by clicking on it in the timeline.');
-      return;
+  const handleDelete = (idToDelete?: string | React.MouseEvent) => {
+    if (!session) return;
+
+    let targetId = selectedSegmentId;
+    if (typeof idToDelete === 'string') {
+      targetId = idToDelete;
     }
-    
-    const segmentToDelete = session.timeline.find(seg => seg.id === selectedSegmentId);
+
+    // Auto-select the first track-0 clip if nothing is selected
+    targetId = targetId || (
+      [...session.timeline].filter(s => s.track === 0).sort((a, b) => a.order - b.order)[0]?.id ?? null
+    );
+
+    if (!targetId) return;
+
+    const segmentToDelete = session.timeline.find(seg => seg.id === targetId);
     if (!segmentToDelete) return;
-    
-    if (session.timeline.length === 1) {
-      alert('Cannot delete the last segment.');
+
+    if (session.timeline.filter(s => s.track === 0).length === 1 && segmentToDelete.track === 0) {
+      alert('Cannot delete the last video clip.');
       return;
     }
     
     // Remove segment and reorder with sequential naming
     const newTimeline = session.timeline
-      .filter(seg => seg.id !== selectedSegmentId)
+      .filter(seg => seg.id !== targetId)
       .sort((a, b) => a.order - b.order);
     
     // Recalculate timeline positions and renumber all clips sequentially
@@ -555,22 +1242,25 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     
     setSession(updatedSession);
     setSelectedSegmentId(null);
-    sessionManager.saveSession(sessionId, updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
   };
 
   const handleUndo = () => {
     if (!session || session.undoStack.length === 0) return;
-    
+
     const lastAction = session.undoStack[session.undoStack.length - 1];
     let newTimeline = [...session.timeline];
     let newTranscript = session.transcript;
     let newTranscriptSegments = session.transcriptSegments;
-    
+
+    // Snapshot the current (post-action) state so redo can restore it
+    const postActionTimeline = [...session.timeline];
+    const postActionTranscript = session.transcript;
+    const postActionTranscriptSegments = session.transcriptSegments;
+
     if (lastAction.type === 'CUT') {
-      // Reverse cut: merge the two segments back
       const seg1 = newTimeline.find(s => s.id === `${lastAction.segmentId}-1`);
       const seg2 = newTimeline.find(s => s.id === `${lastAction.segmentId}-2`);
-      
       if (seg1 && seg2) {
         const merged: TimelineSegment = {
           id: lastAction.segmentId,
@@ -579,170 +1269,72 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           timelineStart: seg1.timelineStart,
           duration: seg1.duration + seg2.duration,
           order: seg1.order,
-          track: seg1.track, // Preserve track
-          color: seg1.color, // Preserve color
-          name: seg1.name, // Preserve name
+          track: seg1.track,
+          color: seg1.color,
+          name: seg1.name,
         };
-        
         newTimeline = newTimeline
           .filter(s => s.id !== seg1.id && s.id !== seg2.id)
           .concat([merged])
-          .map((seg, index) => ({ ...seg, order: index }))
-          .sort((a, b) => a.order - b.order);
+          .sort((a, b) => a.order - b.order)
+          .map((seg, index) => ({ ...seg, order: index }));
       }
     } else if (lastAction.type === 'DELETE') {
-      // Reverse delete: restore the segment
       newTimeline = [...newTimeline, lastAction.segment]
         .sort((a, b) => a.order - b.order)
         .map((seg, index) => ({ ...seg, order: index }));
-      
-      // Recalculate timeline positions
-      let cumulativeTime = 0;
-      newTimeline = newTimeline.map(seg => {
-        const adjusted = { ...seg, timelineStart: cumulativeTime };
-        cumulativeTime += seg.duration;
-        return adjusted;
-      });
+      let t = 0;
+      newTimeline = newTimeline.map(seg => { const s = { ...seg, timelineStart: t }; t += seg.duration; return s; });
     } else if (lastAction.type === 'AI_EDIT') {
-      // Reverse AI edit: restore previous timeline and transcript state
       newTimeline = lastAction.previousTimeline;
       newTranscript = lastAction.previousTranscript;
       newTranscriptSegments = lastAction.previousTranscriptSegments;
     } else if (lastAction.type === 'REORDER') {
-      // Reverse reorder: restore previous timeline order
       newTimeline = lastAction.previousTimeline;
     } else if (lastAction.type === 'ADD_ASSET') {
-      // Reverse asset addition: restore previous timeline
       newTimeline = lastAction.previousTimeline;
     }
-    
+
+    // Store the post-action snapshot in the redo action so redo can restore it
+    const redoAction = {
+      ...lastAction,
+      // Attach post-action state for redo to use
+      _postTimeline: postActionTimeline,
+      _postTranscript: postActionTranscript,
+      _postTranscriptSegments: postActionTranscriptSegments,
+    } as (typeof lastAction & {
+      _postTimeline: TimelineSegment[];
+      _postTranscript: string | null;
+      _postTranscriptSegments: Array<{ start: number; end: number; text: string }> | null;
+    });
+
     const updatedSession = {
       ...session,
       timeline: newTimeline,
       transcript: newTranscript,
       transcriptSegments: newTranscriptSegments,
       undoStack: session.undoStack.slice(0, -1),
-      redoStack: [...session.redoStack, lastAction],
+      redoStack: [...session.redoStack, redoAction as unknown as (typeof session.redoStack)[0]],
     };
-    
+
     setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
   };
 
   const handleRedo = () => {
     if (!session || session.redoStack.length === 0) return;
-    
-    const actionToRedo = session.redoStack[session.redoStack.length - 1];
-    let newTimeline = [...session.timeline];
-    let newTranscript = session.transcript;
-    let newTranscriptSegments = session.transcriptSegments;
-    
-    if (actionToRedo.type === 'CUT') {
-      // Redo cut
-      const segmentToCut = newTimeline.find(s => s.id === actionToRedo.segmentId);
-      if (segmentToCut) {
-        // Get next available color for the second segment only
-        const existingColors = newTimeline.map(seg => seg.color).filter(c => c !== undefined) as string[];
-        const availableColors = [
-          '#4a90e2', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6',
-          '#1abc9c', '#e67e22', '#34495e', '#16a085', '#27ae60'
-        ];
-        
-        // First segment keeps the original color
-        const color1 = segmentToCut.color || availableColors[0];
-        
-        // Find an unused color for the second segment
-        let color2 = availableColors[0];
-        for (let i = 0; i < availableColors.length; i++) {
-          if (!existingColors.includes(availableColors[i]) && availableColors[i] !== color1) {
-            color2 = availableColors[i];
-            break;
-          }
-        }
-        
-        // If no unused colors, use the next color in the palette
-        if (color2 === availableColors[0] && segmentToCut.color) {
-          const currentIndex = availableColors.indexOf(segmentToCut.color);
-          color2 = availableColors[(currentIndex + 1) % availableColors.length];
-        }
-        
-        const segment1: TimelineSegment = {
-          id: `${segmentToCut.id}-1`,
-          sourceStart: segmentToCut.sourceStart,
-          sourceEnd: actionToRedo.cutTime,
-          timelineStart: segmentToCut.timelineStart,
-          duration: actionToRedo.cutTime - segmentToCut.sourceStart,
-          order: segmentToCut.order,
-          track: segmentToCut.track,
-          color: color1,
-          name: `Clip ${segmentToCut.order + 1}`, // Sequential naming
-        };
-        
-        const segment2: TimelineSegment = {
-          id: `${segmentToCut.id}-2`,
-          sourceStart: actionToRedo.cutTime,
-          sourceEnd: segmentToCut.sourceEnd,
-          timelineStart: segmentToCut.timelineStart + segment1.duration,
-          duration: segmentToCut.sourceEnd - actionToRedo.cutTime,
-          order: segmentToCut.order + 1,
-          track: segmentToCut.track,
-          color: color2,
-          name: `Clip ${segmentToCut.order + 2}`, // Sequential naming
-        };
-        
-        newTimeline = newTimeline
-          .filter(s => s.id !== segmentToCut.id)
-          .map(seg => {
-            // Shift order of segments that come after the cut segment
-            if (seg.order > segmentToCut.order) {
-              return { ...seg, order: seg.order + 1 };
-            }
-            return seg;
-          })
-          .concat([segment1, segment2])
-          .sort((a, b) => a.order - b.order);
-        
-        // Recalculate timeline positions and renumber all clips sequentially
-        let cumulativeTime = 0;
-        newTimeline = newTimeline
-          .sort((a, b) => a.order - b.order)
-          .map((seg, index) => {
-            const adjusted = { 
-              ...seg, 
-              order: index, 
-              timelineStart: cumulativeTime,
-              name: `Clip ${index + 1}` // Renumber all clips sequentially
-            };
-            cumulativeTime += seg.duration;
-            return adjusted;
-          });
-      }
-    } else if (actionToRedo.type === 'DELETE') {
-      // Redo delete with sequential renaming
-      newTimeline = newTimeline
-        .filter(s => s.id !== actionToRedo.segment.id)
-        .sort((a, b) => a.order - b.order);
-      
-      // Recalculate timeline positions and renumber all clips sequentially
-      let cumulativeTime = 0;
-      newTimeline = newTimeline.map((seg, index) => {
-        const adjusted = { 
-          ...seg, 
-          order: index, 
-          timelineStart: cumulativeTime,
-          name: `Clip ${index + 1}` // Renumber all clips sequentially
-        };
-        cumulativeTime += seg.duration;
-        return adjusted;
-      });
-    } else if (actionToRedo.type === 'AI_EDIT') {
-      // For AI_EDIT redo, we need to re-apply the operations
-      // This is complex, so for now we'll just show a message
-      // In a full implementation, you'd store the result state and restore it
-      logger.warn('AI_EDIT redo not fully implemented yet');
-      return;
-    }
-    
+
+    const actionToRedo = session.redoStack[session.redoStack.length - 1] as (typeof session.redoStack)[0] & {
+      _postTimeline?: TimelineSegment[];
+      _postTranscript?: string | null;
+      _postTranscriptSegments?: Array<{ start: number; end: number; text: string }> | null;
+    };
+
+    // Use the post-action snapshot stored by handleUndo (most reliable approach)
+    const newTimeline: TimelineSegment[] = actionToRedo._postTimeline ?? session.timeline;
+    const newTranscript: string | null = actionToRedo._postTranscript ?? session.transcript;
+    const newTranscriptSegments = actionToRedo._postTranscriptSegments ?? session.transcriptSegments;
+
     const updatedSession = {
       ...session,
       timeline: newTimeline,
@@ -751,9 +1343,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       undoStack: [...session.undoStack, actionToRedo],
       redoStack: session.redoStack.slice(0, -1),
     };
-    
+
     setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
   };
 
   const handleSegmentClick = (segmentId: string, e: React.MouseEvent) => {
@@ -765,73 +1357,100 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     setDraggedSegmentId(segmentId);
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', segmentId);
+
+    // Compute mouse offset inside clip for smooth dragging drop
+    if (timelineRef.current && session) {
+      const rect = timelineRef.current.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      
+      const track0Segments = (session.timeline || []).filter(s => s.track === 0);
+      const totalDur = Math.max(track0Segments.reduce((sum, s) => sum + s.duration, 0), session.duration || 1);
+      
+      const timeAtCursor = (mouseX / rect.width) * totalDur;
+      const segment = session.timeline.find(s => s.id === segmentId);
+      if (segment && segment.track === 1) {
+        setDragOffset(timeAtCursor - (segment.timelineStart ?? 0));
+      } else {
+        setDragOffset(0);
+      }
+    }
   };
 
   const handleSegmentDragEnd = () => {
     setDraggedSegmentId(null);
     setDragOverSegmentId(null);
     setDragOverPosition(null);
+    setDragOverSide(null);
   };
 
   const handleSegmentDragOver = (targetSegmentId: string, e: React.DragEvent) => {
     if (!draggedSegmentId || draggedSegmentId === targetSegmentId) return;
-    
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = 'move';
-    
     setDragOverSegmentId(targetSegmentId);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setDragOverSide((e.clientX - rect.left) < rect.width / 2 ? 'left' : 'right');
   };
 
   const handleSegmentDragLeave = (targetSegmentId: string, e: React.DragEvent) => {
     e.stopPropagation();
     if (dragOverSegmentId === targetSegmentId) {
       setDragOverSegmentId(null);
+      setDragOverSide(null);
     }
   };
 
   const handleSegmentDrop = (targetSegmentId: string, e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    
+
     if (!draggedSegmentId || !session || draggedSegmentId === targetSegmentId) return;
-    
+
     const draggedSegment = session.timeline.find(seg => seg.id === draggedSegmentId);
-    const targetSegment = session.timeline.find(seg => seg.id === targetSegmentId);
-    
+    const targetSegment  = session.timeline.find(seg => seg.id === targetSegmentId);
     if (!draggedSegment || !targetSegment) return;
-    
-    // Swap the order of the two segments (only if on same track)
-    if (draggedSegment.track === targetSegment.track) {
-      const newTimeline = session.timeline.map(seg => {
-        if (seg.id === draggedSegmentId) {
-          return { ...seg, order: targetSegment.order };
-        } else if (seg.id === targetSegmentId) {
-          return { ...seg, order: draggedSegment.order };
-        }
-        return seg;
-      });
-      
-      // Sort by new order and recalculate timeline positions
-      const sortedTimeline = [...newTimeline].sort((a, b) => a.order - b.order);
-      let cumulativeTime = 0;
-      const adjustedTimeline = sortedTimeline.map((seg, index) => {
-        const adjusted = { ...seg, order: index, timelineStart: cumulativeTime };
-        cumulativeTime += seg.duration;
-        return adjusted;
-      });
-      
-      const updatedSession = {
-        ...session,
-        timeline: adjustedTimeline,
-        undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
-        redoStack: [],
-      };
-      
-      setSession(updatedSession);
-      sessionManager.saveSession(sessionId, updatedSession);
-    }
-    
+
+    // Only reorder within track 0
+    if (draggedSegment.track !== 0 || targetSegment.track !== 0) return;
+
+    // Determine drop side: left half → insert before target, right half → insert after target
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const insertBefore = (e.clientX - rect.left) < rect.width / 2;
+
+    const track0 = [...session.timeline]
+      .filter(s => s.track === 0)
+      .sort((a, b) => a.order - b.order);
+
+    // Remove dragged from list
+    const without = track0.filter(s => s.id !== draggedSegmentId);
+    const targetIdx = without.findIndex(s => s.id === targetSegmentId);
+    const insertAt = insertBefore ? targetIdx : targetIdx + 1;
+
+    // Splice dragged into new position
+    const reordered = [
+      ...without.slice(0, insertAt),
+      draggedSegment,
+      ...without.slice(insertAt),
+    ];
+
+    let t = 0;
+    const adjustedTrack0 = reordered.map((seg, idx) => {
+      const s = { ...seg, order: idx, timelineStart: t };
+      t += seg.duration;
+      return s;
+    });
+
+    const otherTracks = session.timeline.filter(s => s.track !== 0);
+    const updatedSession = {
+      ...session,
+      timeline: [...adjustedTrack0, ...otherTracks],
+      undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+      redoStack: [],
+    };
+
+    setSession(updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
     setDraggedSegmentId(null);
     setDragOverSegmentId(null);
     setDragOverPosition(null);
@@ -840,13 +1459,22 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   // Handle dropping on a track (to move clip to different track)
   const handleTrackDrop = (trackNum: number, e: React.DragEvent) => {
     e.preventDefault();
-    e.stopPropagation();
     
     if (!draggedSegmentId || !session) return;
     
     const draggedSegment = session.timeline.find(seg => seg.id === draggedSegmentId);
-    if (!draggedSegment || draggedSegment.track === trackNum) return;
+    if (!draggedSegment) return;
     
+    if (draggedSegment.track === trackNum) {
+      // Already on this track, let it bubble up to handleTimelineDrop for exact repositioning
+      return;
+    }
+    
+    // Only allow audio on track 1, and no audio on track 0
+    if (trackNum === 1 && draggedSegment.assetKind !== 'audio') return;
+    if (trackNum === 0 && draggedSegment.assetKind === 'audio') return;
+    
+    e.stopPropagation();
     // Move segment to new track
     const newTimeline = session.timeline.map(seg => {
       if (seg.id === draggedSegmentId) {
@@ -863,7 +1491,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     };
     
     setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
     
     setDraggedSegmentId(null);
     setDragOverSegmentId(null);
@@ -871,7 +1499,13 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   };
 
   const handleTrackDragOver = (e: React.DragEvent) => {
-    if (!draggedSegmentId) return;
+    if (!draggedSegmentId || !session) return;
+    const draggedSegment = session.timeline.find(seg => seg.id === draggedSegmentId);
+    if (draggedSegment) {
+      const targetTrack = parseInt((e.currentTarget as HTMLElement).dataset.track || '0', 10);
+      if (targetTrack === 1 && draggedSegment.assetKind !== 'audio') return;
+      if (targetTrack === 0 && draggedSegment.assetKind === 'audio') return;
+    }
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
   };
@@ -885,7 +1519,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const rect = timelineRef.current.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
     const percentage = mouseX / rect.width;
-    const timePosition = percentage * session.duration;
+    
+    const track0Segments = (session.timeline || []).filter(s => s.track === 0);
+    const totalDur = Math.max(
+      track0Segments.reduce((sum, s) => sum + s.duration, 0),
+      session.duration || 1
+    );
+    
+    const timePosition = percentage * totalDur;
     
     setDragOverPosition(timePosition);
   };
@@ -898,44 +1539,68 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const draggedSegment = session.timeline.find(seg => seg.id === draggedSegmentId);
     if (!draggedSegment) return;
     
-    // Find the position to insert the segment based on drop position
-    const sortedSegments = [...session.timeline]
-      .filter(seg => seg.id !== draggedSegmentId)
-      .sort((a, b) => a.sourceStart - b.sourceStart);
+    if (draggedSegment.track === 1) {
+      // It's an audio segment being dropped at a specific absolute position
+      const newStart = Math.max(0, dragOverPosition - dragOffset);
+      const updatedTimeline = session.timeline.map(seg => {
+        if (seg.id === draggedSegmentId) {
+          return { ...seg, timelineStart: newStart };
+        }
+        return seg;
+      });
+      const updatedSession = {
+        ...session,
+        timeline: updatedTimeline,
+        undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+        redoStack: [],
+      };
+      setSession(updatedSession);
+      void sessionManager.saveSession(sessionId, updatedSession);
+      setDraggedSegmentId(null);
+      setDragOverPosition(null);
+      return;
+    }
+
+    // Find the position to insert the segment based on drop position for track 0
+    const track0Segments = [...session.timeline]
+      .filter(seg => seg.track === 0 && seg.id !== draggedSegmentId)
+      .sort((a, b) => a.order - b.order);
     
     let newOrder = 0;
-    for (let i = 0; i < sortedSegments.length; i++) {
-      if (dragOverPosition < sortedSegments[i].sourceStart) {
+    for (let i = 0; i < track0Segments.length; i++) {
+      if (dragOverPosition < (track0Segments[i].timelineStart ?? 0) + (track0Segments[i].duration / 2)) {
         newOrder = i;
         break;
       }
       newOrder = i + 1;
     }
     
-    // Reorder all segments
-    const reorderedTimeline = sortedSegments
+    // Reorder all track 0 segments
+    const reorderedTrack0 = track0Segments
       .slice(0, newOrder)
       .concat([draggedSegment])
-      .concat(sortedSegments.slice(newOrder))
+      .concat(track0Segments.slice(newOrder))
       .map((seg, index) => ({ ...seg, order: index }));
     
-    // Recalculate timeline positions
+    // Recalculate timeline positions for track 0
     let cumulativeTime = 0;
-    const adjustedTimeline = reorderedTimeline.map(seg => {
+    const adjustedTrack0 = reorderedTrack0.map(seg => {
       const adjusted = { ...seg, timelineStart: cumulativeTime };
       cumulativeTime += seg.duration;
       return adjusted;
     });
+
+    const otherTracks = session.timeline.filter(seg => seg.track !== 0 && seg.id !== draggedSegmentId);
     
     const updatedSession = {
       ...session,
-      timeline: adjustedTimeline,
+      timeline: [...adjustedTrack0, ...otherTracks],
       undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
       redoStack: [],
     };
     
     setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
     
     setDraggedSegmentId(null);
     setDragOverPosition(null);
@@ -943,14 +1608,12 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   const getClipColor = (index: number) => {
     const colors = [
-      '#4a90e2', // Blue
       '#2ecc71', // Green  
       '#e74c3c', // Red
       '#f39c12', // Orange
       '#9b59b6', // Purple
       '#1abc9c', // Teal
       '#e67e22', // Dark Orange
-      '#34495e', // Dark Blue Gray
       '#16a085', // Dark Teal
       '#27ae60', // Dark Green
     ];
@@ -966,208 +1629,49 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       video: '#9b59b6', // Purple
       audio: '#1abc9c', // Teal
     };
-    return assetColors[assetKind as keyof typeof assetColors] || '#4a90e2';
+    return assetColors[assetKind as keyof typeof assetColors] || '#2ecc71';
+  };
+
+  const handleVolumeChange = (segmentId: string, volume: number) => {
+    if (!sessionRef.current) return;
+    const updatedTimeline = sessionRef.current.timeline.map(seg => 
+      seg.id === segmentId ? { ...seg, volume } : seg
+    );
+    const updatedSession = { ...sessionRef.current, timeline: updatedTimeline };
+    setSession(updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
+  };
+
+  // Download transcript as .txt
+  const handleDownloadTranscript = () => {
+    if (!session?.transcript) return;
+    const lines = session.transcriptSegments
+      ? session.transcriptSegments.map(s => `[${formatTime(s.start)}]  ${s.text.trim()}`).join('\n')
+      : session.transcript;
+    const blob = new Blob([lines], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `transcript-${sessionId.slice(0, 8)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleResizeMouseDown = (e: React.MouseEvent, segmentId: string, type: 'left' | 'right') => {
+    e.stopPropagation();
+    e.preventDefault();
+    
+    const segment = session?.timeline.find(s => s.id === segmentId);
+    if (!segment) return;
+    
+    setResizingSegmentId(segmentId);
+    setResizeType(type);
+    setResizeInitialX(e.clientX);
+    setResizeInitialStart(segment.timelineStart ?? 0);
+    setResizeInitialDuration(segment.duration);
   };
 
   // Asset management functions
-  const handleAssetUpload = async (file: File) => {
-    if (!file) return;
-    
-    setUploadingAsset(true);
-    
-    try {
-      // Create a URL for the file
-      const url = URL.createObjectURL(file);
-      
-      // Determine asset type
-      let type: 'photo' | 'video' | 'audio' = 'photo';
-      if (file.type.startsWith('video/')) type = 'video';
-      else if (file.type.startsWith('audio/')) type = 'audio';
-      
-      // For video/audio, get duration
-      let duration = undefined;
-      if (type === 'video' || type === 'audio') {
-        duration = await getMediaDuration(file);
-      }
-      
-      const newAsset = {
-        id: `asset-${Date.now()}`,
-        name: file.name,
-        type,
-        url,
-        duration
-      };
-      
-      setAssets(prev => [...prev, newAsset]);
-    } catch (error) {
-      logger.error('Failed to upload asset:', error);
-      alert('Failed to upload asset. Please try again.');
-    } finally {
-      setUploadingAsset(false);
-    }
-  };
-
-  const getMediaDuration = (file: File): Promise<number> => {
-    return new Promise((resolve) => {
-      const element = file.type.startsWith('video/') 
-        ? document.createElement('video')
-        : document.createElement('audio');
-      
-      element.preload = 'metadata';
-      element.onloadedmetadata = () => {
-        resolve(element.duration || 5); // Default 5 seconds for photos
-        URL.revokeObjectURL(element.src);
-      };
-      element.onerror = () => {
-        resolve(5); // Default duration on error
-        URL.revokeObjectURL(element.src);
-      };
-      element.src = URL.createObjectURL(file);
-    });
-  };
-
-  const handleAddAssetToTimeline = (assetId: string) => {
-    if (!session) return;
-    
-    const asset = assets.find(a => a.id === assetId);
-    if (!asset) return;
-    
-    const wasPlaying = isPlaying;
-    if (wasPlaying) {
-      videoRef.current?.pause();
-      setIsPlaying(false);
-    }
-    
-    // Calculate insertion position (at current timeline position)
-    const insertPos = currentTime;
-    const assetDuration = asset.duration || 5; // Default 5 seconds for photos
-    
-    // Create new timeline with asset inserted
-    const sortedTimeline = [...session.timeline].sort((a, b) => a.order - b.order);
-    
-    // Find where to insert based on timeline position
-    let insertOrder = sortedTimeline.length;
-    for (let i = 0; i < sortedTimeline.length; i++) {
-      if (insertPos < sortedTimeline[i].timelineStart + sortedTimeline[i].duration) {
-        insertOrder = i;
-        break;
-      }
-    }
-    
-    // Create new asset segment
-    const newSegment: TimelineSegment = {
-      id: `${asset.id}-${Date.now()}`,
-      sourceStart: 0,
-      sourceEnd: assetDuration,
-      timelineStart: insertPos,
-      duration: assetDuration,
-      order: insertOrder,
-      track: 1, // Default to track 1 (overlay), but user can drag to any track
-      name: asset.name,
-      assetKind: asset.type,
-      assetUrl: asset.url,
-      color: getClipColor(insertOrder),
-    };
-    
-    // Reorder existing segments
-    const newTimeline = [
-      ...sortedTimeline.slice(0, insertOrder).map(seg => ({ ...seg, order: seg.order })),
-      newSegment,
-      ...sortedTimeline.slice(insertOrder).map(seg => ({ ...seg, order: seg.order + 1 }))
-    ];
-    
-    // Recalculate timeline positions
-    let cumulativeTime = 0;
-    const adjustedTimeline = newTimeline.map(seg => {
-      const adjusted = { ...seg, timelineStart: cumulativeTime };
-      cumulativeTime += seg.duration;
-      return adjusted;
-    });
-    
-    // Update session state AND the ref immediately so the engine sees the new timeline
-    const updatedSession = {
-      ...session,
-      timeline: adjustedTimeline,
-      undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline }],
-      redoStack: [],
-    };
-    
-    setSession(updatedSession);
-    sessionRef.current = updatedSession;
-    sessionManager.saveSession(sessionId, updatedSession);
-    
-    // Switch to the new asset segment
-    if (videoRef.current) {
-      videoRef.current.currentTime = insertPos;
-      setCurrentTime(insertPos);
-      if (wasPlaying) {
-        setTimeout(() => setIsPlaying(true), 100);
-      }
-    }
-  };
-
-  const handleRemoveAsset = (assetId: string) => {
-    const asset = assets.find(a => a.id === assetId);
-    if (asset) {
-      URL.revokeObjectURL(asset.url);
-      setAssets(prev => prev.filter(a => a.id !== assetId));
-    }
-  };
-
-  const handleClipRename = (segmentId: string, newName: string) => {
-    if (!session) return;
-    
-    const updatedTimeline = session.timeline.map(seg =>
-      seg.id === segmentId ? { ...seg, name: newName } : seg
-    );
-    
-    const updatedSession = {
-      ...session,
-      timeline: updatedTimeline,
-    };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
-  };
-
-  const getDeletedSections = () => {
-    if (!session) return [];
-    
-    const deletedSections: Array<{ start: number; duration: number }> = [];
-    const sortedSegments = [...session.timeline].sort((a, b) => a.sourceStart - b.sourceStart);
-    
-    // Check for gaps between segments (deleted sections)
-    for (let i = 0; i < sortedSegments.length; i++) {
-      const currentSegment = sortedSegments[i];
-      const nextSegment = sortedSegments[i + 1];
-      
-      // Check gap before first segment
-      if (i === 0 && currentSegment.sourceStart > 0) {
-        deletedSections.push({
-          start: 0,
-          duration: currentSegment.sourceStart,
-        });
-      }
-      
-      // Check gap between segments
-      if (nextSegment && currentSegment.sourceEnd < nextSegment.sourceStart) {
-        deletedSections.push({
-          start: currentSegment.sourceEnd,
-          duration: nextSegment.sourceStart - currentSegment.sourceEnd,
-        });
-      }
-      
-      // Check gap after last segment
-      if (i === sortedSegments.length - 1 && currentSegment.sourceEnd < session.duration) {
-        deletedSections.push({
-          start: currentSegment.sourceEnd,
-          duration: session.duration - currentSegment.sourceEnd,
-        });
-      }
-    }
-    
-    return deletedSections;
-  };
 
   const handleExport = async () => {
     logger.operation("Export process started");
@@ -1193,11 +1697,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
     // Map timeline segments to export format
     const clips = sortedTimeline.map((seg, index) => {
-      const clip: any = {
+      const clip: Record<string, any> = {
         start: seg.timelineStart ?? 0,     // Timeline position (for sequencing)
         end: (seg.timelineStart ?? 0) + seg.duration,  // Timeline position (for sequencing)
         title: seg.name || `Clip ${index + 1}`,
-        id: seg.id
+        id: seg.id,
+        assetUrl: seg.assetUrl,
+        assetKind: seg.assetKind,
+        volume: seg.volume ?? 1.0,
       };
       
       // Handle merged clips with segments
@@ -1261,608 +1768,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
   };
 
-  const handleTranscribe = async () => {
-    if (!session) return;
-    
-    setIsTranscribing(true);
-    
-    try {
-      // CRITICAL: Pass current edited clips to transcription
-      // This ensures transcript reflects the EDITED timeline, not the original video
-      const sortedClips = [...session.timeline].sort((a, b) => a.order - b.order);
-      const clips = sortedClips.map(clip => ({
-        start: clip.sourceStart,
-        end: clip.sourceEnd,
-        title: clip.name || `Clip ${clip.order + 1}`
-      }));
-      
-      logger.debug('Transcribe - sending edited clips to backend:', clips);
-      
-      // Call the real Whisper API backend with edited clips
-      const apiClient = new APIClient(); // Use default /api base URL
-      const response = await apiClient.transcribeVideo(session.sessionId, clips);
-      
-      logger.debug('Transcribe response mode:', response.mode || 'unknown');
-      logger.debug('Transcribe segments received:', response.segments?.length || 0);
-      
-      // Format the transcript with timestamps if segments are available
-      let formattedTranscript = response.transcript;
-      
-      if (response.segments && response.segments.length > 0) {
-        formattedTranscript = response.segments
-          .map((seg: any) => {
-            const startTime = formatTime(seg.start);
-            const endTime = formatTime(seg.end);
-            return `[${startTime} - ${endTime}] ${seg.text}`;
-          })
-          .join('\n\n');
-      }
-      
-      const transcriptSegments = response.segments && response.segments.length > 0
-        ? response.segments.map((seg: any) => ({ start: seg.start, end: seg.end, text: seg.text }))
-        : null;
-      
-      // Create history entry
-      const historyEntry = {
-        timestamp: Date.now(),
-        operation: session.transcript ? 'Re-transcribed' : 'Initial transcription',
-        transcript: formattedTranscript,
-        segments: transcriptSegments,
-      };
-      
-      const updatedSession = {
-        ...session,
-        transcript: formattedTranscript,
-        transcriptSegments: transcriptSegments,
-        transcriptHistory: [...(session.transcriptHistory || []), historyEntry],
-      };
-      
-      setSession(updatedSession);
-      await sessionManager.saveSession(sessionId, updatedSession);
-      setIsTranscribing(false);
-      
-      // Hide transcribe button after successful transcription
-      setShowTranscribeButton(false);
-    } catch (error) {
-      logger.error('Transcription failed:', error);
-      setIsTranscribing(false);
-      
-      // Show error message to user
-      let errorMessage = 'Transcription failed. ';
-      
-      if (error instanceof Error) {
-        if (error.message.includes('OpenAI API key')) {
-          errorMessage += 'OpenAI API key not configured. Please set OPENAI_API_KEY in backend/.env';
-        } else if (error.message.includes('Video file not found')) {
-          errorMessage += 'Video file not found. Please upload the video to the backend first.';
-        } else if (error.message.includes('Connection failed')) {
-          errorMessage += 'Cannot connect to backend. Make sure the backend server is running on http://localhost:8000';
-        } else {
-          errorMessage += error.message;
-        }
-      }
-      
-      alert(errorMessage);
-    }
-  };
-
-  const handleTranscriptChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    if (!session) return;
-    
-    const updatedSession = {
-      ...session,
-      transcript: e.target.value,
-    };
-    
-    setSession(updatedSession);
-    sessionManager.saveSession(sessionId, updatedSession);
-  };
-
-  const downloadTranscript = () => {
-    logger.debug('Transcript download requested, transcript exists:', !!session?.transcript);
-    if (!session?.transcript) {
-      logger.warn('No transcript available to download');
-      return;
-    }
-    
-    try {
-      const blob = new Blob([session.transcript], { type: 'text/plain' });
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `transcript-${sessionId.substring(0, 8)}.txt`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.URL.revokeObjectURL(url);
-      logger.operation('Transcript download completed');
-    } catch (error) {
-      logger.error('Transcript download failed:', error);
-      alert('Failed to download transcript. Please try again.');
-    }
-  };
-
-  const toggleEditPanelFullscreen = async () => {
-    if (!editPanelRef.current) return;
-    
-    try {
-      if (!document.fullscreenElement) {
-        await editPanelRef.current.requestFullscreen();
-        setIsEditPanelFullscreen(true);
-      } else {
-        await document.exitFullscreen();
-        setIsEditPanelFullscreen(false);
-      }
-    } catch (error) {
-      logger.error('Error toggling fullscreen:', error);
-    }
-  };
-
-  // Listen for fullscreen changes and keyboard "F" key
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsEditPanelFullscreen(!!document.fullscreenElement);
-    };
-    
-    const handleKeyPress = (e: KeyboardEvent) => {
-      // Toggle fullscreen on "F" key press (not when typing in input/textarea)
-      if (e.key === 'f' || e.key === 'F') {
-        const target = e.target as HTMLElement;
-        if (target.tagName !== 'INPUT' && target.tagName !== 'TEXTAREA') {
-          e.preventDefault();
-          toggleEditPanelFullscreen();
-        }
-      }
-    };
-    
-    // Enter fullscreen on mount
-    const enterFullscreen = async () => {
-      if (editPanelRef.current && !document.fullscreenElement) {
-        try {
-          await editPanelRef.current.requestFullscreen();
-        } catch (error) {
-          logger.debug('Could not enter fullscreen automatically:', error);
-        }
-      }
-    };
-    
-    enterFullscreen();
-    
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    document.addEventListener('keydown', handleKeyPress);
-    
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullscreenChange);
-      document.removeEventListener('keydown', handleKeyPress);
-    };
-  }, [toggleEditPanelFullscreen]);
-
-  const toggleTranscriptionVisibility = () => {
-    logger.debug('Toggle transcript visibility:', transcriptionVisible, '->', !transcriptionVisible);
-    setTranscriptionVisible(!transcriptionVisible);
-  };
-
-  const handleAiEdit = async () => {
-    if (!session || !aiPrompt.trim()) return;
-
-    const userMessage = aiPrompt.trim();
-    
-    // CRITICAL: Check if transcript is required for this command
-    const contentBasedKeywords = [
-      'about', 'mention', 'discuss', 'talk', 'say', 'explain',
-      'describe', 'topic', 'subject', 'content', 'word', 'phrase',
-      'name the clips', 'title', 'label'
-    ];
-    
-    const isContentBased = contentBasedKeywords.some(keyword => 
-      userMessage.toLowerCase().includes(keyword)
-    );
-    
-    // Check if transcript exists
-    const hasTranscript = session.transcript && session.transcript.trim().length > 0;
-    const hasTranscriptSegments = session.transcriptSegments && session.transcriptSegments.length > 0;
-    
-    logger.debug('AI edit transcript check:', {
-      hasTranscript,
-      hasTranscriptSegments,
-      isContentBased,
-      command: userMessage
-    });
-    
-    // Require transcript for content-based commands
-    if (isContentBased && !hasTranscript && !hasTranscriptSegments) {
-      setAiError('Transcript required for content-based editing. Please generate transcript first.');
-      setChatMessages(prev => [...prev, 
-        { role: 'user', content: userMessage },
-        { 
-          role: 'assistant', 
-          content: '⚠️ Transcript required for this command. Please click "Transcribe Video" first, then try again.' 
-        }
-      ]);
-      setIsAiEditing(false);
-      return;
-    }
-    
-    // Warn if transcript is missing for other commands
-    if (!hasTranscript && !hasTranscriptSegments) {
-      logger.warn('AI edit - no transcript available, working with clip titles only');
-    }
-    
-    setAiPrompt('');
-    setIsAiEditing(true);
-    setAiError(null);
-
-    // Append user message immediately so it shows in chat
-    setChatMessages(prev => [...prev, { role: 'user', content: userMessage }]);
-
-    try {
-      // Read from ref — always the latest committed state, not the stale closure value
-      const currentSession = sessionRef.current;
-      if (!currentSession) throw new Error('Session not available.');
-
-      // Guard: nothing to work with
-      if (currentSession.timeline.length === 0) {
-        setChatMessages(prev => [...prev, { role: 'assistant', content: 'No clips left to edit.' }]);
-        return;
-      }
-
-      // Build one segment per user-defined clip using CURRENT timeline state
-      const sortedClips = [...currentSession.timeline].sort((a, b) => a.order - b.order);
-      const transcriptSegs = currentSession.transcriptSegments || [];
-
-      const segments = sortedClips.map((clip, i) => {
-        const overlapping = transcriptSegs.filter(
-          ts => ts.end > clip.sourceStart && ts.start < clip.sourceEnd
-        );
-        // Ensure text is never empty — fall back to title then generic label
-        const combinedText = overlapping.map(ts => ts.text.trim()).join(' ').trim()
-          || clip.name?.trim()
-          || `Clip ${i + 1}`;
-
-        return {
-          index: i + 1,                          // always 1-based, reindexed after mutations
-          start: clip.sourceStart ?? 0,
-          end: clip.sourceEnd ?? 0,
-          title: clip.name?.trim() || `Clip ${i + 1}`,
-          text: combinedText,
-        };
-      });
-
-      logger.debug('AI edit - clips sent to AI:', segments);
-
-      const apiClient = new APIClient(); // Use default /api base URL
-      const response = await apiClient.editWithAI(sessionId, userMessage, segments);
-      
-      // ROBUSTNESS LAYER: Backend now returns enhanced response
-      const actions: Array<Record<string, any>> = response.actions || [];
-      const backendClips = (response as any).clips || null;  // NEW: Backend-validated clips
-      const operations = (response as any).operations || [];  // NEW: Structured operations
-      const warnings = (response as any).warnings || [];      // NEW: Non-fatal warnings
-      
-      logger.debug('AI edit backend operations:', operations);
-      logger.debug('AI edit backend warnings:', warnings);
-
-      // If backend provided validated clips, use them directly (source of truth)
-      let updatedTimeline: typeof currentSession.timeline;
-      
-      if (backendClips && backendClips.length > 0) {
-        // Backend returned authoritative clips — map to timeline format
-        updatedTimeline = backendClips.map((clip: any, i: number) => {
-          // Handle merged clips with segments
-          if (clip.segments && Array.isArray(clip.segments)) {
-            logger.debug('AI edit - processing merged clip with segments:', clip.id, clip.segments);
-            
-            // For merged clips, calculate total duration from segments
-            const totalDuration = clip.segments.reduce((sum: number, seg: any) => sum + seg.duration, 0);
-            
-            return {
-              id: clip.id || `clip-${i + 1}`,
-              sourceStart: clip.segments[0].sourceStart, // Use first segment's start
-              sourceEnd: clip.segments[clip.segments.length - 1].sourceEnd, // Use last segment's end
-              timelineStart: 0,  // Will recalculate below
-              duration: totalDuration,
-              order: i,
-              name: clip.title || clip.name || `Clip ${i + 1}`,
-              segments: clip.segments, // Preserve segments for export
-              isMerged: true, // Mark as merged clip
-            };
-          } else {
-            // Regular clip
-            return {
-              id: clip.id || `clip-${i + 1}`,
-              sourceStart: clip.sourceStart ?? clip.start ?? 0,
-              sourceEnd: clip.sourceEnd ?? clip.end ?? 0,
-              timelineStart: 0,  // Will recalculate below
-              duration: (clip.sourceEnd ?? clip.end ?? 0) - (clip.sourceStart ?? clip.start ?? 0),
-              order: i,
-              name: clip.title || clip.name || `Clip ${i + 1}`,
-            };
-          }
-        });
-        
-        // Recalculate timeline positions and ensure colors are assigned
-        let cumulativeTime = 0;
-        updatedTimeline = updatedTimeline.map((seg, index) => {
-          const adjusted = { 
-            ...seg, 
-            timelineStart: cumulativeTime,
-            color: seg.color || getClipColor(index), // Ensure color is assigned
-            track: seg.track !== undefined ? seg.track : 0 // Ensure track is assigned
-          };
-          cumulativeTime += seg.duration;
-          return adjusted;
-        });
-        
-        logger.debug('AI edit - backend clips processed, timeline updated:', updatedTimeline.map(seg => ({
-          id: seg.id,
-          name: seg.name,
-          sourceStart: seg.sourceStart,
-          sourceEnd: seg.sourceEnd,
-          timelineStart: seg.timelineStart,
-          duration: seg.duration,
-          order: seg.order,
-          color: seg.color,
-          track: seg.track
-        })));
-      } else {
-        // Fallback: Apply actions client-side (backward compatibility)
-        updatedTimeline = [...currentSession.timeline];
-        const summaryParts: string[] = [];
-
-        for (const action of actions) {
-          const sorted = [...updatedTimeline].sort((a, b) => a.order - b.order);
-
-          if (action.type === 'name_clips' && Array.isArray(action.clips)) {
-            for (const clip of action.clips) {
-              const idx = (clip.index as number) - 1;
-              if (sorted[idx]) {
-                const segId = sorted[idx].id;
-                updatedTimeline = updatedTimeline.map(seg =>
-                  seg.id === segId ? { ...seg, name: clip.title } : seg
-                );
-              }
-            }
-            summaryParts.push(`Renamed ${action.clips.length} clip${action.clips.length !== 1 ? 's' : ''}`);
-
-          } else if (action.type === 'cut' && action.clip_index != null) {
-            const idx = (action.clip_index as number) - 1;
-            if (sorted[idx] && updatedTimeline.length > 1) {
-              const clipName = sorted[idx].name || `Clip ${idx + 1}`;
-              const segId = sorted[idx].id;
-              updatedTimeline = updatedTimeline
-                .filter(seg => seg.id !== segId)
-                .map((seg, i) => ({ ...seg, order: i }));
-              let t = 0;
-              updatedTimeline = updatedTimeline.map(seg => { const s = { ...seg, timelineStart: t }; t += seg.duration; return s; });
-              summaryParts.push(`Deleted "${clipName}"`);
-            }
-
-          } else if (action.type === 'cut_time' && action.start != null && action.end != null) {
-            const cutStart = action.start as number;
-            const cutEnd = action.end as number;
-            const newSegments: typeof updatedTimeline = [];
-
-            for (const seg of updatedTimeline) {
-              const s = seg.sourceStart;
-              const e = seg.sourceEnd;
-
-              if (e <= cutStart || s >= cutEnd) {
-                newSegments.push(seg);
-              } else if (s >= cutStart && e <= cutEnd) {
-                // Delete
-              } else if (s < cutStart && e > cutEnd) {
-                const left = {
-                  ...seg,
-                  id: `${seg.id}-L`,
-                  sourceEnd: cutStart,
-                  duration: cutStart - s,
-                };
-                const right = {
-                  ...seg,
-                  id: `${seg.id}-R`,
-                  sourceStart: cutEnd,
-                  duration: e - cutEnd,
-                };
-                newSegments.push(left, right);
-              } else if (s < cutStart) {
-                newSegments.push({ ...seg, sourceEnd: cutStart, duration: cutStart - s });
-              } else {
-                newSegments.push({ ...seg, sourceStart: cutEnd, duration: e - cutEnd });
-              }
-            }
-
-            let t = 0;
-            updatedTimeline = newSegments
-              .map((seg, i) => ({ ...seg, order: i }))
-              .map(seg => { const s = { ...seg, timelineStart: t }; t += seg.duration; return s; });
-
-            const fmt = (sec: number) => {
-              const m = Math.floor(sec / 60);
-              const s2 = Math.floor(sec % 60).toString().padStart(2, '0');
-              return `${m}:${s2}`;
-            };
-            summaryParts.push(`Deleted section from ${fmt(cutStart)} to ${fmt(cutEnd)}`);
-
-          } else if (action.type === 'keep' && Array.isArray(action.clip_indexes)) {
-            const keepIndexes = new Set((action.clip_indexes as number[]).map(n => n - 1));
-            const toKeep = sorted.filter((_, i) => keepIndexes.has(i));
-            if (toKeep.length > 0) {
-              const keepIds = new Set(toKeep.map(s => s.id));
-              updatedTimeline = updatedTimeline
-                .filter(seg => keepIds.has(seg.id))
-                .map((seg, i) => ({ ...seg, order: i }));
-              let t = 0;
-              updatedTimeline = updatedTimeline.map(seg => { const s = { ...seg, timelineStart: t }; t += seg.duration; return s; });
-              summaryParts.push(`Kept clips ${(action.clip_indexes as number[]).join(', ')}`);
-            }
-
-          } else if (action.type === 'merge' && Array.isArray(action.clip_indexes) && action.clip_indexes.length >= 2) {
-            const mergeIndexes = (action.clip_indexes as number[]).map(n => n - 1).sort((a, b) => a - b);
-            const toMerge = mergeIndexes.map(i => sorted[i]).filter(Boolean);
-            if (toMerge.length >= 2) {
-              const mergeIds = new Set(toMerge.map(s => s.id));
-              
-              // FIXED: Proper merge logic - create one continuous clip
-              // Sort clips by their source timeline position
-              const sortedToMerge = toMerge.sort((a, b) => a.sourceStart - b.sourceStart);
-              
-              const merged = {
-                ...sortedToMerge[0], // Use first clip as base
-                id: `merged-${sortedToMerge.map(s => s.id).join('-')}`,
-                sourceStart: sortedToMerge[0].sourceStart, // Start from first clip
-                sourceEnd: sortedToMerge[sortedToMerge.length - 1].sourceEnd, // End at last clip
-                duration: sortedToMerge[sortedToMerge.length - 1].sourceEnd - sortedToMerge[0].sourceStart, // Total span
-                name: sortedToMerge.map(s => s.name || `Clip ${s.order + 1}`).join(' + '),
-                order: sortedToMerge[0].order, // Keep original order of first clip
-                color: sortedToMerge[0].color, // Keep color of first clip
-                track: sortedToMerge[0].track, // Keep track of first clip
-              };
-              
-              logger.debug('Merge operation - merging clips:', sortedToMerge.map(c => ({
-                id: c.id, 
-                name: c.name, 
-                sourceStart: c.sourceStart, 
-                sourceEnd: c.sourceEnd,
-                duration: c.duration
-              })));
-              logger.debug('Merge operation result:', {
-                id: merged.id,
-                name: merged.name,
-                sourceStart: merged.sourceStart,
-                sourceEnd: merged.sourceEnd,
-                duration: merged.duration
-              });
-              
-              // Remove original clips and add merged clip
-              updatedTimeline = [
-                ...updatedTimeline.filter(seg => !mergeIds.has(seg.id)),
-                merged,
-              ]
-                .sort((a, b) => a.order - b.order)
-                .map((seg, i) => ({ ...seg, order: i })); // Reorder all clips
-              
-              // Recalculate timeline positions
-              let t = 0;
-              updatedTimeline = updatedTimeline.map(seg => { 
-                const s = { ...seg, timelineStart: t }; 
-                t += seg.duration; 
-                return s; 
-              });
-              
-              summaryParts.push(`Merged ${toMerge.length} clips into "${merged.name}"`);
-            }
-          }
-        }
-      }
-
-      // CHANGED: Always preserve the original transcript for the session
-      // The transcript represents the original full video content and should remain available
-      // for reference, download, and hide/show functionality throughout the session
-      logger.debug('AI edit - preserving original transcript after AI operations');
-      
-      // Build updated session - always preserve original transcript
-      const updatedSession = { 
-        ...currentSession, 
-        timeline: updatedTimeline,
-        // PRESERVE: Keep original transcript and segments for reference
-        transcript: currentSession.transcript, // Always keep original
-        transcriptSegments: currentSession.transcriptSegments, // Always keep original
-        // FIXED: Add AI edit operation to undo stack
-        undoStack: [...currentSession.undoStack, { 
-          type: 'AI_EDIT' as const, 
-          previousTimeline: currentSession.timeline,
-          previousTranscript: currentSession.transcript,
-          previousTranscriptSegments: currentSession.transcriptSegments,
-          prompt: userMessage,
-          operations: operations
-        }],
-        redoStack: [], // Clear redo stack when new action is performed
-        lastModified: Date.now()
-      };
-      setSession(updatedSession);
-      sessionRef.current = updatedSession;
-      await sessionManager.saveSession(sessionId, updatedSession);
-      
-      logger.operation('AI edit session updated with', updatedSession.timeline.length, 'clips');
-      
-      // Force timeline refresh by triggering a re-render
-      setTimeout(() => {
-        logger.debug('AI edit - timeline refresh triggered');
-        setCurrentTime(prev => prev); // Trigger re-render
-      }, 100);
-
-      // Build assistant reply
-      let reply = '';
-      if (operations.length > 0) {
-        reply = 'Done! Your video has been edited.';
-      } else {
-        reply = 'No changes were needed for that instruction.';
-      }
-
-      setChatMessages(prev => [...prev, { role: 'assistant', content: reply }]);
-
-    } catch (err) {
-      logger.error('AI edit failed:', err);
-      const errMsg = err instanceof Error ? err.message : 'AI edit failed. Please try again.';
-      setAiError(errMsg);
-      setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${errMsg}` }]);
-    } finally {
-      setIsAiEditing(false);
-    }
-  };
-
-  const handleSegmentJump = async (segment: TimelineSegment) => {
-    if (!videoRef.current) return;
-    
-    const video = videoRef.current;
-    const wasPlaying = !video.paused;
-    
-    // Check if we're already at the target position (within 0.1 seconds)
-    const isAlreadyAtPosition = Math.abs(video.currentTime - segment.sourceStart) < 0.1;
-    
-    if (isAlreadyAtPosition) {
-      // Already at position, just select the segment
-      setSelectedSegmentId(segment.id);
-      return;
-    }
-    
-    // Show seeking indicator for this specific segment
-    setSeekingSegmentId(segment.id);
-    
-    // Pause first to avoid playback issues during seek
-    video.pause();
-    
-    // Set the time
-    video.currentTime = segment.sourceStart;
-    setCurrentTime(segment.sourceStart);
-    setSelectedSegmentId(segment.id);
-    
-    // Wait for seek to complete
-    await new Promise<void>((resolve) => {
-      const onSeeked = () => {
-        video.removeEventListener('seeked', onSeeked);
-        resolve();
-      };
-      video.addEventListener('seeked', onSeeked);
-      
-      // Timeout fallback
-      setTimeout(resolve, 500);
-    });
-    
-    // Hide seeking indicator
-    setSeekingSegmentId(null);
-    
-    // Resume playback if it was playing before
-    if (wasPlaying) {
-      try {
-        await video.play();
-        setIsPlaying(true);
-      } catch (error) {
-        logger.debug('Could not resume playback');
-      }
-    }
-  };
-
   const handleResetConfirm = async () => {
     if (session) {
       await sessionManager.clearSession(session.sessionId);
@@ -1882,75 +1787,135 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   }
 
   return (
-    <div className="editor-page" ref={editPanelRef}>
-      <header className="editor-header">
-        <div className="header-left">
-          <h1>AutoEdit</h1>
-          <span className="session-id">Session: {sessionId.substring(0, 8)}...</span>
-        </div>
-        <div className="header-right">
-          <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
-            Reset
-          </button>
-          <button className="btn btn-primary" onClick={handleExport}>
-            Export
-          </button>
-        </div>
-      </header>
+    <>
+      <div className="editor-page" ref={editPanelRef}>
+        <header className="editor-header">
+          <div className="header-left">
+            <h1>AutoEdit</h1>
+          </div>
+          <div className="header-right">
+            <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
+              Reset
+            </button>
+            <button className="btn btn-primary" onClick={handleExport}>
+              Export
+            </button>
+          </div>
+        </header>
 
-      <div className="editor-content">
-        <main className="editor-main">
-          {/* Video Player */}
-          <div className="video-player">
-            {/* Conditionally render Remotion preview or native video player */}
+        <div className="editor-content">
+          <main className="editor-main">
+            {/* Video Player */}
+            <div
+              className="video-player"
+              style={{ position: 'relative', flex: 1, display: 'flex', flexDirection: 'column', backgroundColor: '#000', minHeight: 0 }}
+            >
             {showRemotionPreview && compositionSchema ? (
               <RemotionPreview
                 composition={compositionSchema}
                 currentTime={currentTime}
                 onTimeUpdate={setCurrentTime}
-                onError={(error) => {
-                  logger.error('Remotion preview error:', error);
-                  setShowRemotionPreview(false);
-                }}
               />
             ) : (
+              <>
               <video
                 key={sessionId}
                 ref={videoRef}
-                src={session.videoUrl}
                 controls
                 className="video-element"
-                preload="metadata"
+                style={{ width: '100%', height: '100%', objectFit: 'contain', flex: 1 }}
+                crossOrigin="anonymous"
+                preload="auto"
                 onLoadedMetadata={() => {
                   const video = videoRef.current;
                   if (!video || !session.timeline.length) return;
-                  const first = [...session.timeline].sort((a, b) => a.order - b.order)[0];
-                  logger.debug('Video onLoadedMetadata - snapping to first clip:', first.sourceStart);
-                  isJumpingRef.current = true;
-                  video.currentTime = first.sourceStart;
-                  setCurrentTime(first.sourceStart);
-                  currentClipIndexRef.current = 0;
-                  setTimeout(() => { isJumpingRef.current = false; }, 150);
+                  // Only snap to the first clip's start on the very first load (empty src ref).
+                  // During playback, loadClip handles seeking — don't interfere.
+                  if (currentSrcRef.current === '') {
+                    const first = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order)[0];
+                    if (first && !first.assetUrl) {
+                      isJumpingRef.current = true;
+                      video.currentTime = first.sourceStart ?? 0;
+                      setCurrentTime(first.timelineStart ?? 0);
+                      setTimeout(() => { isJumpingRef.current = false; }, 150);
+                    }
+                  }
                 }}
-                onError={(e) => {
-                  logger.error('Video error loading video:', e);
-                }}
-                onLoadStart={() => {
-                  logger.debug('Video load started');
-                }}
-                onCanPlay={() => {
-                  logger.debug('Video can play');
-                }}
+                onPlay={() => setIsPlaying(true)}
+                onPause={() => setIsPlaying(false)}
+                aria-label={isPlaying ? 'Video playing' : 'Video paused'}
               >
                 Your browser does not support the video tag.
               </video>
+
+              {/* Asset video overlay — fades in over the original video */}
+              <video
+                ref={assetVideoRef}
+                style={{
+                  position: 'absolute', top: 0, left: 0,
+                  width: '100%', height: '100%',
+                  objectFit: 'contain',
+                  zIndex: 4,
+                  opacity: assetVideoOpacity,
+                  transition: 'opacity 0.18s ease',
+                  pointerEvents: 'none',
+                  backgroundColor: '#000',
+                }}
+                crossOrigin="anonymous"
+                preload="auto"
+                playsInline
+              />
+
+              <img
+                ref={snapshotImgRef}
+                alt="transition-snapshot"
+                style={{
+                  position: 'absolute',
+                  top: 0, left: 0,
+                  width: '100%', height: '100%',
+                  objectFit: 'contain',
+                  zIndex: 2,
+                  pointerEvents: 'none',
+                  opacity: 0,
+                  transition: 'opacity 0.15s ease-out',
+                  backgroundColor: 'transparent'
+                }}
+              />
+              </>
+            )}
+
+            {/* Overlay render logic for new Track 1 active visual assets */}
+            {activeOverlayClip && activeOverlayClip.assetUrl && (
+              <div className="video-photo-preview">
+                {activeOverlayClip.assetKind === 'photo' ? (
+                  <img src={getAssetPreviewUrl(activeOverlayClip.assetUrl)} alt={activeOverlayClip.name} className="video-photo-img" />
+                ) : activeOverlayClip.assetKind === 'video' ? (
+                  <video src={getAssetPreviewUrl(activeOverlayClip.assetUrl)} autoPlay muted loop className="video-photo-img" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                ) : null}
+                <div className="video-photo-label">{getShortName(activeOverlayClip.name, activeOverlayClip.assetKind === 'photo' ? 'Photo' : 'Video')}</div>
+              </div>
+            )}
+            
+            {/* Fallback legacy Photo overlay */}
+            {!activeOverlayClip && photoOverlay && (
+              <div className="video-photo-preview">
+                 <img src={photoOverlay.url} alt={photoOverlay.name} className="video-photo-img" />
+                 <div className="video-photo-label">{getShortName(photoOverlay.name, 'Photo')}</div>
+               </div>
+             )}
+
+            {/* Video asset name label */}
+            {!activeOverlayClip && !photoOverlay && activeAssetClip?.assetKind === 'video' && (
+              <div className="asset-overlay-label" style={{ zIndex: 3 }}>
+                Video: {getShortName(activeAssetClip?.name, 'Video')}
+              </div>
             )}
           </div>
 
           {/* Editing Controls */}
           <div className="editing-controls">
             <button className="btn btn-icon" title="Cut at playhead position" onClick={handleCut}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="6" cy="6" r="3" />
                 <circle cx="6" cy="18" r="3" />
                 <line x1="20" y1="4" x2="8.12" y2="15.88" />
@@ -1962,9 +1927,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               className="btn btn-icon" 
               title="Delete selected segment" 
               onClick={handleDelete}
-              disabled={!selectedSegmentId}
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="3 6 5 6 21 6" />
                 <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
               </svg>
@@ -1975,7 +1939,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               onClick={handleUndo}
               disabled={!session || session.undoStack.length === 0}
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="1 4 1 10 7 10" />
                 <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
               </svg>
@@ -1986,812 +1950,602 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               onClick={handleRedo}
               disabled={!session || session.redoStack.length === 0}
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="23 4 23 10 17 10" />
                 <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
               </svg>
             </button>
+
+            {/* Volume Control for selected audio segment */}
+            {selectedSegmentId && session.timeline.find(s => s.id === selectedSegmentId)?.assetKind === 'audio' && (
+              <div className="volume-control" style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', gap: '8px', background: '#1a1a2e', padding: '4px 12px', borderRadius: '6px', border: '1px solid #333' }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1abc9c" strokeWidth="2">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                </svg>
+                <input 
+                  type="range" 
+                  min="0" 
+                  max="2" 
+                  step="0.05" 
+                  value={session.timeline.find(s => s.id === selectedSegmentId)?.volume ?? 1} 
+                  onChange={(e) => handleVolumeChange(selectedSegmentId, parseFloat(e.target.value))}
+                  title="Volume"
+                  style={{ width: '90px', cursor: 'pointer', accentColor: '#1abc9c' }}
+                />
+                <span style={{ fontSize: '0.7rem', color: '#1abc9c', minWidth: '36px', fontVariantNumeric: 'tabular-nums' }}>
+                  {Math.round((session.timeline.find(s => s.id === selectedSegmentId)?.volume ?? 1) * 100)}%
+                </span>
+              </div>
+            )}
           </div>
 
-          {/* Timeline */}
+{/* Timeline — Clip Section */}
           <div className="timeline">
-            <div className="timeline-header">
-              <span>Timeline</span>
-              <span className="timeline-time">{formatTime(currentTime)} / {formatTime(session.duration)}</span>
-            </div>
-            <div className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`} 
-                 ref={timelineRef} 
-                 onClick={handleTimelineClick}
-                 onDragOver={handleTimelineDragOver}
-                 onDrop={handleTimelineDrop}>
-              {/* Timestamp ruler */}
-              <div className="timeline-ruler">
-                {Array.from({ length: 11 }).map((_, i) => {
-                  const time = (session.duration / 10) * i;
-                  return (
-                    <div
-                      key={i}
-                      className="timeline-tick"
-                      style={{ left: `${i * 10}%` }}
-                    >
-                      <span className="timeline-tick-label">{formatTime(time)}</span>
+            <div className="timeline-inner">
+              {/* Total timeline duration = sum of all clip durations (includes assets on track 0) */}
+              {(() => {
+                const track0Segments = (session.timeline || []).filter(s => s.track === 0);
+                const totalDur = Math.max(
+                  track0Segments.reduce((sum, s) => sum + (s.duration || 0), 0),
+                  1
+                );
+                return (
+                  <>
+                    <div className="timeline-header">
+                      <span className="timeline-time">{formatTime(currentTime)} / {formatTime(totalDur)}</span>
                     </div>
-                  );
-                })}
-              </div>
-              
-              {/* Multiple tracks - All can contain any type of content */}
-              {[0, 1, 2].map(trackNum => (
-                <div 
-                  key={trackNum} 
-                  className="timeline-track" 
-                  data-track={trackNum} 
-                  style={{ position: 'relative', height: '80px', borderBottom: '1px solid #2d2d44' }}
-                  onDragOver={handleTrackDragOver}
-                  onDrop={(e) => handleTrackDrop(trackNum, e)}
-                >
-                  {/* Track label */}
-                  <div className="track-label-inline" style={{ position: 'absolute', left: '8px', top: '50%', transform: 'translateY(-50%)', fontSize: '0.75rem', opacity: 0.5, pointerEvents: 'none', zIndex: 1 }}>
-                    Track {trackNum + 1}
-                  </div>
-                  
-                  {/* Show deleted sections in gray (only for track 0) */}
-                  {trackNum === 0 && getDeletedSections().map((section, index) => (
                     <div
-                      key={`deleted-${index}`}
-                      className="timeline-deleted"
-                      style={{
-                        left: `${(section.start / session.duration) * 100}%`,
-                        width: `${(section.duration / session.duration) * 100}%`,
+                      className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`}
+                      ref={timelineRef}
+                      onClick={(e) => {
+                        if (!videoRef.current || isDraggingPlayhead) return;
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const pct = (e.clientX - rect.left) / rect.width;
+                        const clickTime = pct * totalDur;
+                        void jumpToTimelineTime(clickTime);
                       }}
-                    />
-                  ))}
-                  
-                  {/* Show segments for this track */}
-                  {session.timeline
-                    .filter(seg => seg.track === trackNum)
-                    .sort((a, b) => a.order - b.order)
-                    .map((segment) => {
-                      // Calculate position based on order in timeline
-                      // FIXED: Use the segment's timelineStart property directly, with fallback calculation
-                      let timelineStart = segment.timelineStart ?? 0;
-                      
-                      // Fallback: calculate if timelineStart is not set properly
-                      if (timelineStart === 0 && segment.order > 0) {
-                        const sortedSegments = session.timeline
-                          .filter(s => s.track === trackNum)
-                          .sort((a, b) => a.order - b.order);
-                        
-                        timelineStart = sortedSegments
-                          .filter(s => s.order < segment.order)
-                          .reduce((sum, s) => sum + s.duration, 0);
-                      }
-                      
-                      // Calculate total duration for this track only
-                      const totalDuration = Math.max(
-                        session.timeline
-                          .filter(s => s.track === trackNum)
-                          .reduce((sum, s) => sum + s.duration, 0),
-                        session.duration || 1 // Prevent division by zero
-                      );
-                      
-                      const leftPercent = (timelineStart / totalDuration) * 100;
-                      const widthPercent = (segment.duration / totalDuration) * 100;
-                      
-                      logger.debug(`Timeline render segment ${segment.id}:`, {
-                        name: segment.name,
-                        timelineStart,
-                        duration: segment.duration,
-                        totalDuration,
-                        leftPercent,
-                        widthPercent,
-                        color: segment.color,
-                        track: segment.track
-                      });
-                      
-                      return (
-                        <div
-                          key={segment.id}
-                          className={`timeline-segment ${selectedSegmentId === segment.id ? 'selected' : ''} ${draggedSegmentId === segment.id ? 'dragging' : ''} ${dragOverSegmentId === segment.id ? 'drag-over' : ''} ${segment.assetKind ? `asset-${segment.assetKind}` : ''} ${segment.isMerged ? 'merged' : ''}`}
-                          style={{
-                            left: `${leftPercent}%`,
-                            width: `${widthPercent}%`,
-                            backgroundColor: segment.assetKind ? getAssetColor(segment.assetKind) : (segment.color || getClipColor(segment.order)),
-                            cursor: 'move',
-                            transition: draggedSegmentId ? 'none' : 'all 0.3s ease',
-                          }}
-                          onClick={(e) => handleSegmentClick(segment.id, e)}
-                          draggable={true}
-                          onDragStart={(e) => handleSegmentDragStart(segment.id, e)}
-                          onDragEnd={handleSegmentDragEnd}
-                          onDragOver={(e) => handleSegmentDragOver(segment.id, e)}
-                          onDragLeave={(e) => handleSegmentDragLeave(segment.id, e)}
-                          onDrop={(e) => handleSegmentDrop(segment.id, e)}
-                        >
-                          <span className="segment-label">
-                            {segment.assetKind && (
-                              <span className={`asset-icon asset-${segment.assetKind}`}>
-                                {segment.assetKind === 'photo' && '🖼️'}
-                                {segment.assetKind === 'video' && '🎥'}
-                                {segment.assetKind === 'audio' && '🎵'}
+                      onDragOver={handleTimelineDragOver}
+                      onDrop={handleTimelineDrop}
+                    >
+                      {/* Timeline Ruler (Timestamps) */}
+                      <div className="timeline-ruler" style={{ position: 'relative', height: '14px', borderBottom: '1px solid #333', marginBottom: '4px' }}>
+                        {[...Array(11)].map((_, i) => {
+                          const pct = i * 10;
+                          const timeAtMark = (totalDur * pct) / 100;
+                          const transform = i === 0 ? 'translateX(0)' : i === 10 ? 'translateX(-100%)' : 'translateX(-50%)';
+                          const align = i === 0 ? 'flex-start' : i === 10 ? 'flex-end' : 'center';
+                          return (
+                            <div key={`ruler-${i}`} style={{ position: 'absolute', left: `${pct}%`, transform, fontSize: '0.65rem', color: '#888', display: 'flex', flexDirection: 'column', alignItems: align }}>
+                              <span style={{ userSelect: 'none' }}>{formatTime(timeAtMark)}</span>
+                              <div style={{ height: '6px', width: '1px', background: '#555', marginTop: '2px' }} />
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Single clip track (track 0) */}
+                      <div
+                        className="timeline-track"
+                        data-track={0}
+                        style={{ position: 'relative', height: '44px', background: 'rgba(10, 10, 20, 0.4)', borderRadius: '6px', border: '1px solid #2a2a3e', overflow: 'hidden', marginTop: '4px', display: 'flex' }}
+                        onDragOver={handleTrackDragOver}
+                        onDrop={(e) => handleTrackDrop(0, e)}
+                      >
+                        {/* All segments on track 0 */}
+                        {track0Segments.length === 0 ? (
+                          <div className="timeline-track-empty" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#666', fontSize: '0.75rem', fontStyle: 'italic' }}>No clips - add from Assets tab</div>
+                        ) : (
+                          track0Segments
+                            .sort((a, b) => a.order - b.order)
+                            .map((segment, index) => {
+                              const widthPercent = (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * 100;
+                              
+                              // Use "clip 1", "clip 2" format (lowercase)
+                              const clipLabel = segment.assetKind === 'photo'
+                                ? 'Photo'
+                                : segment.assetKind === 'video'
+                                  ? 'Video'
+                                  : segment.assetKind === 'audio'
+                                    ? 'Audio'
+                                    : `Clip ${index + 1}`;
+
+                              return (
+                                <div
+                                  key={segment.id}
+                                  className={`timeline-segment${selectedSegmentId === segment.id ? ' selected' : ''}${draggedSegmentId === segment.id ? ' dragging' : ''}`}
+                                  title={getShortName(segment.name, clipLabel)}
+                                  style={{
+                                    position: 'relative',
+                                    height: '100%',
+                                    flex: `0 0 ${widthPercent}%`,
+                                    width: `${widthPercent}%`,
+                                    backgroundColor: segment.assetKind
+                                      ? getAssetColor(segment.assetKind)
+                                      : (segment.color || getClipColor(segment.order)),
+                                    boxSizing: 'border-box',
+                                    borderRight: '1px solid #000',
+                                    borderTop: selectedSegmentId === segment.id ? '2px solid #fff' : '1px solid rgba(255,255,255,0.2)',
+                                    borderBottom: selectedSegmentId === segment.id ? '2px solid #fff' : '1px solid rgba(0,0,0,0.5)',
+                                    borderLeft: dragOverSegmentId === segment.id && dragOverSide === 'left'
+                                      ? '3px solid #4a9eff'
+                                      : selectedSegmentId === segment.id ? '2px solid #fff' : 'none',
+                                    cursor: 'grab',
+                                    transition: draggedSegmentId ? 'none' : 'all 0.3s ease',
+                                    zIndex: selectedSegmentId === segment.id ? 10 : 2,
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    overflow: 'hidden',
+                                    outline: dragOverSegmentId === segment.id && dragOverSide === 'right'
+                                      ? '3px solid #4a9eff'
+                                      : 'none',
+                                    outlineOffset: '-1px',
+                                  }}
+                                  onClick={(e) => handleSegmentClick(segment.id, e)}
+                                  draggable={true}
+                                  onDragStart={(e) => handleSegmentDragStart(segment.id, e)}
+                                  onDragEnd={handleSegmentDragEnd}
+                                  onDragOver={(e) => handleSegmentDragOver(segment.id, e)}
+                                  onDragLeave={(e) => handleSegmentDragLeave(segment.id, e)}
+                                  onDrop={(e) => handleSegmentDrop(segment.id, e)}
+                                >
+                                  <span className="segment-label" style={{ fontWeight: 600, textAlign: 'center', fontSize: '0.7rem', color: '#fff', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', maxWidth: '100%', display: 'block', padding: '0 4px', textShadow: '0 1px 2px rgba(0,0,0,0.8)', zIndex: 3 }}>
+                                    {getShortName(segment.name, clipLabel)}
+                                  </span>
+                                </div>
+                              );
+                            })
+                        )}
+                      </div>
+
+                      {/* Audio track — flush below video track, same width, no wrapper div */}
+                      <div
+                        className="timeline-track audio-track"
+                        data-track={1}
+                        style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '4px', border: '1px solid rgba(26,188,156,0.18)', height: '34px', overflow: 'visible', marginTop: '3px' }}
+                        onDragOver={handleTrackDragOver}
+                        onDrop={(e) => handleTrackDrop(1, e)}
+                      >
+                        {(session.timeline || []).filter(s => s.track === 1).length === 0 && (
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#3a5a54', fontSize: '0.65rem', fontStyle: 'italic', gap: '4px', pointerEvents: 'none' }}>
+                            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                            audio
+                          </div>
+                        )}
+                        {(session.timeline || []).filter(s => s.track === 1).map((segment) => {
+                          const leftPercent = ((segment.timelineStart ?? 0) / Math.max(totalDur, 1)) * 100;
+                          const widthPercent = (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * 100;
+                          const vol = segment.volume ?? 1;
+                          return (
+                            <div
+                              key={segment.id}
+                              className={`timeline-segment${selectedSegmentId === segment.id ? ' selected' : ''}${draggedSegmentId === segment.id ? ' dragging' : ''}`}
+                              title={`${getShortName(segment.name, 'Audio')} — ${Math.round(vol * 100)}% vol`}
+                              style={{
+                                position: 'absolute', top: 0, height: '100%',
+                                left: `${leftPercent}%`, width: `${widthPercent}%`,
+                                backgroundColor: '#1abc9c', boxSizing: 'border-box',
+                                border: selectedSegmentId === segment.id ? '2px solid #fff' : '1px solid rgba(26,188,156,0.5)',
+                                cursor: resizingSegmentId === segment.id ? 'ew-resize' : 'grab',
+                                borderRadius: '3px', display: 'flex', alignItems: 'center', overflow: 'hidden',
+                                zIndex: selectedSegmentId === segment.id ? 10 : 1,
+                              }}
+                              onClick={(e) => handleSegmentClick(segment.id, e)}
+                              draggable={resizingSegmentId !== segment.id}
+                              onDragStart={(e) => handleSegmentDragStart(segment.id, e)}
+                              onDragEnd={handleSegmentDragEnd}
+                            >
+                              <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 2 }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'left')} />
+                              <span style={{ fontSize: '0.6rem', color: '#fff', padding: '0 8px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1, textShadow: '0 1px 2px rgba(0,0,0,0.8)', zIndex: 1 }}>
+                                {getShortName(segment.name, 'Audio')}{vol !== 1 ? ` ${Math.round(vol * 100)}%` : ''}
                               </span>
-                            )}
-                            {segment.isMerged && (
-                              <span className="merged-icon" title="Merged clip">
-                                🔗
-                              </span>
-                            )}
-                            {segment.name || `Clip ${segment.order + 1}`}
-                          </span>
-                        </div>
-                      );
-                    })}
-                </div>
-              ))}
-              
-              {/* Playhead spans all tracks */}
-              <div
-                className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
-                style={{
-                  left: `${(currentTime / session.duration) * 100}%`,
-                  height: '240px', // Span all 3 tracks
-                }}
-                onMouseDown={handlePlayheadMouseDown}
-              />
+                              <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 2 }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'right')} />
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Playhead */}
+                      <div
+                        className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
+                        style={{ left: `${(currentTime / totalDur) * 100}%`, top: 0, height: '100%', zIndex: 10 }}
+                        onMouseDown={handlePlayheadMouseDown}
+                      />
+                    </div>
+                  </>
+                );
+              })()}
             </div>
           </div>
         </main>
-
-        {/* Sidebar */}
-        <aside className="editor-sidebar">
-          <div className="sidebar-tabs">
-            <button
-              className={`tab ${activeTab === 'clips' ? 'active' : ''}`}
-              onClick={() => setActiveTab('clips')}
-            >
-              Clips
-            </button>
-            <button
-              className={`tab ${activeTab === 'ai-edit' ? 'active' : ''}`}
-              onClick={() => setActiveTab('ai-edit')}
-            >
-              AI Edit
-            </button>
-            <button
-              className={`tab ${activeTab === 'assets' ? 'active' : ''}`}
-              onClick={() => setActiveTab('assets')}
-            >
-              Assets
-            </button>
-          </div>
-
-          <div className="sidebar-content">
-            {activeTab === 'clips' && (
-              <div className="tab-panel">
-                <h3 className="panel-title">Video Clips</h3>
-                <p className="panel-description">
-                  {session.timeline.length} clip{session.timeline.length !== 1 ? 's' : ''} in timeline
-                </p>
-                
-                <div className="clips-list">
+      <aside className="editor-sidebar">
+        <div className="sidebar-tabs">
+          <button 
+            className={`tab ${activeTab === 'clips' ? 'active' : ''}`}
+            onClick={() => setActiveTab('clips')}
+          >
+            Clips
+          </button>
+          <button 
+            className={`tab ${activeTab === 'ai-edit' ? 'active' : ''}`}
+            onClick={() => setActiveTab('ai-edit')}
+          >
+            AI Edits
+          </button>
+          <button 
+            className={`tab ${activeTab === 'assets' ? 'active' : ''}`}
+            onClick={() => setActiveTab('assets')}
+          >
+            Assets
+          </button>
+        </div>
+        
+        <div className="sidebar-content">
+{activeTab === 'clips' && (
+            <div className="clips-tab">
+              <div style={{ marginBottom: '0.75rem' }}>
+                <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fff' }}>Timeline Clips</h3>
+              </div>
+              {/* Hidden file input for per-clip local insert */}
+              <input
+                type="file"
+                ref={fileInputRef}
+                style={{ display: 'none' }}
+                accept="video/*,image/*,audio/*"
+                onChange={handleLocalFileInsert}
+              />
+              {session.timeline.filter(s => s.track === 0).length === 0 ? (
+                <div style={{ color: '#666', textAlign: 'center', padding: '2rem 1rem' }}>
+                  No clips yet. Add from Assets tab.
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                   {session.timeline
+                    .filter(s => s.track === 0)
                     .sort((a, b) => a.order - b.order)
-                    .map((segment) => (
+                    .map((clip, i) => (
                       <div
-                        key={segment.id}
-                        className={`clip-item ${selectedSegmentId === segment.id ? 'selected' : ''}`}
-                        onClick={() => handleSegmentJump(segment)}
+                        key={clip.id}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.effectAllowed = 'move';
+                          e.dataTransfer.setData('text/plain', clip.id);
+                        }}
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          e.currentTarget.style.borderTop = `2px solid #4a9eff`;
+                        }}
+                        onDragLeave={(e) => {
+                          e.currentTarget.style.borderTop = '';
+                        }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          e.currentTarget.style.borderTop = '';
+                          const draggedId = e.dataTransfer.getData('text/plain');
+                          if (!draggedId || draggedId === clip.id) return;
+                          const track0 = session.timeline
+                            .filter(s => s.track === 0)
+                            .sort((a, b) => a.order - b.order);
+                          const fromIdx = track0.findIndex(s => s.id === draggedId);
+                          const toIdx = track0.findIndex(s => s.id === clip.id);
+                          if (fromIdx < 0 || toIdx < 0) return;
+                          const reordered = [...track0];
+                          const [moved] = reordered.splice(fromIdx, 1);
+                          reordered.splice(toIdx, 0, moved);
+                          let t = 0;
+                          const adjusted = reordered.map((s, idx) => {
+                            const r = { ...s, order: idx, timelineStart: t };
+                            t += s.duration;
+                            return r;
+                          });
+                          const others = session.timeline.filter(s => s.track !== 0);
+                          const updatedSession = {
+                            ...session,
+                            timeline: [...adjusted, ...others],
+                            undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+                            redoStack: [],
+                          };
+                          setSession(updatedSession);
+                          void sessionManager.saveSession(sessionId, updatedSession);
+                        }}
                         style={{
-                          borderLeftColor: segment.color,
-                          borderLeftWidth: '4px'
+                          display: 'flex', alignItems: 'center', gap: '0.6rem',
+                          padding: '0.6rem 0.75rem', background: '#2a2a2a', borderRadius: '8px',
+                          borderLeft: `4px solid ${clip.color || getClipColor(i)}`,
+                          cursor: 'grab', userSelect: 'none',
+                          transition: 'background 0.15s',
                         }}
                       >
-                        <div className="clip-header">
-                          <div className="clip-color-indicator" style={{ backgroundColor: segment.assetKind ? getAssetColor(segment.assetKind) : segment.color }}></div>
-                          <input
-                            type="text"
-                            className="clip-name-input"
-                            value={segment.name || `Clip ${segment.order + 1}`}
-                            onChange={(e) => {
-                              e.stopPropagation();
-                              handleClipRename(segment.id, e.target.value);
-                            }}
-                            onClick={(e) => e.stopPropagation()}
-                            placeholder={`Clip ${segment.order + 1}`}
-                          />
-                          <span className="clip-duration">{formatTime(segment.duration)}</span>
-                        </div>
-                        <div className="clip-time-range">
-                          {segment.assetKind ? (
-                            <span className={`clip-kind-badge ${segment.assetKind}`}>
-                              {segment.assetKind === 'photo' && '🖼️ Photo'}
-                              {segment.assetKind === 'video' && '🎥 Video'}
-                              {segment.assetKind === 'audio' && '🎵 Audio'}
-                            </span>
-                          ) : segment.isMerged ? (
-                            <span className="clip-kind-badge merged" style={{ background: '#f39c12', color: 'white' }}>
-                              🔗 Merged ({segment.segments?.length || 0} parts)
-                            </span>
-                          ) : (
-                            `${formatTime(segment.sourceStart)} - ${formatTime(segment.sourceEnd)}`
-                          )}
-                          <span className="clip-track-badge" style={{ marginLeft: '8px', padding: '2px 6px', background: '#2d2d44', borderRadius: '3px', fontSize: '0.7rem' }}>
-                            Track {segment.track + 1}
-                          </span>
-                        </div>
-                        <div className="clip-actions">
-                          {/* Track change buttons */}
-                          <div style={{ display: 'flex', gap: '4px', marginRight: '8px' }}>
-                            {segment.track > 0 && (
-                              <button
-                                className="btn-small"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const newTimeline = session.timeline.map(seg => 
-                                    seg.id === segment.id ? { ...seg, track: segment.track - 1 } : seg
-                                  );
-                                  const updatedSession = { ...session, timeline: newTimeline };
-                                  setSession(updatedSession);
-                                  sessionManager.saveSession(sessionId, updatedSession);
-                                }}
-                                title="Move to track above"
-                              >
-                                ↑
-                              </button>
-                            )}
-                            {segment.track < 2 && (
-                              <button
-                                className="btn-small"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const newTimeline = session.timeline.map(seg => 
-                                    seg.id === segment.id ? { ...seg, track: segment.track + 1 } : seg
-                                  );
-                                  const updatedSession = { ...session, timeline: newTimeline };
-                                  setSession(updatedSession);
-                                  sessionManager.saveSession(sessionId, updatedSession);
-                                }}
-                                title="Move to track below"
-                              >
-                                ↓
-                              </button>
-                            )}
+                        {/* Drag handle */}
+                        <svg width="12" height="16" viewBox="0 0 12 16" fill="#555" style={{ flexShrink: 0 }}>
+                          <circle cx="4" cy="3" r="1.5"/><circle cx="8" cy="3" r="1.5"/>
+                          <circle cx="4" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/>
+                          <circle cx="4" cy="13" r="1.5"/><circle cx="8" cy="13" r="1.5"/>
+                        </svg>
+                        {/* Color dot */}
+                        <div style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: clip.color || getClipColor(i), flexShrink: 0 }} />
+                        {/* Info */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontWeight: 600, color: '#fff', fontSize: '0.82rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {clip.name || `Clip ${i + 1}`}
                           </div>
+                          <div style={{ fontSize: '0.7rem', color: '#777' }}>
+                            {clip.duration.toFixed(1)}s
+                          </div>
+                        </div>
+                        {/* Actions */}
+                        <div style={{ display: 'flex', gap: '3px', alignItems: 'center', flexShrink: 0 }}>
+                          {/* Jump */}
                           <button
-                            className="btn-small"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSegmentJump(segment);
-                            }}
-                            disabled={seekingSegmentId === segment.id}
+                            className="btn btn-icon"
+                            style={{ padding: '4px' }}
+                            title="Jump to clip"
+                            onClick={(e) => { e.stopPropagation(); jumpToTimelineTime(clip.timelineStart ?? 0); }}
                           >
-                            {seekingSegmentId === segment.id ? 'Seeking...' : 'Jump to'}
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <polygon points="5 3 19 12 5 21 5 3" />
+                            </svg>
                           </button>
+                          {/* Insert local file after this clip */}
                           <button
-                            className="btn-small btn-danger-small"
+                            className="btn btn-icon"
+                            style={{ padding: '4px', color: '#4a9eff' }}
+                            title="Insert file after this clip"
+                            disabled={isUploadingAsset}
                             onClick={(e) => {
                               e.stopPropagation();
-                              setSelectedSegmentId(segment.id);
-                              handleDelete();
+                              insertAfterClipIdRef.current = clip.id;
+                              fileInputRef.current?.click();
                             }}
-                            disabled={seekingSegmentId !== null}
                           >
-                            Delete
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                              <polyline points="17 8 12 3 7 8" />
+                              <line x1="12" y1="3" x2="12" y2="15" />
+                            </svg>
+                          </button>
+                          {/* Delete */}
+                          <button
+                            className="btn btn-icon"
+                            style={{ padding: '4px', color: '#e74c3c' }}
+                            title="Delete clip"
+                            onClick={(e) => { e.stopPropagation(); handleDelete(clip.id); }}
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <polyline points="3 6 5 6 21 6" />
+                              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                            </svg>
                           </button>
                         </div>
                       </div>
                     ))}
                 </div>
+              )}
+            </div>
+          )}
+          {activeTab === 'assets' && session && (
+            <AssetsTab onAddToTimeline={(asset, photoDuration) => {
+              const assetName = (asset as any).name || asset.tags || 'Asset';
+              const assetDuration = photoDuration || (asset._kind === 'video' ? (asset as any).duration : asset._kind === 'audio' ? (asset as any).duration : 5);
+              const isAudio = asset._kind === 'audio';
+
+              // For audio: resolve preview URL from freesound previews
+              // For video: use proxied small video URL
+              // For photo: use proxied preview URL
+              let assetUrl = '';
+              if (isAudio) {
+                const previews = (asset as any).previews || {};
+                assetUrl = getAssetPreviewUrl(previews['preview-hq-mp3'] || previews['preview-lq-mp3'] || '');
+              } else if (asset._kind === 'video') {
+                assetUrl = getAssetPreviewUrl((asset as any).videos?.small?.url || (asset as any).videos?.medium?.url || '');
+              } else {
+                assetUrl = getAssetPreviewUrl((asset as any).previewURL || (asset as any).webformatURL || '');
+              }
+
+              if (isAudio) {
+                // Audio goes to track 1 at the current playhead position
+                const track0Segments = session.timeline.filter(s => s.track === 0);
+                const totalDur = track0Segments.reduce((sum, s) => sum + s.duration, 0);
+                const insertAt = Math.min(currentTime, totalDur);
+
+                const newSegment: TimelineSegment = {
+                  id: `asset-${Date.now()}`,
+                  name: assetName,
+                  assetUrl,
+                  assetKind: 'audio',
+                  duration: assetDuration,
+                  timelineStart: insertAt,
+                  sourceStart: 0,
+                  sourceEnd: assetDuration,
+                  order: session.timeline.filter(s => s.track === 1).length,
+                  track: 1,
+                  color: getAssetColor('audio'),
+                  volume: 1,
+                };
+                setSession({
+                  ...session,
+                  timeline: [...session.timeline, newSegment],
+                  undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSegment }],
+                  redoStack: [],
+                });
+                return;
+              }
+
+              const newSegment: TimelineSegment = {
+                id: `asset-${Date.now()}`,
+                name: assetName,
+                assetUrl,
+                assetKind: asset._kind as 'video' | 'photo',
+                duration: assetDuration,
+                timelineStart: 0,
+                sourceStart: 0,
+                sourceEnd: assetDuration,
+                order: 0,
+                track: 0,
+                color: getAssetColor(asset._kind),
+              };
+
+              const track0Segments = session.timeline.filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+              let newTrack0: TimelineSegment[] = [];
+
+              let cutMade = false;
+              for (let i = 0; i < track0Segments.length; i++) {
+                const seg = track0Segments[i];
+                const start = seg.timelineStart ?? 0;
+                const end = start + seg.duration;
                 
-                {session.timeline.length === 0 && (
-                  <div className="empty-state">
-                    <p>No clips in timeline</p>
-                    <p className="empty-state-hint">Upload a video to get started</p>
-                  </div>
-                )}
+                if (currentTime > start + 0.05 && currentTime < end - 0.05) {
+                  const cutOffset = currentTime - start;
+                  const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
+                  
+                  const segment1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
+                  const segment2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: seg.duration - cutOffset };
+                  
+                  newTrack0 = [
+                    ...track0Segments.slice(0, i),
+                    segment1,
+                    newSegment,
+                    segment2,
+                    ...track0Segments.slice(i + 1),
+                  ];
+                  cutMade = true;
+                  break;
+                }
+              }
+
+              if (!cutMade) {
+                let insertIdx = track0Segments.length;
+                for (let i = 0; i < track0Segments.length; i++) {
+                  if (currentTime <= (track0Segments[i].timelineStart ?? 0) + 0.05) {
+                    insertIdx = i;
+                    break;
+                  }
+                }
+                newTrack0 = [
+                  ...track0Segments.slice(0, insertIdx),
+                  newSegment,
+                  ...track0Segments.slice(insertIdx),
+                ];
+              }
+
+              // Recalculate timelineStart
+              let cumulativeTime = 0;
+              const adjustedTrack0 = newTrack0.map((seg, idx) => {
+                const s = { ...seg, order: idx, timelineStart: cumulativeTime };
+                cumulativeTime += seg.duration;
+                return s;
+              });
+
+              const otherTracks = session.timeline.filter(s => s.track !== 0);
+              setSession({
+                ...session,
+                timeline: [...adjustedTrack0, ...otherTracks],
+                undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSegment }],
+                redoStack: [],
+              });
+            }} />
+          )}
+          {activeTab === 'ai-edit' && (
+            <div className="ai-edit-tab" style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: '0.75rem' }}>
+              {/* Top row: Transcribe | Show/Hide | Download */}
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleTranscribe}
+                  disabled={isTranscribing}
+                  style={{ flex: 1, padding: '0.5rem', fontSize: '0.82rem' }}
+                >
+                  {isTranscribing ? `Transcribing... (${transcribeTimer.toFixed(1)}s)` : 'Transcribe'}
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => setShowTranscript(v => !v)}
+                  title={showTranscript ? 'Hide transcript' : 'Show transcript'}
+                  style={{ padding: '0.5rem 0.6rem', fontSize: '0.75rem', minWidth: '36px' }}
+                >
+                  {showTranscript ? (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                      <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                      <line x1="1" y1="1" x2="23" y2="23"/>
+                    </svg>
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                      <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                  )}
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleDownloadTranscript}
+                  disabled={!session?.transcript}
+                  title="Download transcript"
+                  style={{ padding: '0.5rem 0.6rem', fontSize: '0.75rem', minWidth: '36px', opacity: session?.transcript ? 1 : 0.4 }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                </button>
               </div>
-            )}
-            
-            {activeTab === 'ai-edit' && (
-              <div className="tab-panel">
-                {/* Enhanced Transcribe Section */}
-                <div className="enhanced-transcribe-section">
-                  <div className="transcribe-header">
-                    <h3 className="panel-title">AI Transcription</h3>
-                  </div>
-                  
-                  <p className="panel-description">
-                    Generate and edit video transcript with AI assistance
-                  </p>
-                  
-                  <div className="transcribe-action-bar">
-                    <div className="transcribe-button-container" style={{ display: 'flex', gap: '0.5rem', width: '100%', alignItems: 'center' }}>
-                      <button
-                        className="btn-transcript-action-small"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          logger.debug('Transcript hide/show button clicked, current state:', transcriptionVisible);
-                          toggleTranscriptionVisibility();
-                        }}
-                        disabled={!session.transcript}
-                        title={session.transcript ? (transcriptionVisible ? "Hide transcript" : "Show transcript") : "Transcribe first"}
-                        style={{
-                          padding: '0.5rem',
-                          background: session.transcript ? 'rgba(16, 185, 129, 0.15)' : 'rgba(100, 100, 100, 0.1)',
-                          border: session.transcript ? '1.5px solid #10b981' : '1.5px solid #555',
-                          borderRadius: '8px',
-                          color: session.transcript ? '#10b981' : '#888',
-                          cursor: session.transcript ? 'pointer' : 'not-allowed',
-                          transition: 'all 0.2s ease',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          minWidth: '36px',
-                          minHeight: '36px',
-                          opacity: session.transcript ? 1 : 0.5,
-                        }}
+
+              {/* Timestamped transcript segments — collapsible */}
+              {showTranscript && (
+                <div style={{ flex: 1, overflowY: 'auto', background: '#0d0d1a', borderRadius: '8px', padding: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                  {session?.transcriptSegments && session.transcriptSegments.length > 0 ? (
+                    session.transcriptSegments.map((seg, i) => (
+                      <div
+                        key={i}
+                        style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start', padding: '0.35rem 0.5rem', borderRadius: '5px', background: 'rgba(255,255,255,0.04)', cursor: 'pointer' }}
+                        onClick={() => void jumpToTimelineTime(seg.start)}
                       >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                          {transcriptionVisible ? (
-                            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22"/>
-                          ) : (
-                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6z"/>
-                          )}
-                        </svg>
-                      </button>
-                      <button
-                        className="btn-transcribe-pro"
-                        onClick={handleTranscribe}
-                        disabled={isTranscribing || !showTranscribeButton}
-                        style={{ 
-                          flex: 1,
-                          minHeight: '36px',
-                          height: '36px',
-                          padding: '0 1rem',
-                          opacity: showTranscribeButton ? 1 : 0.7,
-                        }}
-                      >
-                        <div className="btn-content" style={{ padding: '0' }}>
-                          <span style={{ fontSize: '0.9rem' }}>
-                            {isTranscribing 
-                              ? 'Processing Transcription...' 
-                              : showTranscribeButton 
-                                ? 'Transcribe Video' 
-                                : '✓ Transcription Complete'
-                            }
-                          </span>
-                        </div>
-                        {isTranscribing && (
-                          <div className="loading-bar">
-                            <div className="loading-progress"></div>
-                          </div>
-                        )}
-                      </button>
-                      <button
-                        className="btn-transcript-action-small"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          logger.debug('Transcript download button clicked, transcript exists:', !!session?.transcript);
-                          downloadTranscript();
-                        }}
-                        disabled={!session.transcript}
-                        title={session.transcript ? "Download transcript" : "Transcribe first to download"}
-                        style={{
-                          padding: '0.5rem',
-                          background: session.transcript ? 'rgba(16, 185, 129, 0.15)' : 'rgba(100, 100, 100, 0.1)',
-                          border: session.transcript ? '1.5px solid #10b981' : '1.5px solid #555',
-                          borderRadius: '8px',
-                          color: session.transcript ? '#10b981' : '#888',
-                          cursor: session.transcript ? 'pointer' : 'not-allowed',
-                          transition: 'all 0.2s ease',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          minWidth: '36px',
-                          minHeight: '36px',
-                          opacity: session.transcript ? 1 : 0.5,
-                        }}
-                      >
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                          <polyline points="7,10 12,15 17,10"/>
-                          <line x1="12" y1="15" x2="12" y2="3"/>
-                        </svg>
-                      </button>
-                    </div>
-                  </div>
-                  
-                  {/* Collapsible Transcript Area */}
-                  {transcriptionVisible && (
-                    <div className="transcript-area-enhanced">
-                      {session.transcript ? (
-                        <div className="transcript-container">
-                          <label className="transcript-label">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                              <polyline points="14,2 14,8 20,8"/>
-                              <line x1="16" y1="13" x2="8" y2="13"/>
-                              <line x1="16" y1="17" x2="8" y2="17"/>
-                              <polyline points="10,9 9,9 8,9"/>
-                            </svg>
-                            Original Video Transcript
-                            <span style={{ fontSize: '0.75rem', opacity: 0.7, marginLeft: '0.5rem' }}>
-                              (Available throughout session)
-                            </span>
-                          </label>
-                          <textarea
-                            className="transcript-text-enhanced"
-                            value={session.transcript}
-                            onChange={handleTranscriptChange}
-                            placeholder="Edit your transcript here..."
-                            rows={8}
-                          />
-                          <div className="transcript-stats">
-                            <span>{session.transcript.length} characters</span>
-                            <span>{session.transcript.split(/\s+/).filter(w => w.length > 0).length} words</span>
-                          </div>
-                          
-                          {/* Transcript History */}
-                          {session.transcriptHistory && session.transcriptHistory.length > 0 && (
-                            <div style={{ marginTop: '1.5rem' }}>
-                              <label className="transcript-label" style={{ marginBottom: '0.75rem' }}>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10"/>
-                                  <polyline points="12,6 12,12 16,14"/>
-                                </svg>
-                                Transcript History ({session.transcriptHistory.length})
-                              </label>
-                              <div style={{
-                                maxHeight: '300px',
-                                overflowY: 'auto',
-                                display: 'flex',
-                                flexDirection: 'column',
-                                gap: '0.75rem',
-                              }}>
-                                {[...session.transcriptHistory].reverse().map((entry, idx) => (
-                                  <div key={idx} style={{
-                                    padding: '0.75rem',
-                                    background: 'rgba(100, 100, 100, 0.1)',
-                                    border: '1px solid rgba(100, 100, 100, 0.2)',
-                                    borderRadius: '8px',
-                                  }}>
-                                    <div style={{
-                                      display: 'flex',
-                                      justifyContent: 'space-between',
-                                      alignItems: 'center',
-                                      marginBottom: '0.5rem',
-                                      fontSize: '0.85rem',
-                                      color: '#10b981',
-                                    }}>
-                                      <span style={{ fontWeight: 600 }}>{entry.operation}</span>
-                                      <span style={{ fontSize: '0.75rem', color: '#888' }}>
-                                        {new Date(entry.timestamp).toLocaleString()}
-                                      </span>
-                                    </div>
-                                    <div style={{
-                                      fontSize: '0.8rem',
-                                      color: '#ccc',
-                                      maxHeight: '100px',
-                                      overflowY: 'auto',
-                                      whiteSpace: 'pre-wrap',
-                                      wordBreak: 'break-word',
-                                      padding: '0.5rem',
-                                      background: 'rgba(0, 0, 0, 0.2)',
-                                      borderRadius: '4px',
-                                    }}>
-                                      {entry.transcript.substring(0, 300)}
-                                      {entry.transcript.length > 300 && '...'}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="transcript-empty-state">
-                          <div className="empty-icon">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                              <line x1="12" y1="19" x2="12" y2="23"/>
-                              <line x1="8" y1="23" x2="16" y2="23"/>
-                            </svg>
-                          </div>
-                          <h4>No transcript available</h4>
-                          <p>Click "Transcribe Video" to generate an AI-powered transcript of your video content</p>
-                          
-                          {/* Show history even when no current transcript */}
-                          {session.transcriptHistory && session.transcriptHistory.length > 0 && (
-                            <div style={{ marginTop: '1.5rem', width: '100%' }}>
-                              <label className="transcript-label" style={{ marginBottom: '0.75rem' }}>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10"/>
-                                  <polyline points="12,6 12,12 16,14"/>
-                                </svg>
-                                Previous Transcripts ({session.transcriptHistory.length})
-                              </label>
-                              <div style={{
-                                maxHeight: '300px',
-                                overflowY: 'auto',
-                                display: 'flex',
-                                flexDirection: 'column',
-                                gap: '0.75rem',
-                              }}>
-                                {[...session.transcriptHistory].reverse().map((entry, idx) => (
-                                  <div key={idx} style={{
-                                    padding: '0.75rem',
-                                    background: 'rgba(100, 100, 100, 0.1)',
-                                    border: '1px solid rgba(100, 100, 100, 0.2)',
-                                    borderRadius: '8px',
-                                  }}>
-                                    <div style={{
-                                      display: 'flex',
-                                      justifyContent: 'space-between',
-                                      alignItems: 'center',
-                                      marginBottom: '0.5rem',
-                                      fontSize: '0.85rem',
-                                      color: '#10b981',
-                                    }}>
-                                      <span style={{ fontWeight: 600 }}>{entry.operation}</span>
-                                      <span style={{ fontSize: '0.75rem', color: '#888' }}>
-                                        {new Date(entry.timestamp).toLocaleString()}
-                                      </span>
-                                    </div>
-                                    <div style={{
-                                      fontSize: '0.8rem',
-                                      color: '#ccc',
-                                      maxHeight: '100px',
-                                      overflowY: 'auto',
-                                      whiteSpace: 'pre-wrap',
-                                      wordBreak: 'break-word',
-                                      padding: '0.5rem',
-                                      background: 'rgba(0, 0, 0, 0.2)',
-                                      borderRadius: '4px',
-                                    }}>
-                                      {entry.transcript.substring(0, 300)}
-                                      {entry.transcript.length > 300 && '...'}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      )}
+                        <span style={{ fontSize: '0.7rem', color: '#4a9eff', minWidth: '42px', paddingTop: '2px', fontVariantNumeric: 'tabular-nums' }}>
+                          {formatTime(seg.start)}
+                        </span>
+                        <span style={{ fontSize: '0.82rem', color: '#ddd', lineHeight: '1.4' }}>
+                          {seg.text.trim()}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <div style={{ color: '#444', fontSize: '0.78rem', textAlign: 'center', marginTop: '1rem' }}>
+                      {isTranscribing ? `Transcribing... (${transcribeTimer.toFixed(1)}s)` : 'No transcript yet'}
                     </div>
                   )}
                 </div>
+              )}
 
-                {/* AI Chat Section */}
-                <div className="ai-chat-section">
-                  <h4 className="panel-title" style={{ marginTop: '1.5rem' }}>AI Editor</h4>
-                  <p className="panel-description">Give instructions to edit your clips</p>
-
-                  {/* Message list */}
-                  <div style={{
-                    height: '250px',
-                    minHeight: '250px',
-                    maxHeight: '250px',
-                    overflowY: 'auto',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '0.5rem',
-                    marginBottom: '1rem',
-                    padding: '0.5rem',
-                    background: 'var(--color-surface, #1a1a2e)',
-                    borderRadius: '6px',
-                    border: '1px solid var(--color-border, #2d2d44)',
-                  }}>
-                    {chatMessages.map((msg, i) => (
-                      <div key={i} style={{
-                        alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
-                        maxWidth: '85%',
-                        padding: '0.4rem 0.7rem',
-                        borderRadius: msg.role === 'user' ? '12px 12px 2px 12px' : '12px 12px 12px 2px',
-                        background: msg.role === 'user' ? 'var(--color-primary, #6c63ff)' : 'var(--color-surface-2, #2d2d44)',
-                        fontSize: '0.82rem',
-                        lineHeight: '1.4',
-                      }}>
-                        {msg.content}
-                      </div>
-                    ))}
-                    {isAiEditing && (
-                      <div style={{
-                        alignSelf: 'flex-start',
-                        padding: '0.4rem 0.7rem',
-                        borderRadius: '12px 12px 12px 2px',
-                        background: 'var(--color-surface-2, #2d2d44)',
-                        fontSize: '0.82rem',
-                        opacity: 0.6,
-                      }}>
-                        Thinking…
-                      </div>
-                    )}
-                    <div ref={chatEndRef} />
-                  </div>
-                </div>
-              </div>
-            )}
-            
-            {activeTab === 'assets' && (
-              <div className="tab-panel">
-                <h3 className="panel-title">Media Assets</h3>
-                <p className="panel-description">
-                  Add photos, videos, and audio to your timeline
-                </p>
-                
-                {/* Asset Upload */}
-                <div className="asset-upload-section">
-                  <input
-                    type="file"
-                    id="asset-upload"
-                    accept="image/*,video/*,audio/*"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) {
-                        handleAssetUpload(file);
-                        e.target.value = ''; // Reset input
-                      }
-                    }}
-                    style={{ display: 'none' }}
-                  />
-                  <button
-                    className="btn btn-primary btn-full"
-                    onClick={() => document.getElementById('asset-upload')?.click()}
-                    disabled={uploadingAsset}
-                  >
-                    {uploadingAsset ? 'Uploading...' : '+ Add Media Asset'}
-                  </button>
-                </div>
-
-                {/* Assets List */}
-                <div className="asset-list">
-                  {assets.map((asset) => (
-                    <div key={asset.id} className="asset-item">
-                      <div className="asset-icon">
-                        {asset.type === 'photo' && (
-                          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                            <circle cx="8.5" cy="8.5" r="1.5"/>
-                            <polyline points="21,15 16,10 5,21"/>
-                          </svg>
-                        )}
-                        {asset.type === 'video' && (
-                          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polygon points="23 7 16 12 23 17 23 7"/>
-                            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
-                          </svg>
-                        )}
-                        {asset.type === 'audio' && (
-                          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <path d="M9 18V5l12-2v13"/>
-                            <circle cx="6" cy="18" r="3"/>
-                            <circle cx="18" cy="16" r="3"/>
-                          </svg>
-                        )}
-                      </div>
-                      <div className="asset-info">
-                        <div className="asset-name">{asset.name}</div>
-                        <div className="asset-meta">
-                          {asset.type} • {asset.duration ? formatTime(asset.duration) : 'Static'}
-                        </div>
-                      </div>
-                      <div className="asset-actions">
-                        <button
-                          className="btn-small"
-                          onClick={() => handleAddAssetToTimeline(asset.id)}
-                        >
-                          Add to Timeline
-                        </button>
-                        <button
-                          className="btn-small btn-danger-small"
-                          onClick={() => handleRemoveAsset(asset.id)}
-                        >
-                          Remove
-                        </button>
-                      </div>
+              {/* Chat / AI Edit messaging */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: showTranscript ? 0 : 'auto' }}>
+                <div ref={chatEndRef} style={{ maxHeight: '160px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                  {chatHistory.map((msg, i) => (
+                    <div key={i} style={{ padding: '0.45rem 0.7rem', borderRadius: '6px', background: msg.role === 'user' ? '#2a2a3e' : '#1a1a2e', color: '#fff', fontSize: '0.82rem', alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start', maxWidth: '90%' }}>
+                      {msg.content}
                     </div>
                   ))}
-                  
-                  {assets.length === 0 && (
-                    <div className="empty-state">
-                      <svg
-                        width="48"
-                        height="48"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        style={{ margin: '0 auto 1rem', opacity: 0.5 }}
-                      >
-                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                        <circle cx="8.5" cy="8.5" r="1.5"/>
-                        <polyline points="21,15 16,10 5,21"/>
-                      </svg>
-                      <p>No assets yet</p>
-                      <p className="empty-state-hint">
-                        Click "Add Media Asset" to upload photos, videos, or audio files
-                      </p>
-                    </div>
-                  )}
+                  {isAiEditing && <div style={{ color: '#aaa', fontSize: '0.8rem', fontStyle: 'italic' }}>Thinking...</div>}
                 </div>
-                
-                <div className="asset-stats">
-                  <h4>Project Stats</h4>
-                  <div className="stat-row">
-                    <span>Total Clips:</span>
-                    <span>{session.timeline.length}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Original Duration:</span>
-                    <span>{formatTime(session.duration)}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Edited Duration:</span>
-                    <span>
-                      {formatTime(
-                        session.timeline.reduce((sum, seg) => sum + seg.duration, 0)
-                      )}
-                    </span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Assets:</span>
-                    <span>{assets.length}</span>
-                  </div>
-                  <div className="stat-row">
-                    <span>Resolution:</span>
-                    <span>{session.resolution.width}x{session.resolution.height}</span>
-                  </div>
-                </div>
+                <form onSubmit={handleAiEditSubmit} style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input
+                    type="text"
+                    value={aiPrompt}
+                    onChange={(e) => setAiPrompt(e.target.value)}
+                    placeholder="Type message..."
+                    disabled={isAiEditing || !session?.transcript}
+                    style={{ flex: 1, padding: '0.5rem', borderRadius: '6px', border: '1px solid #333', background: '#1a1a2e', color: '#fff', fontSize: '0.82rem' }}
+                  />
+                  <button type="submit" className="btn btn-primary" disabled={isAiEditing || !aiPrompt.trim() || !session?.transcript} style={{ fontSize: '0.82rem' }}>
+                    Send
+                  </button>
+                </form>
               </div>
-            )}
-          </div>
-        </aside>
-
-        {/* Fixed Chat Input at Bottom */}
-        {activeTab === 'ai-edit' && (
-          <div className="chat-input-fixed">
-            <div style={{ display: 'flex', gap: '0.4rem', padding: '1rem' }}>
-              <input
-                type="text"
-                style={{
-                  flex: 1,
-                  padding: '0.75rem 1rem',
-                  borderRadius: '25px',
-                  border: '1px solid var(--color-border, #2d2d44)',
-                  background: 'var(--color-surface, #1a1a2e)',
-                  color: 'inherit',
-                  fontSize: '0.9rem',
-                }}
-                value={aiPrompt}
-                onChange={e => setAiPrompt(e.target.value)}
-                placeholder="Type your message..."
-                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) handleAiEdit(); }}
-                disabled={isAiEditing}
-              />
-              <button
-                className="btn btn-primary"
-                onClick={handleAiEdit}
-                disabled={isAiEditing || !aiPrompt.trim()}
-                style={{ 
-                  whiteSpace: 'nowrap',
-                  borderRadius: '25px',
-                  padding: '0.75rem 1.5rem'
-                }}
-              >
-                Send
-              </button>
             </div>
-            {aiError && (
-              <p style={{ color: '#e53e3e', fontSize: '0.8rem', padding: '0 1rem 1rem', margin: 0 }}>
-                {aiError}
-              </p>
-            )}
-          </div>
-        )}
+          )}
+        </div>
+      </aside>
       </div>
 
       {/* Reset Confirmation Dialog */}
@@ -2812,5 +2566,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         </div>
       )}
     </div>
-  );
+  </>
+);
 }

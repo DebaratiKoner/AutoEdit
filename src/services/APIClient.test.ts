@@ -197,6 +197,7 @@ describe('APIClient', () => {
           timelineStart: 0,
           duration: 10,
           order: 0,
+          track: 0,
         },
       ];
 
@@ -232,6 +233,7 @@ describe('APIClient', () => {
           timelineStart: 0,
           duration: 10,
           order: 0,
+          track: 0,
         },
       ];
 

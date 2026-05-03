@@ -14,7 +14,7 @@ export const VideoComposition: React.FC<VideoCompositionProps> = ({
   transitions,
 }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps: _fps } = useVideoConfig();
 
   return (
     <AbsoluteFill style={{ backgroundColor: '#000' }}>

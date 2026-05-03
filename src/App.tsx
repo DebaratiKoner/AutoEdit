@@ -3,7 +3,6 @@
  * Handles routing between Upload and Editor pages
  */
 
-import { useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { UploadPage, EditorPage, ErrorBoundary } from './components';
 

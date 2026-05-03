@@ -363,7 +363,7 @@ function createMockVideoFile(width: number, height: number): File {
       
       // Override the src setter to trigger metadata loading
       Object.defineProperty(video, 'src', {
-        set: function (value: string) {
+        set: function (_value: string) {
           // Simulate async metadata loading
           setTimeout(() => {
             Object.defineProperty(video, 'videoWidth', { value: width, writable: false });

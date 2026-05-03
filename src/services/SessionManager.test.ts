@@ -9,7 +9,6 @@ import type { SessionData } from '../types';
 
 describe('SessionManager', () => {
   let manager: SessionManager;
-  let mockIndexedDB: any;
 
   beforeEach(() => {
     manager = new SessionManager();
@@ -273,6 +272,7 @@ describe('SessionManager', () => {
         timelineStart: i * 10,
         duration: 10,
         order: i,
+        track: 0,
       }));
       
       await manager.saveSession('large-timeline', sessionData);
@@ -424,6 +424,7 @@ function createMockSessionData(sessionId: string): SessionData {
         timelineStart: 0,
         duration: 30,
         order: 0,
+        track: 0,
       },
       {
         id: 'segment-2',
@@ -432,9 +433,11 @@ function createMockSessionData(sessionId: string): SessionData {
         timelineStart: 30,
         duration: 30,
         order: 1,
+        track: 0,
       },
     ],
     transcript: 'This is a test transcript',
+    transcriptSegments: null,
     undoStack: [],
     redoStack: [],
     lastModified: Date.now(),
@@ -449,7 +452,7 @@ function setupIndexedDBMock() {
   
   // @ts-expect-error - Mock implementation
   global.indexedDB = {
-    open: (name: string, version: number) => {
+    open: (_name: string, _version: number) => {
       const request: any = {
         onsuccess: null,
         onerror: null,
@@ -458,8 +461,8 @@ function setupIndexedDBMock() {
       };
 
       setTimeout(() => {
-        if (!stores.has(name)) {
-          stores.set(name, new Map());
+        if (!stores.has(_name)) {
+          stores.set(_name, new Map());
           
           if (request.onupgradeneeded) {
             const event = {
@@ -468,7 +471,7 @@ function setupIndexedDBMock() {
                   objectStoreNames: {
                     contains: () => false,
                   },
-                  createObjectStore: (storeName: string) => {
+                  createObjectStore: (_storeName: string) => {
                     return {};
                   },
                 },
@@ -478,12 +481,12 @@ function setupIndexedDBMock() {
           }
         }
 
-        const store = stores.get(name)!;
+        const store = stores.get(_name)!;
         
         request.result = {
-          transaction: (storeNames: string[], mode: string) => {
+          transaction: (_storeNames: string[], _mode: string) => {
             return {
-              objectStore: (storeName: string) => {
+              objectStore: (_storeName: string) => {
                 return {
                   put: (data: any) => {
                     const putRequest: any = {
@@ -589,10 +592,16 @@ function arbitrarySessionData(): fc.Arbitrary<SessionData> {
         timelineStart: fc.double({ min: 0, max: 3600, noNaN: true }),
         duration: fc.double({ min: 0.1, max: 3600, noNaN: true }),
         order: fc.nat({ max: 1000 }),
+        track: fc.nat({ max: 10 }),
       }),
       { maxLength: 50 }
     ),
     transcript: fc.option(fc.string(), { nil: null }),
+    transcriptSegments: fc.option(fc.array(fc.record({
+      start: fc.double({ min: 0, max: 3600, noNaN: true }),
+      end: fc.double({ min: 0, max: 3600, noNaN: true }),
+      text: fc.string(),
+    })), { nil: null }),
     undoStack: fc.array(
       fc.oneof(
         fc.record({
@@ -610,6 +619,7 @@ function arbitrarySessionData(): fc.Arbitrary<SessionData> {
             timelineStart: fc.double({ min: 0, max: 3600, noNaN: true }),
             duration: fc.double({ min: 0.1, max: 3600, noNaN: true }),
             order: fc.nat({ max: 1000 }),
+            track: fc.nat({ max: 10 }),
           }),
         }),
         fc.record({
@@ -643,6 +653,7 @@ function arbitrarySessionData(): fc.Arbitrary<SessionData> {
             timelineStart: fc.double({ min: 0, max: 3600, noNaN: true }),
             duration: fc.double({ min: 0.1, max: 3600, noNaN: true }),
             order: fc.nat({ max: 1000 }),
+            track: fc.nat({ max: 10 }),
           }),
         }),
         fc.record({
