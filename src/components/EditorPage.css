@@ -215,7 +215,7 @@
   cursor: pointer;
   user-select: none;
   overflow-x: auto;        
-  overflow-y: hidden;
+  overflow-y: auto;
   background:
     linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px) 0 0 / 8.333% 100%,
     linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 58%);

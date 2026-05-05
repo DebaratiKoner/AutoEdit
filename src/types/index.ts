@@ -29,6 +29,8 @@ export interface TimelineSegment {
 /**
  * Represents an editing operation for undo/redo functionality
  */
+export type CompressedSnapshot = string;
+
 export type EditAction = 
   | { type: 'CUT'; segmentId: string; cutTime: number; newSegmentId: string }
   | { type: 'DELETE'; segment: TimelineSegment }
@@ -44,6 +46,26 @@ export type EditAction =
       previousTranscriptSegments: Array<{ start: number; end: number; text: string }> | null;
       prompt?: string;
       operations?: Array<Record<string, any>>;
+    }
+  | {
+      type: 'FULL_SNAPSHOT';
+      previousSnapshot: CompressedSnapshot;
+      actionType: 'CUT' | 'DELETE' | 'REORDER_DROP' | 'ADD_ASSET' | 'TRACK_DROP' | 'TIMELINE_DROP' | 'RESIZE' | 'AI_EDIT' | 'UNDO' | 'REDO' | 'REORDER' | 'VOLUME_CHANGE';
+      details?: Record<string, any>;
+    }
+  | {
+      type: 'LZ_COMPRESSED_SNAPSHOT';
+      snapshot: string;
+      decompressedSize: number;
+      actionType?: string;
+    }
+  | {
+      type: 'UNDO_SNAPSHOT';
+      previousTimeline: TimelineSegment[];
+      previousTranscript: string | null;
+      previousTranscriptSegments: Array<{ start: number; end: number; text: string }> | null;
+      previousTranscriptHistory: TranscriptHistoryEntry[] | null;
+      timestamp: number;
     };
 
 /**

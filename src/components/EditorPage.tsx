@@ -3,9 +3,10 @@
  * Main editing interface with video player, timeline, and controls
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { SessionManager, CompositionBuilder } from '../services';
 import { formatTime, logger } from '../utils';
+import LZString from 'lz-string';
 import type { SessionData, TimelineSegment, CompositionSchema } from '../types';
 import { RemotionPreview } from './RemotionPreview';
 import { AssetsTab } from './AssetsTab';
@@ -46,8 +47,73 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [transcribeTimer, setTranscribeTimer] = useState(0);
   const [showTranscript, setShowTranscript] = useState(true);
   const [isAiEditing, setIsAiEditing] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [aiPrompt, setAiPrompt] = useState('');
-  const [chatHistory, setChatHistory] = useState<Array<{role: 'user' | 'assistant', content: string}>>([]);
+  const [chatHistory, setChatHistory] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
+
+  const sessionManager = new SessionManager();
+
+  // LZ Compressor singleton (avoids repeated imports)
+  const LZCompressor = {
+    compress: (data: string): string => {
+      if (data.length > 1024) { // Compress if >1KB
+        return LZString.compressToBase64(data);
+      }
+      return data; // Raw if small
+    },
+    decompress: (data: string): string => {
+      try {
+        return LZString.decompressFromBase64(data) || data;
+      } catch {
+        return data; // Fallback to raw
+      }
+    },
+    isCompressed: (data: string): boolean => {
+      return data.length > 1024 && !data.startsWith('{');
+    }
+  };
+
+  // Phase 4: Full session snapshot → optional LZ compression
+  const saveFullSessionSnapshot = useCallback((currentSession: SessionData): string => {
+    // Deep clone ALL mutable fields
+    const snapshot: SessionData = {
+      sessionId: currentSession.sessionId,
+      videoUrl: currentSession.videoUrl,
+      duration: currentSession.duration,
+      resolution: { ...currentSession.resolution },
+      timeline: structuredClone(currentSession.timeline),
+      transcript: currentSession.transcript,
+      transcriptSegments: structuredClone(currentSession.transcriptSegments || []),
+      transcriptHistory: structuredClone(currentSession.transcriptHistory || []),
+      undoStack: structuredClone(currentSession.undoStack),
+      redoStack: structuredClone(currentSession.redoStack),
+      lastModified: Date.now(),
+    };
+    const json = JSON.stringify(snapshot);
+    return LZCompressor.compress(json); // Auto-compress large snapshots
+  }, []);
+
+  // Phase 4: Restore full snapshot → LZ decompress → parse → validate
+  const restoreFullSessionSnapshot = useCallback((snapshotStr: string): SessionData => {
+    try {
+      let jsonStr = LZCompressor.decompress(snapshotStr);
+      const snapshot: SessionData = JSON.parse(jsonStr);
+      
+      // Safety: Deep clone mutable fields post-parse
+      return {
+        ...snapshot,
+        timeline: structuredClone(snapshot.timeline || []),
+        transcriptSegments: structuredClone(snapshot.transcriptSegments || []),
+        transcriptHistory: structuredClone(snapshot.transcriptHistory || []),
+        undoStack: structuredClone(snapshot.undoStack || []),
+        redoStack: structuredClone(snapshot.redoStack || []),
+        lastModified: Date.now(), // Update timestamp
+      };
+    } catch (error) {
+      logger.error('Failed to restore snapshot:', error);
+      throw new Error(`Invalid snapshot: ${error}`);
+    }
+  }, []);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const currentClipIndexRef = useRef<number>(0);
@@ -66,37 +132,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const systemActionRef = useRef<boolean>(false);
   const isPlayingRef = useRef<boolean>(false);
   const photoElapsedRef = useRef<number>(0);
-  const lastFrameTimeRef = useRef<number>(performance.now());
+
   const snapshotImgRef = useRef<HTMLImageElement>(null);
-
-  const takeTransitionSnapshot = () => {
-    if (!snapshotImgRef.current || !videoRef.current) return;
-    const video = videoRef.current;
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth || 1920;
-      canvas.height = video.videoHeight || 1080;
-      const ctx = canvas.getContext('2d');
-      if (ctx && canvas.width > 0 && canvas.height > 0) {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        snapshotImgRef.current.src = canvas.toDataURL('image/jpeg');
-        snapshotImgRef.current.style.opacity = '1';
-      }
-    } catch(e) {
-      // Ignore cross-origin errors
-    }
-  };
-
-  const clearTransitionSnapshot = () => {
-    if (!snapshotImgRef.current) return;
-    snapshotImgRef.current.style.opacity = '0';
-    // Let transition finish before clearing src to avoid flash
-    setTimeout(() => {
-      if (snapshotImgRef.current && snapshotImgRef.current.style.opacity === '0') {
-        snapshotImgRef.current.src = '';
-      }
-    }, 200);
-  };
 
   const handleLocalFileInsert = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -127,9 +164,19 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           order: session.timeline.filter(s => s.track === 1).length,
           track: 1, color: getAssetColor('audio'), volume: 1,
         };
-        setSession({ ...session, timeline: [...session.timeline, newSeg],
-          undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSeg }],
-          redoStack: [] });
+        // Phase 4.14: Capture FULL session snapshot BEFORE mutation
+        const previousSnapshot = saveFullSessionSnapshot(session);
+
+        setSession({ 
+          ...session, 
+          timeline: [...session.timeline, newSeg],
+          undoStack: [...session.undoStack, { 
+            type: 'FULL_SNAPSHOT' as const,
+            previousSnapshot,
+            actionType: 'ADD_ASSET' as const
+          }],
+          redoStack: [] 
+        });
         return;
       }
 
@@ -195,11 +242,31 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       }
 
       let t = 0;
-      const adjusted = newTrack0.map((s, i) => { const r = { ...s, order: i, timelineStart: t }; t += s.duration; return r; });
+    const adjusted = newTrack0.map((s, i) => { 
+      const r = { 
+        ...s, 
+        order: i, 
+        timelineStart: t,
+        // ✅ FIXED: Preserve custom names (no "Clip N" override)
+        name: preserveClipName(s) 
+      }; 
+      t += s.duration; 
+      return r; 
+    });
       const others = session.timeline.filter(s => s.track !== 0);
-      setSession({ ...session, timeline: [...adjusted, ...others],
-        undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSeg }],
-        redoStack: [] });
+      // Phase 4.14: Capture FULL session snapshot BEFORE mutation
+      const previousSnapshot = saveFullSessionSnapshot(session);
+
+      setSession({ 
+        ...session, 
+        timeline: [...adjusted, ...others],
+        undoStack: [...session.undoStack, { 
+          type: 'FULL_SNAPSHOT' as const,
+          previousSnapshot,
+          actionType: 'ADD_ASSET' as const
+        }],
+        redoStack: [] 
+      });
     } catch (err) {
       console.error(err);
       alert('Failed to upload file');
@@ -260,17 +327,78 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const handleAiEditSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!session || !aiPrompt.trim()) return;
-    setIsAiEditing(true);
-    const currentPrompt = aiPrompt;
+
+    const userInput = aiPrompt.trim();
+    const currentPrompt = userInput.toLowerCase();
+    
+    // Add user message to chat
     setAiPrompt('');
-    setChatHistory(prev => [...prev, { role: 'user', content: currentPrompt }]);
+    setChatHistory(prev => [...prev, { role: 'user', content: userInput }]);
+
+    // Handle undo/redo typed as text commands
+    if (currentPrompt === 'undo' || currentPrompt === 'undo last' || currentPrompt === 'go back') {
+      if (session.undoStack.length === 0) {
+        setChatHistory(prev => [...prev, { role: 'assistant', content: 'Nothing to undo.' }]);
+        return;
+      }
+      const lastAction = session.undoStack[session.undoStack.length - 1];
+      if (lastAction.type === 'FULL_SNAPSHOT' && lastAction.previousSnapshot) {
+        try {
+          const restored = restoreFullSessionSnapshot(lastAction.previousSnapshot);
+          const currentSnapshot = saveFullSessionSnapshot(session);
+          const updated: SessionData = {
+            ...restored,
+            undoStack: session.undoStack.slice(0, -1),
+            redoStack: [...session.redoStack, { type: 'FULL_SNAPSHOT' as const, previousSnapshot: currentSnapshot, actionType: 'UNDO' as const }],
+          };
+          setSession(updated);
+          void sessionManager.saveSession(sessionId, updated);
+          setChatHistory(prev => [...prev, { role: 'assistant', content: `Undone. (${updated.timeline.filter(s => s.track === 0).length} clips remaining)` }]);
+          logger.debug('Undo successful');
+        } catch(e) { 
+          logger.error('Undo failed:', e);
+          setChatHistory(prev => [...prev, { role: 'assistant', content: 'Undo failed.' }]); 
+        }
+      }
+      return;
+    }
+
+    if (currentPrompt === 'redo' || currentPrompt === 'redo last' || currentPrompt === 'redo it') {
+      if (session.redoStack.length === 0) {
+        setChatHistory(prev => [...prev, { role: 'assistant', content: 'Nothing to redo.' }]);
+        return;
+      }
+      const lastAction = session.redoStack[session.redoStack.length - 1];
+      if (lastAction.type === 'FULL_SNAPSHOT' && lastAction.previousSnapshot) {
+        try {
+          const restored = restoreFullSessionSnapshot(lastAction.previousSnapshot);
+          const currentSnapshot = saveFullSessionSnapshot(session);
+          const updated: SessionData = {
+            ...restored,
+            undoStack: [...session.undoStack, { type: 'FULL_SNAPSHOT' as const, previousSnapshot: currentSnapshot, actionType: 'REDO' as const }],
+            redoStack: session.redoStack.slice(0, -1),
+          };
+          setSession(updated);
+          void sessionManager.saveSession(sessionId, updated);
+          setChatHistory(prev => [...prev, { role: 'assistant', content: `Redone. (${updated.timeline.filter(s => s.track === 0).length} clips)` }]);
+          logger.debug('Redo successful');
+        } catch(e) { 
+          logger.error('Redo failed:', e);
+          setChatHistory(prev => [...prev, { role: 'assistant', content: 'Redo failed.' }]); 
+        }
+      }
+      return;
+    }
+
+    setIsAiEditing(true);
+    const promptToSend = userInput;
 
     try {
       const response = await fetch(`/api/videos/${sessionId}/edit-with-ai`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: currentPrompt,
+          prompt: promptToSend,
           // Map to the format the backend expects: {start, end, id, title, text}
           segments: session.timeline
             .filter(s => s.track === 0)
@@ -318,20 +446,21 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         const origSeg = session.timeline.find(s => s.id === clip.id);
         const assetUrl = clip.assetUrl ?? origSeg?.assetUrl;
         const assetKind = clip.assetKind ?? origSeg?.assetKind;
-        const srcStart = clip.sourceStart ?? origSeg?.sourceStart ?? 0;
-        const srcEnd   = clip.sourceEnd   ?? origSeg?.sourceEnd   ?? 0;
-        // Duration from source times (always reliable); fall back to backend duration field
+        const srcStart = clip.sourceStart ?? (origSeg?.sourceStart ?? 0);
+        const srcEnd = clip.sourceEnd ?? (origSeg?.sourceEnd ?? 0);
         const duration = clip.duration ?? (srcEnd - srcStart);
+        // Use name from backend (already enforced correctly), fall back to original, then sequential
+        const name = clip.name || clip.title || origSeg?.name || `Clip ${i + 1}`;
         return {
           id: clip.id || origSeg?.id || `ai-clip-${i}`,
           sourceStart: srcStart,
-          sourceEnd:   srcEnd,
+          sourceEnd: srcEnd,
           timelineStart: clip.timelineStart ?? 0,
           duration,
           order: i,
           track: 0,
           color: assetUrl ? getAssetColor(assetKind || 'video') : getClipColor(i),
-          name: clip.name || clip.title || `Clip ${i + 1}`,
+          name,
           assetUrl,
           assetKind,
           volume: clip.volume ?? origSeg?.volume,
@@ -347,14 +476,16 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       const otherTracks = session.timeline.filter(s => s.track !== 0);
       const newTimeline = [...adjustedTrack0, ...otherTracks];
       
+      // Phase 4.13: Capture FULL session snapshot BEFORE mutation
+      const previousSnapshot = saveFullSessionSnapshot(session);
+
       const updatedSession = {
          ...session,
          timeline: newTimeline,
          undoStack: [...session.undoStack, { 
-           type: 'AI_EDIT' as const, 
-           previousTimeline: session.timeline, 
-           previousTranscript: session.transcript, 
-           previousTranscriptSegments: session.transcriptSegments 
+           type: 'FULL_SNAPSHOT' as const,
+           previousSnapshot,
+           actionType: 'AI_EDIT' as const
          }],
          redoStack: []
       };
@@ -375,35 +506,41 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
   };
 
-  const sessionManager = new SessionManager();
+/**
+ * CRITICAL: Preserve custom clip names across ALL mutations.
+ * Returns seg.name if set, otherwise null (no fallback to "Clip N").
+ * Sequential "Clip 1,2,3" ONLY for initial untouched clips.
+ */
+function preserveClipName(seg: TimelineSegment): string {
+  return seg.name ?? `Clip`;
+}
 
-  const getShortName = (name: string | undefined | null, fallback: string) => {
+function getShortName(name: string | undefined | null, fallback: string) {
     if (!name || typeof name !== 'string') return fallback;
     const trimmed = name.trim();
     if (/^clip\s+\d+$/i.test(trimmed)) return trimmed;
-    const firstWord = trimmed.split(/[\s_-]+/)[0];
-    return firstWord || fallback;
-  };
+    return trimmed || fallback;
+  }
 
-  const getAssetPreviewUrl = (url?: string | null) => {
+  function getAssetPreviewUrl(url?: string | null) {
     if (!url || typeof url !== 'string') return '';
     return url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('/api/') ? url : `/api/proxy-image?url=${encodeURIComponent(url)}`;
-  };
+  }
 
   // Helper function to add transcript history entry after editing operations
-  const addTranscriptHistoryEntry = (session: SessionData, operation: string): SessionData => {
-    if (!session.transcript) return session;
-    const historyEntry = {
-      timestamp: Date.now(),
-      operation,
-      transcript: session.transcript,
-      segments: session.transcriptSegments,
-    };
-    return {
-      ...session,
-      transcriptHistory: [...(session.transcriptHistory || []), historyEntry],
-    };
-  };
+  /* addTranscriptHistoryEntry removed - unused */
+  //   if (!session.transcript) return session;
+  //   const historyEntry = {
+  //     timestamp: Date.now(),
+  //     operation,
+  //     transcript: session.transcript,
+  //     segments: session.transcriptSegments,
+  //   };
+  //   return {
+  //     ...session,
+  //     transcriptHistory: [...(session.transcriptHistory || []), historyEntry],
+  //   };
+  // };
 
   useEffect(() => {
     loadSession();
@@ -528,277 +665,188 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.timeline, session?.transcriptSegments, showRemotionPreview]);
 
+  // FIXED: Phase 1 - Playback/Playhead Sync (#2, #3)
   useEffect(() => {
-    // ── Single-video playback engine ──────────────────────────────────────────
-    // Uses ONE <video> element. When an asset clip is active, we swap its src.
-    // When done, we swap back to the original video src.
     if (!session || !videoRef.current) return;
 
     const video = videoRef.current;
+    const av = assetVideoRef.current;
     const sortedClips = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
-    const EPS = 0.03; // Tighter tolerance for precise playback transitions
+    const EPS = 0.01;
 
     let rafId = 0;
     let rafRunning = false;
 
     const clearPhotoTimer = () => {
-      if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
+      if (photoTimerRef.current) { 
+        clearTimeout(photoTimerRef.current); 
+        photoTimerRef.current = null; 
+      }
     };
 
-    // ── Load a clip into the video element ────────────────────────────────────
-    const loadClip = async (clip: typeof sortedClips[0], shouldPlay: boolean) => {
+    isJumpingRef.current = false;
+
+    const loadClip = async (clip: typeof sortedClips[0], offset = 0, shouldPlay = false) => {
       isSwitchingRef.current = true;
       clearPhotoTimer();
+      isJumpingRef.current = true;
 
-      // ── PHOTO: show as overlay, keep original video paused ──────────────────
+      // Pause all
+      if (video) video.pause();
+      if (av && !av.paused) av.pause();
+
+      // PHOTO
       if (clip.assetKind === 'photo' && clip.assetUrl) {
-        // Pause original video but keep its position
-        systemActionRef.current = true;
-        video.pause();
         setPhotoOverlay({ url: getAssetPreviewUrl(clip.assetUrl), name: clip.name ?? 'Photo' });
         setActiveAssetClip(clip);
         setAssetVideoOpacity(0);
+        photoElapsedRef.current = offset;
         isSwitchingRef.current = false;
-        photoElapsedRef.current = 0;
+        isJumpingRef.current = false;
         if (shouldPlay) {
           setIsPlaying(true);
           isPlayingRef.current = true;
-          photoTimerRef.current = setTimeout(() => {
-            advanceToNextClip(true);
-          }, clip.duration * 1000);
+          const remaining = clip.duration - offset;
+          photoTimerRef.current = setTimeout(() => advanceToNextClip(true), remaining * 1000);
         }
         return;
       }
 
-      // ── ASSET VIDEO: play in the overlay video element ──────────────────────
-      if (clip.assetUrl && clip.assetKind === 'video') {
-        const av = assetVideoRef.current;
-        if (!av) { isSwitchingRef.current = false; return; }
-
-        // Pause original video, keep its position
-        systemActionRef.current = true;
-        video.pause();
+      // ASSET VIDEO
+      if (clip.assetUrl && clip.assetKind === 'video' && av) {
         setPhotoOverlay(null);
         setActiveAssetClip(clip);
-
-        // Pre-seek the original video to the NEXT clip's start position
-        // so when we return to it after the asset, there's no seek delay
-        const nextIdx = currentClipIndexRef.current + 1;
-        if (nextIdx < sortedClips.length) {
-          const nextClip = sortedClips[nextIdx];
-          if (!nextClip.assetUrl) {
-            try { video.currentTime = nextClip.sourceStart ?? 0; } catch(e) {}
-          }
-        }
-
-        // Load asset into the overlay video
         if (assetSrcRef.current !== clip.assetUrl) {
           av.src = clip.assetUrl;
           assetSrcRef.current = clip.assetUrl;
-          av.load();
-          await new Promise<void>(resolve => {
-            const onMeta = () => { av.removeEventListener('loadedmetadata', onMeta); resolve(); };
-            av.addEventListener('loadedmetadata', onMeta);
-            setTimeout(() => { av.removeEventListener('loadedmetadata', onMeta); resolve(); }, 3000);
-          });
         }
-        av.currentTime = 0;
-
-        // Wait for canplay then fade in
-        await new Promise<void>(resolve => {
-          const onReady = () => { av.removeEventListener('canplay', onReady); resolve(); };
-          av.addEventListener('canplay', onReady);
-          setTimeout(() => { av.removeEventListener('canplay', onReady); resolve(); }, 2000);
-        });
-
-        setAssetVideoOpacity(1);  // fade in asset video
+        av.currentTime = offset;
+        setAssetVideoOpacity(1);
         isSwitchingRef.current = false;
-        lastFrameTimeRef.current = performance.now();
-
+        isJumpingRef.current = false;
         if (shouldPlay) {
           av.play().catch(() => {});
           setIsPlaying(true);
           isPlayingRef.current = true;
-          // Ensure rAF loop is running to track asset video time
-          if (!rafRunning) {
-            rafRunning = true;
-            rafId = requestAnimationFrame(rafLoop);
-          }
         }
         return;
       }
 
-      // ── ORIGINAL VIDEO CLIP ─────────────────────────────────────────────────
-      const targetTime = clip.sourceStart ?? 0;
-
-      // Fade out asset video overlay
-      setAssetVideoOpacity(0);
+      // ORIGINAL
       setPhotoOverlay(null);
       setActiveAssetClip(null);
+      setAssetVideoOpacity(0);
+      if (av && !av.paused) av.pause();
 
-      // Stop asset video
-      const av = assetVideoRef.current;
-      if (av && !av.paused) {
-        av.pause();
-      }
-
-      // Seek original video to the correct position (may already be pre-seeked)
-      if (Math.abs(video.currentTime - targetTime) > 0.15) {
-        takeTransitionSnapshot();
-        try {
-          video.currentTime = targetTime;
-          await new Promise<void>(resolve => {
-            const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); };
-            video.addEventListener('seeked', onSeeked);
-            setTimeout(() => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); }, 800);
-          });
-        } catch(e) { clearTransitionSnapshot(); }
-      }
+      const targetTime = (clip.sourceStart ?? 0) + offset;
+      if (video) video.currentTime = targetTime;
 
       isSwitchingRef.current = false;
-      lastFrameTimeRef.current = performance.now();
-
-      if (shouldPlay) {
-        systemActionRef.current = true;
+      isJumpingRef.current = false;
+      if (shouldPlay && video) {
         video.play().catch(() => {});
         setIsPlaying(true);
         isPlayingRef.current = true;
       }
     };
 
-    const advanceToNextClip = (shouldPlay: boolean) => {
+    const advanceToNextClip = (shouldPlay = false) => {
       const next = currentClipIndexRef.current + 1;
       if (next < sortedClips.length) {
         currentClipIndexRef.current = next;
-        loadClip(sortedClips[next], shouldPlay);
+        loadClip(sortedClips[next], 0, shouldPlay);
       } else {
-        // End of timeline — reset to start
         currentClipIndexRef.current = 0;
-        systemActionRef.current = true;
-        video.pause();
+        setIsPlaying(false);
+        isPlayingRef.current = false;
         clearPhotoTimer();
         setPhotoOverlay(null);
         setActiveAssetClip(null);
         setAssetVideoOpacity(0);
-        setIsPlaying(false);
-        isPlayingRef.current = false;
-        // Stop asset video
-        const av = assetVideoRef.current;
-        if (av && !av.paused) av.pause();
-        // Seek original video back to first clip start
-        const firstClip = sortedClips[0];
-        if (firstClip && !firstClip.assetUrl) {
-          video.currentTime = firstClip.sourceStart ?? 0;
-        }
-        setCurrentTime(sortedClips[0].timelineStart ?? 0);
-      }
-    };
-
-    // ── rAF enforce loop ──────────────────────────────────────────────────────
-    const enforce = () => {
-      if (isSwitchingRef.current) {
-        lastFrameTimeRef.current = performance.now();
-        return;
-      }
-      if (sortedClips.length === 0) return;
-
-      const idx = currentClipIndexRef.current;
-      const clip = sortedClips[idx];
-      if (!clip) return;
-
-      lastFrameTimeRef.current = performance.now();
-
-      // Photo clips are handled by timer — skip
-      if (clip.assetKind === 'photo') return;
-
-      // Asset video clip — track time from the asset video element
-      if (clip.assetKind === 'video' && clip.assetUrl) {
-        const av = assetVideoRef.current;
-        if (!av || av.paused || isJumpingRef.current) return;
-        const t = av.currentTime;
-        setCurrentTime((clip.timelineStart ?? 0) + Math.max(0, t));
-        if (t >= clip.duration - EPS) {
-          advanceToNextClip(true);
-        }
-        return;
-      }
-
-      // Original video clip
-      if (video.paused || isJumpingRef.current) return;
-      const t = video.currentTime;
-      const clipSourceStart = clip.sourceStart ?? 0;
-      setCurrentTime((clip.timelineStart ?? 0) + Math.max(0, t - clipSourceStart));
-
-      const clipEnd = clip.sourceEnd ?? 0;
-      if (t >= clipEnd - EPS) {
-        advanceToNextClip(true);
+        setCurrentTime(0);
+        rafRunning = false;
+        if (video) video.currentTime = sortedClips[0]?.sourceStart ?? 0;
       }
     };
 
     const rafLoop = () => {
-      enforce();
-      if (rafRunning) rafId = requestAnimationFrame(rafLoop);
-    };
-
-    const handlePlayEvent = () => {
-      if (systemActionRef.current) {
-        systemActionRef.current = false;
+      if (isSwitchingRef.current || isJumpingRef.current) {
+        rafId = requestAnimationFrame(rafLoop);
         return;
       }
-      setIsPlaying(true);
-      isPlayingRef.current = true;
-      lastFrameTimeRef.current = performance.now();
+      if (sortedClips.length === 0) return;
 
-      // If current clip is an asset, load it now (user pressed play)
-      const idx = currentClipIndexRef.current;
-      const clip = sortedClips[idx];
-      if (clip && clip.assetUrl) {
-        loadClip(clip, true);
+      const clip = sortedClips[currentClipIndexRef.current];
+      if (!clip) return;
+
+      if (clip.assetKind === 'photo') {
+        rafId = requestAnimationFrame(rafLoop);
         return;
       }
 
-      if (!rafRunning) {
-        rafRunning = true;
+      if (clip.assetUrl && clip.assetKind === 'video' && av && !av.paused) {
+        const t = av.currentTime;
+        setCurrentTime((clip.timelineStart ?? 0) + t);
+        if (t >= clip.duration - EPS) advanceToNextClip(isPlayingRef.current);
+        else rafId = requestAnimationFrame(rafLoop);
+        return;
+      }
+
+      if (video && !video.paused) {
+        const sourceOffset = video.currentTime - (clip.sourceStart ?? 0);
+        setCurrentTime((clip.timelineStart ?? 0) + sourceOffset);
+        const clipEnd = (clip.sourceStart ?? 0) + clip.duration;
+        if (video.currentTime >= clipEnd - EPS) advanceToNextClip(isPlayingRef.current);
+        else rafId = requestAnimationFrame(rafLoop);
+      } else {
         rafId = requestAnimationFrame(rafLoop);
       }
     };
 
-    const handlePauseEvent = () => {
+    const handleUnifiedPlay = () => {
       if (systemActionRef.current) {
         systemActionRef.current = false;
         return;
       }
-      // Only stop rAF if we're not in the middle of asset playback
-      const idx = currentClipIndexRef.current;
-      const clip = sortedClips[idx];
-      const isAssetPlaying = clip?.assetUrl && assetVideoRef.current && !assetVideoRef.current.paused;
-      if (!isAssetPlaying) {
-        setIsPlaying(false);
-        isPlayingRef.current = false;
-        rafRunning = false;
-        cancelAnimationFrame(rafId);
-        clearPhotoTimer();
+      const clip = sortedClips[currentClipIndexRef.current];
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      
+      if (clip?.assetKind === 'video' && clip.assetUrl && av) {
+        av.play().catch(() => {});
+      } else if (clip?.assetKind === 'photo') {
+        const offset = photoElapsedRef.current;
+        const remaining = clip.duration - offset;
+        photoTimerRef.current = setTimeout(() => advanceToNextClip(true), remaining * 1000);
+      } else if (video) {
+        video.play().catch(() => {});
       }
+      
+      rafRunning = true;
+      rafId = requestAnimationFrame(rafLoop);
     };
 
-    const handleEndedEvent = () => {
-      advanceToNextClip(true);
+    const handleUnifiedPause = () => {
+      if (systemActionRef.current) {
+        systemActionRef.current = false;
+        return;
+      }
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+      rafRunning = false;
+      cancelAnimationFrame(rafId);
+      clearPhotoTimer();
+      
+      if (video && !video.paused) video.pause();
+      if (av && !av.paused) av.pause();
     };
 
-    // Asset video ended → advance to next clip
-    const handleAssetEnded = () => {
-      advanceToNextClip(true);
-    };
+    video?.addEventListener('play', handleUnifiedPlay);
+    video?.addEventListener('pause', handleUnifiedPause);
+    av?.addEventListener('ended', () => advanceToNextClip(isPlayingRef.current));
 
-    const av = assetVideoRef.current;
-
-    video.addEventListener('timeupdate', enforce);
-    video.addEventListener('play', handlePlayEvent);
-    video.addEventListener('pause', handlePauseEvent);
-    video.addEventListener('ended', handleEndedEvent);
-    if (av) av.addEventListener('ended', handleAssetEnded);
-
-    if (!video.paused || isPlayingRef.current) {
+    // Initial RAF if playing
+    if (!video?.paused || isPlayingRef.current) {
       rafRunning = true;
       rafId = requestAnimationFrame(rafLoop);
     }
@@ -807,16 +855,13 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       rafRunning = false;
       cancelAnimationFrame(rafId);
       clearPhotoTimer();
-      video.removeEventListener('timeupdate', enforce);
-      video.removeEventListener('play', handlePlayEvent);
-      video.removeEventListener('pause', handlePauseEvent);
-      video.removeEventListener('ended', handleEndedEvent);
-      if (av) av.removeEventListener('ended', handleAssetEnded);
+      video?.removeEventListener('play', handleUnifiedPlay);
+      video?.removeEventListener('pause', handleUnifiedPause);
+      av?.removeEventListener('ended', () => advanceToNextClip(isPlayingRef.current));
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session]);
+  }, [session?.timeline]);
 
-  const loadSession = async () => {
+  async function loadSession() {
     // 1. Try to restore a previously saved session (survives refresh)
     const data = await sessionManager.loadSession(sessionId);
     if (data) {
@@ -885,11 +930,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     logger.operation('Session created:', { sessionId, duration });
     setSession(newSession);
     void sessionManager.saveSession(sessionId, newSession);
-  };
+  }
 
   const handlePlayheadMouseDown = (e: React.MouseEvent) => {
     e.stopPropagation();
     setIsDraggingPlayhead(true);
+    if (isPlaying) {
+      setIsPlaying(false);
+      if (videoRef.current) videoRef.current.pause();
+      if (assetVideoRef.current) assetVideoRef.current.pause();
+      isPlayingRef.current = true;
+    }
   };
 
   const handleMouseMove = (e: MouseEvent) => {
@@ -897,17 +948,15 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     
     const rect = timelineRef.current.getBoundingClientRect();
     const track0Segments = sessionRef.current.timeline.filter(s => s.track === 0);
-    const totalDur = Math.max(
-      track0Segments.reduce((sum, s) => sum + s.duration, 0),
-      sessionRef.current.duration || 1
-    );
+    const totalDur = track0Segments.reduce((sum, s) => sum + s.duration, 0) || 1;
 
     if (isDraggingPlayhead && videoRef.current) {
       const mouseX = e.clientX - rect.left;
       const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
       const newTime = percentage * totalDur;
       
-      void jumpToTimelineTime(newTime, sessionRef.current);
+      setCurrentTime(newTime);
+      void jumpToTimelineTime(newTime, sessionRef.current, true);
     }
 
     if (resizingSegmentId && resizeType) {
@@ -942,14 +991,27 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const handleMouseUp = () => {
     if (isDraggingPlayhead) {
       setIsDraggingPlayhead(false);
+      if (isPlayingRef.current) {
+        const video = videoRef.current;
+        const av = assetVideoRef.current;
+        if (video && video.paused) video.play().catch(() => {});
+        if (av && av.src && av.paused) av.play().catch(() => {});
+        setIsPlaying(true);
+      }
     }
     if (resizingSegmentId) {
       if (sessionRef.current) {
-         const updatedSession = {
-            ...sessionRef.current,
-            undoStack: [...sessionRef.current.undoStack, { type: 'RESIZE' as const, previousTimeline: sessionRef.current.timeline }],
-            redoStack: []
-         };
+        const session = sessionRef.current;
+        const previousSnapshot = saveFullSessionSnapshot(session);
+        const updatedSession = {
+          ...session,
+          undoStack: [...session.undoStack, { 
+            type: 'FULL_SNAPSHOT' as const,
+            previousSnapshot,
+            actionType: 'RESIZE' as const
+          }],
+          redoStack: []
+        };
          void sessionManager.saveSession(sessionId, updatedSession);
       }
       setResizingSegmentId(null);
@@ -957,7 +1019,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
   };
 
-  const jumpToTimelineTime = async (timelineTime: number, sourceSession: SessionData = session!) => {
+  async function jumpToTimelineTime(timelineTime: number, sourceSession: SessionData = session!, isScrubbing: boolean = false) {
     if (!videoRef.current || !sourceSession) return;
 
     const video = videoRef.current;
@@ -993,7 +1055,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
     // Asset video
     if (segment.assetKind === 'video' && segment.assetUrl && av) {
-      const wasPlaying = !video.paused || (av && !av.paused);
+      const wasPlaying = !isScrubbing && (!video.paused || (av && !av.paused));
       video.pause();
       setPhotoOverlay(null);
       setActiveAssetClip(segment);
@@ -1020,22 +1082,21 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     if (av && !av.paused) av.pause();
 
     const targetTime = (segment.sourceStart ?? 0) + offset;
-    const wasPlaying = !video.paused;
-    takeTransitionSnapshot();
+    const wasPlaying = !isScrubbing && !video.paused;
     video.pause();
     try {
       video.currentTime = targetTime;
       await new Promise<void>(resolve => {
-        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); };
+        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
         video.addEventListener('seeked', onSeeked);
-        setTimeout(() => { video.removeEventListener('seeked', onSeeked); clearTransitionSnapshot(); resolve(); }, 1000);
+        setTimeout(() => { video.removeEventListener('seeked', onSeeked); resolve(); }, 500);
       });
-    } catch(e) { clearTransitionSnapshot(); }
+    } catch(e) { /* ignore */ }
 
     if (wasPlaying) {
       try { await video.play(); setIsPlaying(true); } catch {}
     }
-  };
+  }
 
   useEffect(() => {
     if (isDraggingPlayhead || resizingSegmentId) {
@@ -1050,10 +1111,12 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDraggingPlayhead, resizingSegmentId, resizeType, resizeInitialX, resizeInitialStart, resizeInitialDuration]);
 
+  // FIXED: Phase 3 - Clip Splitting Names (#1)
   const handleCut = () => {
     if (!session) return;
     
-    // Only cut track 0 (main video) segments
+    const previousSnapshot = saveFullSessionSnapshot(session);
+    
     const segmentToCut = session.timeline
       .filter(seg => seg.track === 0)
       .find(seg => currentTime >= (seg.timelineStart ?? 0) && currentTime < (seg.timelineStart ?? 0) + seg.duration);
@@ -1063,125 +1126,86 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const cutOffset = currentTime - (segmentToCut.timelineStart ?? 0);
     const sourceCutTime = (segmentToCut.sourceStart ?? 0) + cutOffset;
 
-    if (cutOffset <= 0 || cutOffset >= segmentToCut.duration) {
-      alert('Cannot cut at segment boundaries. Please position the playhead within a segment.');
+    if (cutOffset <= 0.1 || cutOffset >= segmentToCut.duration - 0.1) {
+      alert('Playhead must be inside segment (not at edges)');
       return;
     }
     
-    // Get next available color for the second segment only
-    const existingColors = session.timeline.map(seg => seg.color).filter(c => c !== undefined) as string[];
-    const availableColors = [
-      '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6',
-      '#1abc9c', '#e67e22', '#16a085', '#27ae60'
-    ];
-    
-    // First segment keeps the original color
+    // Colors - original for part1, next for part2
+    const availableColors = ['#2ecc71', '#e74c3c', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22', '#16a085', '#27ae60'];
     const color1 = segmentToCut.color || availableColors[0];
+    const color2 = availableColors[(availableColors.indexOf(color1) + 1) % availableColors.length];
     
-    // Find an unused color for the second segment
-    let color2 = availableColors[0];
-    for (let i = 0; i < availableColors.length; i++) {
-      if (!existingColors.includes(availableColors[i]) && availableColors[i] !== color1) {
-        color2 = availableColors[i];
-        break;
-      }
-    }
+    // FIXED: Smart name splitting - "MyClip" → "MyClip-A/B", "Clip1-A" → "Clip1-A1/A2"
+    const baseNameMatch = segmentToCut.name?.match(/^(.+?)(?:-([AB]\\d+))?$/i);
+    const baseName = baseNameMatch ? baseNameMatch[1].trim() : (segmentToCut.name || `Clip ${segmentToCut.order + 1}`);
+    const partNum = baseNameMatch?.[2] ? parseInt(baseNameMatch[2].slice(1)) : 0;
     
-    // If no unused colors, use the next color in the palette
-    if (color2 === availableColors[0] && segmentToCut.color) {
-      const currentIndex = availableColors.indexOf(segmentToCut.color);
-      color2 = availableColors[(currentIndex + 1) % availableColors.length];
-    }
+    const segment1Name = partNum > 0 ? `${baseName}-${String.fromCharCode(65 + partNum)}${1}` : `${baseName}-A`;
+    const segment2Name = partNum > 0 ? `${baseName}-${String.fromCharCode(65 + partNum)}${2}` : `${baseName}-B`;
     
-    // Create two new segments from the cut
     const segment1: TimelineSegment = {
+      ...segmentToCut,
       id: `${segmentToCut.id}-1`,
-      sourceStart: segmentToCut.sourceStart ?? 0,
       sourceEnd: sourceCutTime,
-      timelineStart: segmentToCut.timelineStart ?? 0,
       duration: cutOffset,
-      order: segmentToCut.order,
-      track: segmentToCut.track, // Preserve track
-      color: color1, // Assign new unique color
-      name: `Clip ${segmentToCut.order + 1}`, // Sequential naming: Clip 1, Clip 2, etc.
+      name: segment1Name,
+      color: color1,
     };
     
     const segment2: TimelineSegment = {
+      ...segmentToCut,
       id: `${segmentToCut.id}-2`,
       sourceStart: sourceCutTime,
-      sourceEnd: segmentToCut.sourceEnd ?? 0,
-      timelineStart: (segmentToCut.timelineStart ?? 0) + segment1.duration,
+      timelineStart: (segmentToCut.timelineStart ?? 0) + cutOffset,
       duration: segmentToCut.duration - cutOffset,
-      order: segmentToCut.order + 1,
-      track: segmentToCut.track, // Preserve track
-      color: color2, // Assign new unique color
-      name: `Clip ${segmentToCut.order + 2}`, // Sequential naming: next number
+      name: segment2Name,
+      color: color2,
     };
+
+    // Correctly replace the single segment with two parts in the timeline
+    const track0 = session.timeline.filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+    const others = session.timeline.filter(s => s.track !== 0);
+    const cutIdx = track0.findIndex(s => s.id === segmentToCut.id);
     
-    // Update timeline: remove old segment, add two new ones, adjust orders
-    // Keep segment1 at the original order, segment2 at order+1, and shift everything after
-    const newTimeline = session.timeline
-      .filter(seg => seg.id !== segmentToCut.id)
-      .map(seg => {
-        // Shift order of segments that come after the cut segment
-        if (seg.order > segmentToCut.order) {
-          return { ...seg, order: seg.order + 1 };
-        }
-        return seg;
-      })
-      .concat([segment1, segment2])
-      .sort((a, b) => a.order - b.order);
+    const newTrack0 = [
+      ...track0.slice(0, cutIdx),
+      segment1,
+      segment2,
+      ...track0.slice(cutIdx + 1)
+    ];
     
-    // Recalculate timeline positions and renumber all clips sequentially
-    let cumulativeTime = 0;
-    const adjustedTimeline = newTimeline
-      .sort((a, b) => a.order - b.order)
-      .map((seg, index) => {
-        const adjusted = { 
-          ...seg, 
-          order: index, 
-          timelineStart: cumulativeTime,
-          name: `Clip ${index + 1}` // Renumber all clips sequentially: Clip 1, Clip 2, Clip 3, etc.
-        };
-        cumulativeTime += seg.duration;
-        return adjusted;
-      });
-    
-    // Add history entry if transcript existed, then preserve original transcript
-    let updatedSession: SessionData;
-    if (session.transcript) {
-      const sessionWithHistory = addTranscriptHistoryEntry(session, `Cut clip at ${formatTime(currentTime)}`);
-      updatedSession = {
-        ...sessionWithHistory,
-        timeline: adjustedTimeline,
-        // PRESERVE: Keep original transcript available for reference
-        transcript: session.transcript, // Keep original transcript
-        transcriptSegments: session.transcriptSegments, // Keep original segments
-        undoStack: [...session.undoStack, { type: 'CUT' as const, segmentId: segmentToCut.id, cutTime: currentTime, newSegmentId: segment2.id }],
-        redoStack: [],
-      };
-    } else {
-      updatedSession = {
-        ...session,
-        timeline: adjustedTimeline,
-        transcript: null, // No transcript to preserve
-        transcriptSegments: null,
-        undoStack: [...session.undoStack, { type: 'CUT' as const, segmentId: segmentToCut.id, cutTime: currentTime, newSegmentId: segment2.id }],
-        redoStack: [],
-      };
-    }
+    // Recalculate positions/names
+    let t = 0;
+    const adjusted = newTrack0.map((seg, i) => {
+      const adj = { ...seg, order: i, timelineStart: t };
+      t += seg.duration;
+      return adj;
+    });
+
+    const updatedSession = {
+      ...session,
+      timeline: [...adjusted, ...others],
+      undoStack: [...session.undoStack, { 
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'CUT' as const,
+        details: { cutId: segmentToCut.id, cutTime: cutOffset }
+      }],
+      redoStack: [],
+    };
     
     setSession(updatedSession);
     void sessionManager.saveSession(sessionId, updatedSession);
+    setSelectedSegmentId(segment2.id); // Select right part
   };
 
-  const handleDelete = (idToDelete?: string | React.MouseEvent) => {
+  const handleDelete = () => {
     if (!session) return;
 
+    const previousSnapshot = saveFullSessionSnapshot(session);
+
     let targetId = selectedSegmentId;
-    if (typeof idToDelete === 'string') {
-      targetId = idToDelete;
-    }
 
     // Auto-select the first track-0 clip if nothing is selected
     targetId = targetId || (
@@ -1198,47 +1222,37 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return;
     }
     
-    // Remove segment and reorder with sequential naming
+    // Remove segment and reorder (preserve custom names)
     const newTimeline = session.timeline
       .filter(seg => seg.id !== targetId)
       .sort((a, b) => a.order - b.order);
     
-    // Recalculate timeline positions and renumber all clips sequentially
+    // Recalculate timeline positions → STRICTLY PRESERVE custom names
     let cumulativeTime = 0;
     const adjustedTimeline = newTimeline.map((seg, index) => {
       const adjusted = { 
         ...seg, 
         order: index, 
         timelineStart: cumulativeTime,
-        name: `Clip ${index + 1}` // Renumber all clips sequentially: Clip 1, Clip 2, Clip 3, etc.
+        name: preserveClipName(seg)
       };
       cumulativeTime += seg.duration;
       return adjusted;
     });
     
-    // Add history entry if transcript existed, then preserve original transcript
-    let updatedSession: SessionData;
-    if (session.transcript) {
-      const sessionWithHistory = addTranscriptHistoryEntry(session, `Deleted ${segmentToDelete.name || 'clip'}`);
-      updatedSession = {
-        ...sessionWithHistory,
-        timeline: adjustedTimeline,
-        // PRESERVE: Keep original transcript available for reference
-        transcript: session.transcript, // Keep original transcript
-        transcriptSegments: session.transcriptSegments, // Keep original segments
-        undoStack: [...session.undoStack, { type: 'DELETE' as const, segment: segmentToDelete }],
-        redoStack: [],
-      };
-    } else {
-      updatedSession = {
-        ...session,
-        timeline: adjustedTimeline,
-        transcript: null, // No transcript to preserve
-        transcriptSegments: null,
-        undoStack: [...session.undoStack, { type: 'DELETE' as const, segment: segmentToDelete }],
-        redoStack: [],
-      };
-    }
+    const updatedSession: SessionData = {
+      ...session,
+      timeline: adjustedTimeline,
+      transcript: session.transcript,
+      transcriptSegments: session.transcriptSegments,
+      undoStack: [...session.undoStack, { 
+        type: 'FULL_SNAPSHOT' as const, 
+        previousSnapshot,
+        actionType: 'DELETE' as const,
+        details: { segmentId: targetId } 
+      }],
+      redoStack: [],
+    };
     
     setSession(updatedSession);
     setSelectedSegmentId(null);
@@ -1247,105 +1261,60 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   const handleUndo = () => {
     if (!session || session.undoStack.length === 0) return;
-
+    
     const lastAction = session.undoStack[session.undoStack.length - 1];
-    let newTimeline = [...session.timeline];
-    let newTranscript = session.transcript;
-    let newTranscriptSegments = session.transcriptSegments;
-
-    // Snapshot the current (post-action) state so redo can restore it
-    const postActionTimeline = [...session.timeline];
-    const postActionTranscript = session.transcript;
-    const postActionTranscriptSegments = session.transcriptSegments;
-
-    if (lastAction.type === 'CUT') {
-      const seg1 = newTimeline.find(s => s.id === `${lastAction.segmentId}-1`);
-      const seg2 = newTimeline.find(s => s.id === `${lastAction.segmentId}-2`);
-      if (seg1 && seg2) {
-        const merged: TimelineSegment = {
-          id: lastAction.segmentId,
-          sourceStart: seg1.sourceStart,
-          sourceEnd: seg2.sourceEnd,
-          timelineStart: seg1.timelineStart,
-          duration: seg1.duration + seg2.duration,
-          order: seg1.order,
-          track: seg1.track,
-          color: seg1.color,
-          name: seg1.name,
+    const previousSnapshot = lastAction.type === 'FULL_SNAPSHOT' ? lastAction.previousSnapshot : null;
+    
+    if (previousSnapshot) {
+      try {
+        const restored = restoreFullSessionSnapshot(previousSnapshot);
+        const currentSnapshot = saveFullSessionSnapshot(session);
+        
+        const updated: SessionData = {
+          ...restored,
+          undoStack: session.undoStack.slice(0, -1),
+          redoStack: [...session.redoStack, { 
+            type: 'FULL_SNAPSHOT' as const,
+            previousSnapshot: currentSnapshot,
+            actionType: 'UNDO' as const
+          }],
         };
-        newTimeline = newTimeline
-          .filter(s => s.id !== seg1.id && s.id !== seg2.id)
-          .concat([merged])
-          .sort((a, b) => a.order - b.order)
-          .map((seg, index) => ({ ...seg, order: index }));
+        
+        setSession(updated);
+        sessionManager.saveSession(sessionId, updated);
+      } catch (e) {
+        logger.error('Undo failed:', e);
       }
-    } else if (lastAction.type === 'DELETE') {
-      newTimeline = [...newTimeline, lastAction.segment]
-        .sort((a, b) => a.order - b.order)
-        .map((seg, index) => ({ ...seg, order: index }));
-      let t = 0;
-      newTimeline = newTimeline.map(seg => { const s = { ...seg, timelineStart: t }; t += seg.duration; return s; });
-    } else if (lastAction.type === 'AI_EDIT') {
-      newTimeline = lastAction.previousTimeline;
-      newTranscript = lastAction.previousTranscript;
-      newTranscriptSegments = lastAction.previousTranscriptSegments;
-    } else if (lastAction.type === 'REORDER') {
-      newTimeline = lastAction.previousTimeline;
-    } else if (lastAction.type === 'ADD_ASSET') {
-      newTimeline = lastAction.previousTimeline;
     }
-
-    // Store the post-action snapshot in the redo action so redo can restore it
-    const redoAction = {
-      ...lastAction,
-      // Attach post-action state for redo to use
-      _postTimeline: postActionTimeline,
-      _postTranscript: postActionTranscript,
-      _postTranscriptSegments: postActionTranscriptSegments,
-    } as (typeof lastAction & {
-      _postTimeline: TimelineSegment[];
-      _postTranscript: string | null;
-      _postTranscriptSegments: Array<{ start: number; end: number; text: string }> | null;
-    });
-
-    const updatedSession = {
-      ...session,
-      timeline: newTimeline,
-      transcript: newTranscript,
-      transcriptSegments: newTranscriptSegments,
-      undoStack: session.undoStack.slice(0, -1),
-      redoStack: [...session.redoStack, redoAction as unknown as (typeof session.redoStack)[0]],
-    };
-
-    setSession(updatedSession);
-    void sessionManager.saveSession(sessionId, updatedSession);
   };
 
   const handleRedo = () => {
     if (!session || session.redoStack.length === 0) return;
-
-    const actionToRedo = session.redoStack[session.redoStack.length - 1] as (typeof session.redoStack)[0] & {
-      _postTimeline?: TimelineSegment[];
-      _postTranscript?: string | null;
-      _postTranscriptSegments?: Array<{ start: number; end: number; text: string }> | null;
-    };
-
-    // Use the post-action snapshot stored by handleUndo (most reliable approach)
-    const newTimeline: TimelineSegment[] = actionToRedo._postTimeline ?? session.timeline;
-    const newTranscript: string | null = actionToRedo._postTranscript ?? session.transcript;
-    const newTranscriptSegments = actionToRedo._postTranscriptSegments ?? session.transcriptSegments;
-
-    const updatedSession = {
-      ...session,
-      timeline: newTimeline,
-      transcript: newTranscript,
-      transcriptSegments: newTranscriptSegments,
-      undoStack: [...session.undoStack, actionToRedo],
-      redoStack: session.redoStack.slice(0, -1),
-    };
-
-    setSession(updatedSession);
-    void sessionManager.saveSession(sessionId, updatedSession);
+    
+    const lastAction = session.redoStack[session.redoStack.length - 1];
+    const previousSnapshot = lastAction.type === 'FULL_SNAPSHOT' ? lastAction.previousSnapshot : null;
+    
+    if (previousSnapshot) {
+      try {
+        const restored = restoreFullSessionSnapshot(previousSnapshot);
+        const currentSnapshot = saveFullSessionSnapshot(session);
+        
+        const updated: SessionData = {
+          ...restored,
+          undoStack: [...session.undoStack, { 
+            type: 'FULL_SNAPSHOT' as const,
+            previousSnapshot: currentSnapshot,
+            actionType: 'REDO' as const
+          }],
+          redoStack: session.redoStack.slice(0, -1),
+        };
+        
+        setSession(updated);
+        sessionManager.saveSession(sessionId, updated);
+      } catch (e) {
+        logger.error('Redo failed:', e);
+      }
+    }
   };
 
   const handleSegmentClick = (segmentId: string, e: React.MouseEvent) => {
@@ -1364,7 +1333,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       const mouseX = e.clientX - rect.left;
       
       const track0Segments = (session.timeline || []).filter(s => s.track === 0);
-      const totalDur = Math.max(track0Segments.reduce((sum, s) => sum + s.duration, 0), session.duration || 1);
+      const totalDur = track0Segments.reduce((sum, s) => sum + s.duration, 0) || 1;
       
       const timeAtCursor = (mouseX / rect.width) * totalDur;
       const segment = session.timeline.find(s => s.id === segmentId);
@@ -1425,7 +1394,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     // Remove dragged from list
     const without = track0.filter(s => s.id !== draggedSegmentId);
     const targetIdx = without.findIndex(s => s.id === targetSegmentId);
-    const insertAt = insertBefore ? targetIdx : targetIdx + 1;
+    // Bounds validation for insert position
+    const insertAt = Math.max(0, Math.min(without.length, insertBefore ? targetIdx : targetIdx + 1));
 
     // Splice dragged into new position
     const reordered = [
@@ -1436,16 +1406,29 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
     let t = 0;
     const adjustedTrack0 = reordered.map((seg, idx) => {
-      const s = { ...seg, order: idx, timelineStart: t };
+      const s = { 
+        ...seg, 
+        order: idx, 
+        timelineStart: t,
+        // ✅ FIXED: Preserve custom names on reorder/drop
+        name: preserveClipName(seg)
+      };
       t += seg.duration;
       return s;
     });
 
     const otherTracks = session.timeline.filter(s => s.track !== 0);
+    // Phase 4.15: Capture FULL session snapshot BEFORE mutation (segment drop reorder)
+    const previousSnapshot = saveFullSessionSnapshot(session);
+
     const updatedSession = {
       ...session,
       timeline: [...adjustedTrack0, ...otherTracks],
-      undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+      undoStack: [...session.undoStack, { 
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'REORDER_DROP' as const
+      }],
       redoStack: [],
     };
 
@@ -1483,10 +1466,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return seg;
     });
     
+    // Phase 4.15: Capture FULL session snapshot BEFORE mutation (track drop)
+    const previousSnapshot = saveFullSessionSnapshot(session);
+
     const updatedSession = {
       ...session,
       timeline: newTimeline,
-      undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+      undoStack: [...session.undoStack, { 
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'TRACK_DROP' as const
+      }],
       redoStack: [],
     };
     
@@ -1521,10 +1511,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const percentage = mouseX / rect.width;
     
     const track0Segments = (session.timeline || []).filter(s => s.track === 0);
-    const totalDur = Math.max(
-      track0Segments.reduce((sum, s) => sum + s.duration, 0),
-      session.duration || 1
-    );
+    const totalDur = track0Segments.reduce((sum, s) => sum + s.duration, 0) || 1;
     
     const timePosition = percentage * totalDur;
     
@@ -1540,22 +1527,31 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     if (!draggedSegment) return;
     
     if (draggedSegment.track === 1) {
-      // It's an audio segment being dropped at a specific absolute position
-      const newStart = Math.max(0, dragOverPosition - dragOffset);
+      // Audio segment: absolute positioning with bounds validation
+      const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0);
+      const newStart = Math.max(0, Math.min(track0Dur - draggedSegment.duration + 0.1, dragOverPosition - dragOffset));
       const updatedTimeline = session.timeline.map(seg => {
         if (seg.id === draggedSegmentId) {
           return { ...seg, timelineStart: newStart };
         }
         return seg;
       });
+      // Phase 4.15: Capture FULL session snapshot BEFORE mutation (audio reposition/timeline drop)
+      const previousSnapshot = saveFullSessionSnapshot(session);
+
       const updatedSession = {
         ...session,
         timeline: updatedTimeline,
-        undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+        undoStack: [...session.undoStack, { 
+          type: 'FULL_SNAPSHOT' as const,
+          previousSnapshot,
+          actionType: 'TIMELINE_DROP' as const
+        }],
         redoStack: [],
       };
       setSession(updatedSession);
       void sessionManager.saveSession(sessionId, updatedSession);
+      
       setDraggedSegmentId(null);
       setDragOverPosition(null);
       return;
@@ -1592,11 +1588,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
     const otherTracks = session.timeline.filter(seg => seg.track !== 0 && seg.id !== draggedSegmentId);
     
+    const previousSnapshot = saveFullSessionSnapshot(session);
     const updatedSession = {
       ...session,
       timeline: [...adjustedTrack0, ...otherTracks],
-      undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
-      redoStack: [],
+      undoStack: [...session.undoStack, { 
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'REORDER' as const,
+        details: { dropPosition: dragOverPosition }
+      }],
+      redoStack: []
     };
     
     setSession(updatedSession);
@@ -1606,7 +1608,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     setDragOverPosition(null);
   };
 
-  const getClipColor = (index: number) => {
+  function getClipColor(index: number) {
     const colors = [
       '#2ecc71', // Green  
       '#e74c3c', // Red
@@ -1620,24 +1622,36 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const color = colors[index % colors.length];
     logger.debug(`Clip color assignment - Index ${index} -> Color ${color}`);
     return color;
-  };
+  }
 
   // Generate colors for different asset types
-  const getAssetColor = (assetKind: string) => {
+  function getAssetColor(assetKind: string) {
     const assetColors = {
       photo: '#e67e22', // Orange
       video: '#9b59b6', // Purple
       audio: '#1abc9c', // Teal
     };
     return assetColors[assetKind as keyof typeof assetColors] || '#2ecc71';
-  };
+  }
 
   const handleVolumeChange = (segmentId: string, volume: number) => {
     if (!sessionRef.current) return;
-    const updatedTimeline = sessionRef.current.timeline.map(seg => 
+    const session = sessionRef.current;
+    
+    const previousSnapshot = saveFullSessionSnapshot(session);
+    const updatedTimeline = session.timeline.map(seg => 
       seg.id === segmentId ? { ...seg, volume } : seg
     );
-    const updatedSession = { ...sessionRef.current, timeline: updatedTimeline };
+    const updatedSession = { 
+      ...session, 
+      timeline: updatedTimeline,
+      undoStack: [...session.undoStack, { 
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'VOLUME_CHANGE' as const
+      }],
+      redoStack: []
+    };
     setSession(updatedSession);
     void sessionManager.saveSession(sessionId, updatedSession);
   };
@@ -1681,49 +1695,55 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return;
     }
 
-    // CRITICAL: Use CURRENT session.timeline state (reflects all AI edits)
+    setIsExporting(true);
+
+    // Get all clips from track 0 (main video clips)
     const sortedTimeline = [...session.timeline].sort((a, b) => a.order - b.order);
+    const track0Clips = sortedTimeline.filter(s => s.track === 0);
+    
+    if (track0Clips.length === 0) {
+      alert('No video clips to export. Please add clips to the timeline.');
+      setIsExporting(false);
+      return;
+    }
     
     logger.debug("Export timeline state:", {
-      totalClips: sortedTimeline.length,
-      clips: sortedTimeline.map(seg => ({
+      totalClips: track0Clips.length,
+      clips: track0Clips.map(seg => ({
         id: seg.id,
         order: seg.order,
         start: seg.sourceStart,
         end: seg.sourceEnd,
+        duration: seg.duration,
         name: seg.name || 'Unnamed'
       }))
     });
 
-    // Map timeline segments to export format
-    const clips = sortedTimeline.map((seg, index) => {
+    // Map timeline segments to export format - export ALL track0 clips
+    const clips = track0Clips.map((seg, index) => {
       const clip: Record<string, any> = {
-        start: seg.timelineStart ?? 0,     // Timeline position (for sequencing)
-        end: (seg.timelineStart ?? 0) + seg.duration,  // Timeline position (for sequencing)
+        sourceStart: seg.sourceStart ?? 0,
+        sourceEnd:   seg.sourceEnd   ?? seg.duration,
+        start: seg.timelineStart ?? 0,
+        end:   (seg.timelineStart ?? 0) + seg.duration,
         title: seg.name || `Clip ${index + 1}`,
-        id: seg.id,
-        assetUrl: seg.assetUrl,
+        id:    seg.id,
+        assetUrl:  seg.assetUrl,
         assetKind: seg.assetKind,
-        volume: seg.volume ?? 1.0,
+        volume:    seg.volume ?? 1.0,
       };
-      
-      // Handle merged clips with segments
       if (seg.isMerged && seg.segments) {
-        logger.debug(`Export merged clip ${index + 1} with ${seg.segments.length} segments:`, seg.segments);
-        clip.segments = seg.segments; // Pass segments to backend
+        clip.segments = seg.segments;
         clip.isMerged = true;
-      } else {
-        // Regular clip
-        clip.sourceStart = seg.sourceStart;
-        clip.sourceEnd = seg.sourceEnd;
       }
-      
-      logger.debug(`Export mapped clip ${index + 1}:`, clip);
       return clip;
     });
 
-    logger.debug("Export final clips array:", clips);
-    logger.operation("Using Remotion export endpoint: /export-with-clips");
+    logger.debug("Export final clips array:", {
+      count: clips.length,
+      clips: clips.map(c => ({ id: c.id, title: c.title, duration: c.end - c.start }))
+    });
+    logger.operation(`Exporting ${clips.length} clips using Remotion export endpoint`);
 
     try {
       // Use the new Remotion export endpoint
@@ -1761,10 +1781,13 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
       
-      logger.operation("Export download completed successfully");
+      logger.operation(`Export completed successfully: ${clips.length} clips exported`);
+      alert(`Successfully exported ${clips.length} clips!`);
     } catch (err) {
       logger.error("Export error:", err);
       alert(`Export failed: ${err instanceof Error ? err.message : 'Network error'}`);
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -1797,8 +1820,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
               Reset
             </button>
-            <button className="btn btn-primary" onClick={handleExport}>
-              Export
+            <button className="btn btn-primary" onClick={handleExport} disabled={isExporting}>
+              {isExporting ? 'Exporting...' : 'Export'}
             </button>
           </div>
         </header>
@@ -1826,31 +1849,16 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 style={{ width: '100%', height: '100%', objectFit: 'contain', flex: 1 }}
                 crossOrigin="anonymous"
                 preload="auto"
-                onLoadedMetadata={() => {
-                  const video = videoRef.current;
-                  if (!video || !session.timeline.length) return;
-                  // Only snap to the first clip's start on the very first load (empty src ref).
-                  // During playback, loadClip handles seeking — don't interfere.
-                  if (currentSrcRef.current === '') {
-                    const first = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order)[0];
-                    if (first && !first.assetUrl) {
-                      isJumpingRef.current = true;
-                      video.currentTime = first.sourceStart ?? 0;
-                      setCurrentTime(first.timelineStart ?? 0);
-                      setTimeout(() => { isJumpingRef.current = false; }, 150);
-                    }
-                  }
-                }}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
                 aria-label={isPlaying ? 'Video playing' : 'Video paused'}
               >
                 Your browser does not support the video tag.
               </video>
 
               {/* Asset video overlay — fades in over the original video */}
+              {/* When active: pointer-events enabled so user can interact with it */}
               <video
                 ref={assetVideoRef}
+                controls={assetVideoOpacity > 0}
                 style={{
                   position: 'absolute', top: 0, left: 0,
                   width: '100%', height: '100%',
@@ -1858,7 +1866,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   zIndex: 4,
                   opacity: assetVideoOpacity,
                   transition: 'opacity 0.18s ease',
-                  pointerEvents: 'none',
+                  pointerEvents: assetVideoOpacity > 0 ? 'auto' : 'none',
                   backgroundColor: '#000',
                 }}
                 crossOrigin="anonymous"
@@ -1881,6 +1889,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   backgroundColor: 'transparent'
                 }}
               />
+
               </>
             )}
 
@@ -1896,13 +1905,41 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               </div>
             )}
             
-            {/* Fallback legacy Photo overlay */}
+            {/* Photo overlay — click to pause/resume */}
             {!activeOverlayClip && photoOverlay && (
-              <div className="video-photo-preview">
-                 <img src={photoOverlay.url} alt={photoOverlay.name} className="video-photo-img" />
-                 <div className="video-photo-label">{getShortName(photoOverlay.name, 'Photo')}</div>
-               </div>
-             )}
+              <div
+                className="video-photo-preview"
+                style={{ cursor: 'pointer' }}
+                onClick={() => {
+                  if (isPlaying) {
+                    if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
+                    setIsPlaying(false);
+                    isPlayingRef.current = false;
+                  } else {
+                    setIsPlaying(true);
+                    isPlayingRef.current = true;
+                    // Resume with remaining duration (use full duration as safe fallback)
+                    const clips = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+                    const clip = clips[currentClipIndexRef.current];
+                    const remaining = clip ? Math.max(500, (clip.duration - photoElapsedRef.current) * 1000) : 3000;
+                    photoTimerRef.current = setTimeout(() => {
+                      // advance — trigger by seeking past end
+                      const nextIdx = currentClipIndexRef.current + 1;
+                      if (nextIdx < clips.length) {
+                        currentClipIndexRef.current = nextIdx;
+                        // loadClip is inside the useEffect closure, so we trigger via video play
+                        // Simplest: just clear photo and let the rAF loop handle it
+                        setPhotoOverlay(null);
+                        setActiveAssetClip(null);
+                      }
+                    }, remaining);
+                  }
+                }}
+              >
+                <img src={photoOverlay.url} alt={photoOverlay.name} className="video-photo-img" />
+                <div className="video-photo-label">{getShortName(photoOverlay.name, 'Photo')}</div>
+              </div>
+            )}
 
             {/* Video asset name label */}
             {!activeOverlayClip && !photoOverlay && activeAssetClip?.assetKind === 'video' && (
@@ -1986,18 +2023,18 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               {/* Total timeline duration = sum of all clip durations (includes assets on track 0) */}
               {(() => {
                 const track0Segments = (session.timeline || []).filter(s => s.track === 0);
-                const totalDur = Math.max(
-                  track0Segments.reduce((sum, s) => sum + (s.duration || 0), 0),
-                  1
-                );
+                const totalDur = track0Segments.reduce((sum, s) => sum + (s.duration || 0), 0) || 1;
                 return (
                   <>
                     <div className="timeline-header">
                       <span className="timeline-time">{formatTime(currentTime)} / {formatTime(totalDur)}</span>
                     </div>
+
+                    {/* Scrollable area: ruler + video track + playhead */}
                     <div
                       className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`}
                       ref={timelineRef}
+                      style={{ overflowX: 'auto', overflowY: 'hidden', position: 'relative' }}
                       onClick={(e) => {
                         if (!videoRef.current || isDraggingPlayhead) return;
                         const rect = e.currentTarget.getBoundingClientRect();
@@ -2008,6 +2045,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                       onDragOver={handleTimelineDragOver}
                       onDrop={handleTimelineDrop}
                     >
+                      {/* Inner container — min-width ensures clips don't squish */}
+                      <div style={{ minWidth: `${Math.max(100, track0Segments.length * 80)}px`, position: 'relative' }}>
                       {/* Timeline Ruler (Timestamps) */}
                       <div className="timeline-ruler" style={{ position: 'relative', height: '14px', borderBottom: '1px solid #333', marginBottom: '4px' }}>
                         {[...Array(11)].map((_, i) => {
@@ -2099,21 +2138,30 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                         )}
                       </div>
 
-                      {/* Audio track — flush below video track, same width, no wrapper div */}
+                      {/* Playhead — inside scrollable area */}
                       <div
-                        className="timeline-track audio-track"
-                        data-track={1}
-                        style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '4px', border: '1px solid rgba(26,188,156,0.18)', height: '34px', overflow: 'visible', marginTop: '3px' }}
-                        onDragOver={handleTrackDragOver}
-                        onDrop={(e) => handleTrackDrop(1, e)}
-                      >
-                        {(session.timeline || []).filter(s => s.track === 1).length === 0 && (
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#3a5a54', fontSize: '0.65rem', fontStyle: 'italic', gap: '4px', pointerEvents: 'none' }}>
-                            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-                            audio
-                          </div>
-                        )}
-                        {(session.timeline || []).filter(s => s.track === 1).map((segment) => {
+                        className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
+                        style={{ left: `${(currentTime / totalDur) * 100}%`, top: 0, height: '100%', zIndex: 10 }}
+                        onMouseDown={handlePlayheadMouseDown}
+                      />
+                      </div>{/* end inner min-width container */}
+                    </div>{/* end scrollable timeline-content */}
+
+                    {/* Audio track — OUTSIDE scroll, always visible, full width */}
+                    <div
+                      className="timeline-track audio-track"
+                      data-track={1}
+                      style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '4px', border: '1px solid rgba(26,188,156,0.18)', height: '34px', overflow: 'visible', marginTop: '3px', marginLeft: '1rem', marginRight: '1rem' }}
+                      onDragOver={handleTrackDragOver}
+                      onDrop={(e) => handleTrackDrop(1, e)}
+                    >
+                      {(session.timeline || []).filter(s => s.track === 1).length === 0 && (
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#3a5a54', fontSize: '0.65rem', fontStyle: 'italic', gap: '4px', pointerEvents: 'none' }}>
+                          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                          audio
+                        </div>
+                      )}
+                      {(session.timeline || []).filter(s => s.track === 1).map((segment) => {
                           const leftPercent = ((segment.timelineStart ?? 0) / Math.max(totalDur, 1)) * 100;
                           const widthPercent = (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * 100;
                           const vol = segment.volume ?? 1;
@@ -2144,14 +2192,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                             </div>
                           );
                         })}
-                      </div>
-
-                      {/* Playhead */}
-                      <div
-                        className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
-                        style={{ left: `${(currentTime / totalDur) * 100}%`, top: 0, height: '100%', zIndex: 10 }}
-                        onMouseDown={handlePlayheadMouseDown}
-                      />
                     </div>
                   </>
                 );
@@ -2224,7 +2264,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                           e.currentTarget.style.borderTop = '';
                           const draggedId = e.dataTransfer.getData('text/plain');
                           if (!draggedId || draggedId === clip.id) return;
-                          const track0 = session.timeline
+                          git status                          const track0 = session.timeline
                             .filter(s => s.track === 0)
                             .sort((a, b) => a.order - b.order);
                           const fromIdx = track0.findIndex(s => s.id === draggedId);
@@ -2240,10 +2280,15 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                             return r;
                           });
                           const others = session.timeline.filter(s => s.track !== 0);
+                        const previousSnapshot = saveFullSessionSnapshot(session);
                           const updatedSession = {
                             ...session,
                             timeline: [...adjusted, ...others],
-                            undoStack: [...session.undoStack, { type: 'REORDER' as const, previousTimeline: session.timeline }],
+                          undoStack: [...session.undoStack, { 
+                            type: 'FULL_SNAPSHOT' as const, 
+                            previousSnapshot, 
+                            actionType: 'REORDER' as const 
+                          }],
                             redoStack: [],
                           };
                           setSession(updatedSession);
@@ -2251,10 +2296,15 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                         }}
                         style={{
                           display: 'flex', alignItems: 'center', gap: '0.6rem',
-                          padding: '0.6rem 0.75rem', background: '#2a2a2a', borderRadius: '8px',
+                          padding: '0.6rem 0.75rem', background: selectedSegmentId === clip.id ? '#1e2a3a' : '#2a2a2a', borderRadius: '8px',
                           borderLeft: `4px solid ${clip.color || getClipColor(i)}`,
                           cursor: 'grab', userSelect: 'none',
                           transition: 'background 0.15s',
+                          outline: selectedSegmentId === clip.id ? '1px solid #4a9eff' : 'none',
+                        }}
+                        onClick={() => {
+                          setSelectedSegmentId(clip.id);
+                          void jumpToTimelineTime(clip.timelineStart ?? 0);
                         }}
                       >
                         {/* Drag handle */}
@@ -2310,7 +2360,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                             className="btn btn-icon"
                             style={{ padding: '4px', color: '#e74c3c' }}
                             title="Delete clip"
-                            onClick={(e) => { e.stopPropagation(); handleDelete(clip.id); }}
+                          onClick={(e) => { e.stopPropagation(); handleDelete(); }}
                           >
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                               <polyline points="3 6 5 6 21 6" />
@@ -2363,13 +2413,20 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   color: getAssetColor('audio'),
                   volume: 1,
                 };
-                setSession({
-                  ...session,
-                  timeline: [...session.timeline, newSegment],
-                  undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSegment }],
-                  redoStack: [],
-                });
-                return;
+              // Phase 4.14: Capture FULL session snapshot BEFORE mutation
+              const previousSnapshot = saveFullSessionSnapshot(session);
+
+              setSession({
+                ...session,
+                timeline: [...session.timeline, newSegment],
+                undoStack: [...session.undoStack, { 
+                  type: 'FULL_SNAPSHOT' as const,
+                  previousSnapshot,
+                  actionType: 'ADD_ASSET' as const
+                }],
+                redoStack: [],
+              });
+              return;
               }
 
               const newSegment: TimelineSegment = {
@@ -2438,10 +2495,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               });
 
               const otherTracks = session.timeline.filter(s => s.track !== 0);
+              // Phase 4.14: Capture FULL session snapshot BEFORE mutation
+              const previousSnapshot = saveFullSessionSnapshot(session);
+
               setSession({
                 ...session,
                 timeline: [...adjustedTrack0, ...otherTracks],
-                undoStack: [...session.undoStack, { type: 'ADD_ASSET' as const, previousTimeline: session.timeline, asset: newSegment }],
+                undoStack: [...session.undoStack, { 
+                  type: 'FULL_SNAPSHOT' as const,
+                  previousSnapshot,
+                  actionType: 'ADD_ASSET' as const
+                }],
                 redoStack: [],
               });
             }} />
@@ -2528,16 +2592,23 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   ))}
                   {isAiEditing && <div style={{ color: '#aaa', fontSize: '0.8rem', fontStyle: 'italic' }}>Thinking...</div>}
                 </div>
-                <form onSubmit={handleAiEditSubmit} style={{ display: 'flex', gap: '0.5rem' }}>
-                  <input
-                    type="text"
+                <form onSubmit={handleAiEditSubmit} style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start' }}>
+                  <textarea
                     value={aiPrompt}
                     onChange={(e) => setAiPrompt(e.target.value)}
-                    placeholder="Type message..."
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        if (!isAiEditing && aiPrompt.trim() && session?.transcript) {
+                          handleAiEditSubmit(e as any);
+                        }
+                      }
+                    }}
+                    placeholder="e.g. Trim the first 5 seconds, add subtitles, and highlight the middle segment."
                     disabled={isAiEditing || !session?.transcript}
-                    style={{ flex: 1, padding: '0.5rem', borderRadius: '6px', border: '1px solid #333', background: '#1a1a2e', color: '#fff', fontSize: '0.82rem' }}
+                    style={{ flex: 1, padding: '0.5rem', borderRadius: '6px', border: '1px solid #333', background: '#1a1a2e', color: '#fff', fontSize: '0.82rem', resize: 'vertical', minHeight: '40px', fontFamily: 'inherit' }}
                   />
-                  <button type="submit" className="btn btn-primary" disabled={isAiEditing || !aiPrompt.trim() || !session?.transcript} style={{ fontSize: '0.82rem' }}>
+                  <button type="submit" className="btn btn-primary" disabled={isAiEditing || !aiPrompt.trim() || !session?.transcript} style={{ fontSize: '0.82rem', alignSelf: 'stretch' }}>
                     Send
                   </button>
                 </form>

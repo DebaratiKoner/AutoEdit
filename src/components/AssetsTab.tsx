@@ -166,15 +166,6 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
       <div className="assets-header">
         <form className="assets-search-form" onSubmit={submit}>
           <div className="assets-search-wrapper">
-            <button
-              type="submit"
-              className="assets-search-btn"
-              title="Search"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-              </svg>
-            </button>
             <input
               className="assets-search-input"
               placeholder="Search media..."
@@ -185,6 +176,16 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
               <button type="button" className="assets-search-clear"
                 onClick={() => { setInputValue(''); setSearchQuery(''); }}>×</button>
             )}
+            <button
+              type="submit"
+              className="assets-search-btn"
+              title="Search"
+              onClick={() => setSearchQuery(inputValue)}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+            </button>
           </div>
         </form>
 
@@ -194,7 +195,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
               { key: 'all',   label: 'All' },
               { key: 'video', label: 'Video' },
               { key: 'audio', label: 'Audio' },
-              { key: 'photo', label: 'Photos' }
+              { key: 'photo', label: 'Photos' },
             ].map(f => (
               <button key={f.key}
                 className={`assets-filter-btn${filter === f.key ? ' active' : ''}`}
@@ -300,16 +301,18 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
                       {/* Preview button for videos */}
                       {isVid && (
                         <button className="asset-preview-btn"
+                          style={{ fontSize: '0.7rem', padding: '3px 7px' }}
                           onClick={e => { e.stopPropagation(); setPreview(asset as PixabayVideo & { _kind: 'video' }); }}>
-                          ▶ Preview
+                          ▶
                         </button>
                       )}
                       {/* Insert button */}
                       <button
                         className={`asset-add-btn${isAdded ? ' added' : ''}`}
+                        style={{ fontSize: '0.7rem', padding: '3px 7px' }}
                         onClick={e => addToTimeline(asset, e)}
                         title="Insert at playhead">
-                        {isAdded ? '✓ Added' : '+ Insert'}
+                        {isAdded ? '✓' : '+'}
                       </button>
                     </div>
                   </div>

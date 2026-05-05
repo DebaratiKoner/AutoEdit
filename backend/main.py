@@ -198,6 +198,51 @@ def _apply_advanced_operations(clips: list, actions: list) -> list:
 async def root():
     return {"message": "Video Editor API", "status": "running"}
 
+
+class GenerateImageRequest(BaseModel):
+    prompt: str
+
+@app.post("/api/generate-image")
+async def generate_image(body: GenerateImageRequest):
+    """Generate an image using DALL-E 3 from a text prompt, then cache it locally."""
+    if not body.prompt or not body.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if not client.api_key:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    try:
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=body.prompt.strip(),
+            size="1024x1024",
+            quality="standard",
+            n=1,
+        )
+        dalle_url = response.data[0].url
+
+        # Download and cache the image locally so it doesn't expire
+        import httpx, uuid as _uuid
+        img_id = str(_uuid.uuid4())[:8]
+        img_path = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
+        async with httpx.AsyncClient(timeout=30.0) as hc:
+            img_resp = await hc.get(dalle_url)
+            img_resp.raise_for_status()
+            img_path.write_bytes(img_resp.content)
+
+        # Return a local API URL that won't expire
+        local_url = f"/api/assets/ai-image/{img_id}"
+        return JSONResponse({"url": local_url, "prompt": body.prompt.strip()})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+
+
+@app.get("/api/assets/ai-image/{img_id}")
+async def serve_ai_image(img_id: str):
+    """Serve a cached AI-generated image."""
+    img_path = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(str(img_path), media_type="image/jpeg")
+
 @app.get("/test-export")
 async def test_export_info():
     """
@@ -1243,16 +1288,14 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     # ROBUSTNESS LAYER: Ensure all clips have stable IDs
     clips_with_ids = _ensure_clip_ids(body.segments)
     
-    # Build numbered clip list — include title when present so AI can match by name
+    # Build numbered clip list with all info the AI needs to compute correct timestamps
     segments_text = "\n".join(
         (
-            f"{i + 1}. [Timeline: {seg.get('timelineStart', 0):.2f}s - {seg.get('timelineStart', 0) + seg.get('duration', seg.get('end', 0) - seg.get('start', 0)):.2f}s] "
-            f"(Source: {seg.get('start', 0):.2f}s - {seg.get('end', 0):.2f}s) "
-            f"Title: \"{seg.get('title', '').strip()}\" | Transcript: {seg.get('text', '').strip()}"
-            if seg.get('title')
-            else
-            f"{i + 1}. [Timeline: {seg.get('timelineStart', 0):.2f}s - {seg.get('timelineStart', 0) + seg.get('duration', seg.get('end', 0) - seg.get('start', 0)):.2f}s] "
-            f"(Source: {seg.get('start', 0):.2f}s - {seg.get('end', 0):.2f}s) {seg.get('text', '').strip()}"
+            f"{i + 1}. Title:\"{seg.get('title', '').strip()}\" | "
+            f"Timeline:{seg.get('timelineStart', 0):.2f}s-{seg.get('timelineStart', 0) + seg.get('duration', 0):.2f}s | "
+            f"Source:{seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s | "
+            f"Duration:{seg.get('duration', seg.get('end', 0) - seg.get('start', 0)):.2f}s | "
+            f"Transcript:{seg.get('text', '').strip()[:120]}"
         )
         for i, seg in enumerate(clips_with_ids)
     )
@@ -1339,79 +1382,46 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 )
 
     system_prompt = (
-        "You are an AI video editor.\n"
-        "You are given clips with an index, a title, and a transcript excerpt.\n"
-        "Your task: convert the user's instruction into structured JSON edit actions.\n\n"
-        "CAPABILITIES:\n"
-        "- RENAME: Change clip names using name_clips\n"
-        "- DELETE CLIP: Remove an entire clip using cut\n"
-        "- DELETE TIME RANGE: Remove a specific time range using cut_time\n"
-        "- SPLIT: Divide a clip at a specific time using split\n"
-        "- MERGE: Combine two clips using merge\n"
-        "- SWAP: Reorder two clips using swap\n"
-        "- CHAPTERS BY NUMBER: Split into exact N chapters using N-1 split actions\n"
-        "- CHAPTERS BY TRANSCRIPT: Analyze transcript text to find topic boundaries and split there\n\n"
-        "NAMING RULES — CRITICAL:\n"
-        "- SPLIT / DIVIDE operations: DEFAULT to naming the resulting clips 'Clip 1', 'Clip 2', 'Clip 3'... (sequential numbers only).\n"
-        "  Do NOT use descriptive names when splitting UNLESS the user explicitly asks to 'rename' or use 'chapters' or 'chapter names'.\n"
-        "  If asked for chapters/names, use a 'name_clips' action AFTER splitting to give each part a descriptive title based on the transcript.\n"
-        "- RENAME operations: Use descriptive chapter names derived from the transcript content.\n"
-        "  When user says 'rename', 'give chapter names', 'chapters', 'name from transcript', 'title the clips' etc.,\n"
-        "  analyze the transcript text for each clip's time range and give a meaningful title.\n"
-        "  Example: 'Introduction', 'Main Topic', 'Conclusion', 'Product Demo', etc.\n"
-        "- If no transcript is available for rename: use 'Chapter 1', 'Chapter 2'...\n\n"
-        "TRANSCRIPT-BASED CHAPTER DETECTION:\n"
-        "- When user says 'identify chapters from transcript' or 'create chapters based on content':\n"
-        "  1. Read the transcript text carefully\n"
-        "  2. Find where topics change — look for transition phrases like 'now let's talk about', 'moving on', 'next', 'the second topic', 'chapter two', etc.\n"
-        "  3. Estimate the timestamp of each topic change based on its position in the transcript relative to total duration\n"
-        "  4. Use split actions at those timestamps\n"
-        "  5. Use name_clips with descriptive chapter names (if asked) or 'Clip 1', 'Clip 2'... (if just splitting)\n"
-        "- EXAMPLE: If transcript is 600s long and 'Second topic' appears 40% through the text, split at 240s\n\n"
-        "CHAPTER DIVISION BY NUMBER:\n"
-        "- To create N chapters: use EXACTLY N-1 split actions\n"
-        "- For 6 chapters: 5 splits. For 7 chapters: 6 splits.\n"
-        "- Always use clip_index: 1 for all splits\n"
-        "- Use ABSOLUTE timestamps (seconds from video start)\n"
-        "- If transcript available: split at topic boundaries\n"
-        "- If no transcript: split at equal time intervals\n"
-        "- NEVER split within 5 seconds of clip end\n"
-        "- After splitting, use name_clips with sequential names: Clip 1, Clip 2, Clip 3...\n\n"
-        "DELETE TIME RANGE (REMOVES those seconds from the current timeline):\n"
-        "- 'delete the first 10 seconds' → cut_time {start: 0, end: 10}\n"
-        "- 'delete 10 to 20 seconds' → cut_time {start: 10, end: 20}\n"
-        "- 'delete 10 seconds of clip 1' → cut_time {start: clip1_timeline_start, end: clip1_timeline_start + 10}\n"
-        "- 'delete the last 20 seconds of clip 2' → cut_time {start: clip2_timeline_end - 20, end: clip2_timeline_end}\n"
-        "- CRITICAL: cut_time REMOVES the range. The remaining video plays without that section.\n"
-        "- CRITICAL: start and end for cut_time are TIMELINE seconds (see 'Timeline:' in segments).\n\n"
-        "DELETE FULL CLIP:\n"
-        "- 'delete clip 2' → cut {clip_index: 2}\n"
-        "- 'remove clip 3' → cut {clip_index: 3}\n\n"
-        "SPLIT (divides a clip into separate parts):\n"
-        "- 'split clip 1 at 10 seconds' → split {clip_index: 1, split_time: 10}\n"
-        "- 'split clip 1 at 1:30' → split {clip_index: 1, split_time: 90}\n"
-        "- 'split clip 1 into 2 parts' → split at midpoint of clip 1\n"
-        "- 'split clip 1 into 3 parts' → 2 split actions at 1/3 and 2/3 of clip 1\n"
-        "- For N parts: use N-1 split actions at equal intervals\n"
-        "- CRITICAL: split_time for split action should be the SOURCE time (see 'Source:' in segments).\n"
-        "- If user says 'split at 2:30', convert: 2*60+30 = 150\n\n"
-        "RENAME:\n"
-        "- 'rename clip 1 to Introduction' → name_clips [{index: 1, title: 'Introduction'}]\n"
-        "- 'name all clips' → name_clips with descriptive titles from transcript content\n"
-        "- 'rename clips with chapter names' → name_clips using transcript to create descriptive chapter titles\n"
-        "- 'name clips from transcript' → analyze transcript text for each clip's time range and give a descriptive title\n"
-        "- 'give chapter names' → name_clips with titles based on what each clip's transcript says\n\n"
-        "AVAILABLE ACTIONS:\n"
-        "- name_clips: {\"type\": \"name_clips\", \"clips\": [{\"index\": 1, \"title\": \"Title\"}]}\n"
-        "- cut:        {\"type\": \"cut\", \"clip_index\": <number>}\n"
-        "- cut_time:   {\"type\": \"cut_time\", \"start\": <seconds>, \"end\": <seconds>}\n"
-        "- split:      {\"type\": \"split\", \"clip_index\": 1, \"split_time\": <seconds>}\n"
-        "- merge:      {\"type\": \"merge\", \"clip_indexes\": [<number>, <number>]}\n"
-        "- swap:       {\"type\": \"swap\", \"clip_indexes\": [<number>, <number>]}\n"
-        "- keep:       {\"type\": \"keep\", \"clip_indexes\": [<number>]}\n\n"
-        "TIME PARSING: Convert MM:SS to seconds: 1:30 → 90, 2:05 → 125.\n\n"
-        "Return ONLY valid JSON. No explanation, no markdown, no code fences.\n"
-        f"CRITICAL: Currently {len(clips_with_ids)} clip(s) exist. Total duration: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
+        "You are an AI video editor. Convert instructions into JSON edit actions.\n\n"
+        "CLIP DATA: Each line shows Index. Title | Timeline:START-END | Source:START-END | Duration:Ds\n"
+        "- Source = timestamps in the ORIGINAL video file\n"
+        "- split_time MUST be a Source timestamp (absolute seconds from original video start)\n"
+        "- Timeline = position in the edited video (use for cut_time)\n\n"
+        "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n\n"
+        "SPLIT — CRITICAL EXAMPLES:\n"
+        "Clip 1: Source 0-60s\n"
+        "  'split at 10s' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
+        "  'first 10s and rest' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
+        "  'split into 3 equal parts' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":40}\n"
+        "  ]\n"
+        "  'split into 4 parts' → split_times: 15, 30, 45\n"
+        "  FORMULA for N parts of clip with Source S-E:\n"
+        "    split_times = [round(S + (E-S)*i/N, 2) for i in 1..N-1]\n"
+        "    Use clip_index: same number for ALL splits (engine finds sub-clips by timestamp)\n\n"
+        "Clip 2: Source 30-90s\n"
+        "  'split clip 2 at 10s from start' → split_time = 30+10 = 40\n"
+        "  'split clip 2 into first 20s and rest' → split_time = 30+20 = 50\n\n"
+        "DELETE TIME RANGE (timeline seconds):\n"
+        "  'delete first 10s of clip 1' → {\"type\":\"cut_time\",\"start\":clip1_tl_start,\"end\":clip1_tl_start+10}\n"
+        "  'delete last 20s of clip 2' → {\"type\":\"cut_time\",\"start\":clip2_tl_end-20,\"end\":clip2_tl_end}\n\n"
+        "DELETE CLIP: {\"type\":\"cut\",\"clip_index\":N}\n"
+        "RENAME: {\"type\":\"name_clips\",\"clips\":[{\"index\":N,\"title\":\"Name\"}]}\n"
+        "MERGE: {\"type\":\"merge\",\"clip_indexes\":[N,M]}\n"
+        "SWAP: {\"type\":\"swap\",\"clip_indexes\":[N,M]}\n\n"
+        "COMBINED COMMANDS — put all actions in one actions array:\n"
+        "  'split clip 1 at 10s and rename first part Intro' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":10},\n"
+        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"Intro\"},{\"index\":2,\"title\":\"Clip 2\"}]}\n"
+        "  ]\n"
+        "  'split into 3 parts and name them' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":T1},\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":T2},\n"
+        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"Part 1\"},{\"index\":2,\"title\":\"Part 2\"},{\"index\":3,\"title\":\"Part 3\"}]}\n"
+        "  ]\n\n"
+        "Return ONLY: {\"actions\":[...]}  No markdown, no explanation.\n"
+        f"Currently {len(clips_with_ids)} clip(s). Total: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
         + chapter_instruction
     )
 
@@ -1457,21 +1467,62 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 print(f"[edit-with-ai] Chapter division request detected, allowing AI to analyze content for splitting")
 
     user_message = (
-        f"Segments:\n{segments_text}\n\n"
-        f"User instruction: {body.prompt.strip()}\n\n"
-        f"Current state: {len(clips_with_ids)} clip(s) exist."
-        + (f"\nREMINDER: User wants EXACTLY {requested_chapters} chapters. Use EXACTLY {splits_needed} split actions." if requested_chapters else "")
+        f"Clips:\n{segments_text}\n\n"
+        f"Instruction: {body.prompt.strip()}\n\n"
+        f"State: {len(clips_with_ids)} clip(s). Total duration: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
+        + (f"\nREMINDER: produce EXACTLY {requested_chapters} parts using {splits_needed} split action(s)." if requested_chapters else "")
     )
 
     try:
         print(f"[edit-with-ai] calling GPT-4o-mini")
+
+        # ── PRE-PROCESSING: Inject computed split_times into the user message ──
+        # This prevents the AI from making arithmetic errors on split_time values.
+        import re as _re3
+        enhanced_prompt = body.prompt.strip()
+
+        # Pattern: "split clip N at Xs" or "split clip N into first Xs and rest"
+        split_at_match = _re3.search(
+            r'split\s+clip\s*(\d+)\s+(?:at|into\s+first)\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?',
+            enhanced_prompt, _re3.IGNORECASE
+        )
+        if split_at_match:
+            clip_num = int(split_at_match.group(1))
+            offset_s = float(split_at_match.group(2))
+            if clip_num <= len(clips_with_ids):
+                target = clips_with_ids[clip_num - 1]
+                src_start = float(target.get('start', 0))
+                computed_split = round(src_start + offset_s, 2)
+                enhanced_prompt += f"\n[COMPUTED: split_time for clip {clip_num} at {offset_s}s from start = {computed_split}]"
+
+        # Pattern: "split clip N into M parts/equal parts"
+        split_parts_match = _re3.search(
+            r'split\s+clip\s*(\d+)\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
+            enhanced_prompt, _re3.IGNORECASE
+        )
+        if split_parts_match and not split_at_match:
+            clip_num = int(split_parts_match.group(1))
+            n_parts  = int(split_parts_match.group(2))
+            if clip_num <= len(clips_with_ids) and n_parts >= 2:
+                target = clips_with_ids[clip_num - 1]
+                src_start = float(target.get('start', 0))
+                src_end   = float(target.get('end', 0))
+                split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
+                enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} parts → split_times: {split_pts}]"
+
+        user_message_final = (
+            f"Clips:\n{segments_text}\n\n"
+            f"Instruction: {enhanced_prompt}\n\n"
+            f"State: {len(clips_with_ids)} clip(s). Total: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
+            + (f"\nREMINDER: produce EXACTLY {requested_chapters} parts using {splits_needed} split action(s)." if requested_chapters else "")
+        )
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
+                {"role": "user", "content": user_message_final},
             ],
-            temperature=0.2,
+            temperature=0.1,
         )
         raw = response.choices[0].message.content.strip()
         print(f"[edit-with-ai] raw response: {raw}")
@@ -1589,6 +1640,37 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
         # ROBUSTNESS LAYER: Normalize timeline
         normalized_clips = _normalize_timeline(final_clips)
+
+        # ENFORCE NAMING:
+        # - If this was a pure divide/split with NO prior custom names → Clip 1, 2, 3...
+        # - If clips already had custom names (e.g. "Introduction") → preserve them,
+        #   only assign "Clip N" to newly created clips that have no name.
+        original_clip_count = len(clips_with_ids)
+        clips_were_split = len(normalized_clips) > original_clip_count
+
+        # Build a map of original custom names by clip id
+        original_names = {c.get('id'): (c.get('title') or c.get('name') or '') for c in clips_with_ids}
+        # Check if ANY original clip had a custom name (not just "Clip N")
+        import re as _re2
+        has_custom_names = any(
+            name and not _re2.match(r'^clip\s*\d+$', name.strip(), _re2.IGNORECASE)
+            for name in original_names.values()
+        )
+
+        if clips_were_split or requested_chapters is not None:
+            if has_custom_names:
+                # Preserve existing custom names; only fill in blanks with "Clip N"
+                for i, clip in enumerate(normalized_clips):
+                    existing = clip.get('title') or clip.get('name') or ''
+                    if not existing or _re2.match(r'^clip\s*\d+$', existing.strip(), _re2.IGNORECASE):
+                        clip['title'] = f'Clip {i + 1}'
+                        clip['name']  = f'Clip {i + 1}'
+            else:
+                # No custom names — force sequential Clip 1, 2, 3...
+                for i, clip in enumerate(normalized_clips):
+                    clip['title'] = f'Clip {i + 1}'
+                    clip['name']  = f'Clip {i + 1}'
+            print(f"[edit-with-ai] Names after enforcement: {[c['name'] for c in normalized_clips]}")
         
         # PRESERVE TRANSCRIPT: Ensure transcript data is maintained in final clips
         # Always map transcript from original if available, never lose it
@@ -1614,14 +1696,21 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                     clip['text'] = ' '.join(overlapping_text)
                     print(f"[edit-with-ai] Preserved transcript for clip {clip.get('id', '?')}: {len(clip['text'])} chars")
         
+        # FINAL NAMING PASS — only if no custom names at all
+        # (enforcement block above already handles the has_custom_names case)
+        if not has_custom_names and (len(normalized_clips) > len(clips_with_ids) or requested_chapters is not None):
+            for i, clip in enumerate(normalized_clips):
+                clip['title'] = f'Clip {i + 1}'
+                clip['name']  = f'Clip {i + 1}'
+
         # Build backward-compatible response with new fields
         enhanced_result = {
-            "actions": result["actions"],  # Keep original for backward compatibility
-            "clips": normalized_clips,      # NEW: Final authoritative clips with preserved transcripts
-            "operations": operations,       # NEW: Structured operations log
-            "warnings": warnings,           # NEW: Non-fatal issues
-            "transcript_preserved": original_transcript is not None,  # NEW: Indicates if transcript was preserved
-            "requires_retranscription": False  # NEW: Always false since we preserve original transcript
+            "actions": result["actions"],
+            "clips": normalized_clips,
+            "operations": operations,
+            "warnings": warnings,
+            "transcript_preserved": original_transcript is not None,
+            "requires_retranscription": False
         }
 
     except _json.JSONDecodeError as e:
@@ -2263,9 +2352,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                         clip_a["end"] = start + duration_a
                         clip_a["sourceStart"] = source_start
                         clip_a["sourceEnd"] = source_split_time
-                        # Leave title empty — name_clips action will set proper names
-                        clip_a["title"] = ""
-                        clip_a["name"] = ""
+                        # Inherit parent name — preserves custom names through splits
+                        clip_a["title"] = original_title
+                        clip_a["name"]  = original_title
 
                         clip_b = dict(clip_to_split)
                         clip_b["id"] = f"{clip_to_split.get('id', 'clip')}-B"
@@ -2273,8 +2362,8 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                         clip_b["end"] = start + duration_a + duration_b
                         clip_b["sourceStart"] = source_split_time
                         clip_b["sourceEnd"] = source_end
-                        clip_b["title"] = ""
-                        clip_b["name"] = ""
+                        clip_b["title"] = original_title
+                        clip_b["name"]  = original_title
                         
                         # Preserve external clip properties
                         if clip_to_split.get("externalId"):
@@ -2584,13 +2673,14 @@ def _normalize_timeline(clips: list) -> list:
         normalized_clip["end"]           = round(current_time + duration, 3)
         normalized_clip["duration"]      = round(duration, 3)
 
-        # Name: keep existing, or assign sequential
+        # Name: keep existing custom name, or assign sequential fallback
         existing_title = normalized_clip.get("title", "") or normalized_clip.get("name", "")
-        if not existing_title:
+        if existing_title:
+            normalized_clip["title"] = existing_title
+            normalized_clip["name"]  = existing_title
+        else:
             normalized_clip["title"] = f"Clip {i + 1}"
             normalized_clip["name"]  = f"Clip {i + 1}"
-        else:
-            normalized_clip["name"] = existing_title
 
         normalized_clips.append(normalized_clip)
         current_time += duration
@@ -2746,45 +2836,183 @@ async def build_composition(session_id: str, body: BuildCompositionRequest):
 @app.post("/api/videos/{session_id}/export-with-clips")
 async def export_with_clips(session_id: str, body: BuildCompositionRequest):
     """
-    Simplified export endpoint: accepts clips array, builds composition, renders video.
-    This is the main endpoint for exporting after AI editing.
-    Uses Remotion for rendering with automatic FFmpeg fallback.
+    Export endpoint: concatenates all timeline clips (original video + assets) using FFmpeg.
+    Each clip is extracted/downloaded separately then concatenated in order.
     """
-    import json as _json
+    import tempfile, httpx
     from datetime import datetime
-    
     timestamp = datetime.now().isoformat()
-    
-    # Enhanced debug logging
-    print("=" * 80)
-    print(f"[{timestamp}] [EXPORT] export-with-clips endpoint called")
-    print(f"[{timestamp}] [EXPORT] session_id: {session_id}")
-    print(f"[{timestamp}] [EXPORT] Number of clips: {len(body.clips)}")
-    print(f"[{timestamp}] [EXPORT] Clips data: {body.clips}")
-    print(f"[{timestamp}] [EXPORT] Options: {body.options}")
-    print("=" * 80)
-    
-    # Validate clips
-    if not body.clips or len(body.clips) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No clips provided. Please provide at least one clip with start and end times."
+
+    print(f"[{timestamp}] [export-with-clips] session_id={session_id}, clips={len(body.clips)}")
+
+    if not body.clips:
+        raise HTTPException(status_code=400, detail="No clips provided.")
+
+    # Resolve original video path
+    video_path = None
+    if session_id in session_store:
+        stored = Path(session_store[session_id])
+        if stored.exists():
+            video_path = stored
+    if video_path is None:
+        for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv"]:
+            candidate = UPLOAD_DIR / f"{session_id}{ext}"
+            if candidate.exists():
+                video_path = candidate
+                break
+    if video_path is None:
+        raise HTTPException(status_code=404, detail=f"Video file not found for session {session_id}")
+
+    temp_files = []
+    concat_list_path = UPLOAD_DIR / f"{session_id}_export_concat.txt"
+
+    try:
+        for i, clip in enumerate(body.clips):
+            asset_url = clip.get("assetUrl")
+            src_start  = float(clip.get("sourceStart", clip.get("start", 0)))
+            src_end    = float(clip.get("sourceEnd",   clip.get("end",   0)))
+            duration   = src_end - src_start
+
+            if duration <= 0:
+                print(f"[export-with-clips] Skipping clip {i+1} with zero duration")
+                continue
+
+            out_path = UPLOAD_DIR / f"{session_id}_export_clip_{i+1}.mp4"
+            temp_files.append(out_path)
+
+            if asset_url:
+                # Asset clip — download if external, or use local path
+                if asset_url.startswith("/api/"):
+                    # Local asset — serve directly via ffmpeg
+                    local_asset = None
+                    # Try to find the file
+                    if "ai-image" in asset_url:
+                        img_id = asset_url.split("/")[-1]
+                        local_asset = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
+                    elif "assets" in asset_url and "stream" in asset_url:
+                        asset_id = asset_url.split("/")[-2]
+                        for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp"]:
+                            candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
+                            if candidate.exists():
+                                local_asset = candidate
+                                break
+
+                    if local_asset and local_asset.exists():
+                        # Photo: create a video from the image (must re-encode)
+                        if local_asset.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                            result = subprocess.run([
+                                "ffmpeg", "-loop", "1", "-i", str(local_asset),
+                                "-t", str(duration), "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                        else:
+                            # Video asset — use stream copy for speed
+                            result = subprocess.run([
+                                "ffmpeg", "-i", str(local_asset), "-t", str(duration),
+                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                    else:
+                        # Skip unknown local asset
+                        print(f"[export-with-clips] Cannot find local asset for {asset_url}, skipping")
+                        temp_files.pop()
+                        continue
+                else:
+                    # External URL — download first
+                    print(f"[export-with-clips] Downloading asset: {asset_url[:80]}")
+                    try:
+                        async with httpx.AsyncClient(timeout=30.0) as hc:
+                            r = await hc.get(asset_url)
+                            r.raise_for_status()
+                            content = r.content
+                        dl_path = UPLOAD_DIR / f"{session_id}_asset_dl_{i+1}.tmp"
+                        dl_path.write_bytes(content)
+                        temp_files.append(dl_path)
+                        
+                        # Detect if it's an image or video by checking content
+                        is_image = dl_path.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"] or content[:8] == b'\xff\xd8\xff' or content[:4] == b'\x89PNG'
+                        
+                        if is_image:
+                            # Image: create video with ultrafast encoding
+                            result = subprocess.run([
+                                "ffmpeg", "-loop", "1", "-i", str(dl_path), "-t", str(duration),
+                                "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                        else:
+                            # Video: use stream copy for speed
+                            result = subprocess.run([
+                                "ffmpeg", "-i", str(dl_path), "-t", str(duration),
+                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                    except Exception as e:
+                        print(f"[export-with-clips] Failed to download asset: {e}, skipping")
+                        temp_files.pop()
+                        continue
+            else:
+                # Original video clip — use stream copy for speed (no re-encoding)
+                result = subprocess.run([
+                    "ffmpeg",
+                    "-ss", str(src_start), "-t", str(duration),
+                    "-i", str(video_path),
+                    "-c:v", "copy", "-c:a", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    "-y", str(out_path)
+                ], capture_output=True, text=True)
+
+            if result.returncode != 0:
+                print(f"[export-with-clips] ffmpeg error clip {i+1}: {result.stderr[-300:]}")
+                raise HTTPException(status_code=500, detail=f"Failed to process clip {i+1}: {result.stderr[-200:]}")
+
+            print(f"[export-with-clips] Clip {i+1} ready: {out_path}")
+
+        # Filter to only files that exist
+        valid_clips = [f for f in temp_files if f.exists() and str(f).endswith(".mp4")]
+
+        if not valid_clips:
+            raise HTTPException(status_code=400, detail="No clips could be processed for export.")
+
+        if len(valid_clips) == 1:
+            # Single clip — return directly
+            output_path = valid_clips[0]
+        else:
+            # Multiple clips — concatenate
+            with open(concat_list_path, 'w') as f:
+                for clip_file in valid_clips:
+                    escaped = str(clip_file.absolute()).replace('\\', '/')
+                    f.write(f"file '{escaped}'\n")
+
+            output_path = UPLOAD_DIR / f"{session_id}_export_final.mp4"
+            temp_files.append(output_path)
+
+            result = subprocess.run([
+                "ffmpeg", "-f", "concat", "-safe", "0",
+                "-i", str(concat_list_path),
+                "-c", "copy", "-y", str(output_path)
+            ], capture_output=True, text=True)
+
+            if result.returncode != 0:
+                print(f"[export-with-clips] concat error: {result.stderr[-300:]}")
+                raise HTTPException(status_code=500, detail=f"Failed to concatenate clips: {result.stderr[-200:]}")
+
+        print(f"[export-with-clips] Export complete: {output_path}")
+        return FileResponse(
+            str(output_path),
+            media_type="video/mp4",
+            filename=f"export-{session_id[:8]}.mp4"
         )
-    
-    # Step 1: Build composition from clips
-    print(f"[{timestamp}] [export-with-clips] Building composition...")
-    composition_response = await build_composition(session_id, body)
-    composition = _json.loads(composition_response.body)
-    
-    print(f"[{timestamp}] [export-with-clips] Composition built, starting render...")
-    
-    # Step 2: Export with Remotion
-    remotion_request = RemotionExportRequest(
-        composition=composition,
-        options=body.options
-    )
-    
-    return await export_video_remotion(session_id, remotion_request)
+
+    finally:
+        # Clean up temp files (except the final output which FileResponse will serve)
+        output_path_local = locals().get('output_path')
+        for f in temp_files:
+            try:
+                if f.exists() and f != output_path_local:
+                    f.unlink()
+            except Exception:
+                pass
+        if concat_list_path.exists():
+            try: concat_list_path.unlink()
+            except Exception: pass
 
 
 @app.post("/api/videos/{session_id}/export-remotion")
