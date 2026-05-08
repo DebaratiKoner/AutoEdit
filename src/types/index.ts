@@ -17,7 +17,9 @@ export interface TimelineSegment {
   color?: string;          // Permanent color for visual identification
   assetKind?: 'video' | 'photo' | 'audio'; // Type of asset if this is an imported asset
   assetUrl?: string;       // URL for imported assets
-  volume?: number;         // Volume level for audio tracks (0-2, default 1)
+  volume?: number;         // Volume level for audio tracks (0-1, default 1)
+  frequency?: number;      // Frequency/pitch adjustment for audio tracks (0.5-2.0, default 1)
+  originalDuration?: number; // Original file duration before trimming (for resize cap)
   segments?: Array<{       // For merged clips: array of source segments
     sourceStart: number;
     sourceEnd: number;
@@ -50,7 +52,7 @@ export type EditAction =
   | {
       type: 'FULL_SNAPSHOT';
       previousSnapshot: CompressedSnapshot;
-      actionType: 'CUT' | 'DELETE' | 'REORDER_DROP' | 'ADD_ASSET' | 'TRACK_DROP' | 'TIMELINE_DROP' | 'RESIZE' | 'AI_EDIT' | 'UNDO' | 'REDO' | 'REORDER' | 'VOLUME_CHANGE';
+      actionType: 'CUT' | 'DELETE' | 'REORDER_DROP' | 'ADD_ASSET' | 'TRACK_DROP' | 'TIMELINE_DROP' | 'RESIZE' | 'AI_EDIT' | 'UNDO' | 'REDO' | 'REORDER' | 'VOLUME_CHANGE' | 'FREQUENCY_CHANGE';
       details?: Record<string, any>;
     }
   | {
@@ -185,7 +187,12 @@ export interface CompositionSchema {
  */
 export interface ClipDefinition {
   id: string;
-  src: string;              // Video file URL or path
+  /**
+   * Media URL for this clip.
+   * - video clips: should be the original video (or proxied stream)
+   * - photo clips: should be an image URL
+   */
+  src: string;
   startFrom: number;        // Frame offset in composition
   durationInFrames: number; // Clip duration in frames
   sourceStart: number;      // Trim start in source video (seconds)
@@ -193,7 +200,9 @@ export interface ClipDefinition {
   volume: number;           // Audio volume (0-1)
   name?: string;            // Clip name
   order: number;            // Original timeline order
+  assetKind?: 'video' | 'photo' | 'audio'; // used by Remotion renderer
 }
+
 
 /**
  * Subtitle definition for Remotion overlay

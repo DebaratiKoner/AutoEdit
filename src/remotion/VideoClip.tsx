@@ -4,6 +4,7 @@
  */
 
 import { Sequence, OffthreadVideo, AbsoluteFill, interpolate, useCurrentFrame } from 'remotion';
+import { Img } from 'remotion';
 import type { ClipDefinition, TransitionConfig } from '../types';
 
 interface VideoClipProps {
@@ -20,16 +21,25 @@ export const VideoClip: React.FC<VideoClipProps> = ({ clip, transition, isLast }
     ? calculateOpacity(frame, clip.startFrom, clip.durationInFrames, transition.durationInFrames, isLast)
     : 1;
 
+  const assetKind = clip.assetKind ?? 'video';
+
   return (
     <Sequence from={clip.startFrom} durationInFrames={clip.durationInFrames}>
       <AbsoluteFill style={{ opacity }}>
-        <OffthreadVideo
-          src={clip.src}
-          startFrom={Math.floor(clip.sourceStart * 30)} // Convert seconds to frames (assuming 30fps source)
-          endAt={Math.floor(clip.sourceEnd * 30)}
-          volume={clip.volume}
-          style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-        />
+        {assetKind === 'photo' ? (
+          <Img
+            src={clip.src}
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          />
+        ) : (
+          <OffthreadVideo
+            src={clip.src}
+            startFrom={Math.floor(clip.sourceStart * 30)} // Convert seconds to frames (assuming 30fps source)
+            endAt={Math.floor(clip.sourceEnd * 30)}
+            volume={clip.volume}
+            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+          />
+        )}
       </AbsoluteFill>
     </Sequence>
   );

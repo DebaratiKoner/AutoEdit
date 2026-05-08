@@ -45,9 +45,14 @@ export class CompositionBuilder {
     for (const segment of sortedSegments) {
       const durationInFrames = Math.floor(segment.duration * fps);
 
+      const assetKind = segment.assetKind ?? (segment.assetUrl ? 'video' : 'video');
+      const src = assetKind === 'photo'
+        ? (segment.assetUrl || session.videoUrl)
+        : session.videoUrl;
+
       clips.push({
         id: segment.id,
-        src: session.videoUrl,
+        src,
         startFrom: cumulativeFrames,
         durationInFrames,
         sourceStart: segment.sourceStart,
@@ -55,6 +60,7 @@ export class CompositionBuilder {
         volume: 1.0,
         name: segment.name,
         order: segment.order,
+        assetKind,
       });
 
       cumulativeFrames += durationInFrames;

@@ -243,6 +243,61 @@ async def serve_ai_image(img_id: str):
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(str(img_path), media_type="image/jpeg")
 
+
+class GenerateAudioRequest(BaseModel):
+    text: str
+    voice: str = "alloy"  # alloy, echo, fable, onyx, nova, shimmer
+
+@app.post("/api/generate-audio")
+async def generate_audio(body: GenerateAudioRequest):
+    """Generate speech audio using OpenAI TTS from text."""
+    if not body.text or not body.text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+    if not client.api_key:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    try:
+        import uuid as _uuid
+        audio_id = str(_uuid.uuid4())[:8]
+        audio_path = UPLOAD_DIR / f"ai_audio_{audio_id}.mp3"
+
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice=body.voice,
+            input=body.text.strip(),
+        )
+        response.stream_to_file(str(audio_path))
+
+        # Get duration via ffprobe
+        duration = 5.0
+        try:
+            import json as _json
+            result = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "json", str(audio_path)
+            ], capture_output=True, text=True)
+            meta = _json.loads(result.stdout)
+            duration = float(meta.get("format", {}).get("duration", 5.0))
+        except Exception:
+            pass
+
+        return JSONResponse({
+            "url": f"/api/assets/ai-audio/{audio_id}",
+            "duration": round(duration, 2),
+            "text": body.text.strip(),
+            "voice": body.voice,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
+
+
+@app.get("/api/assets/ai-audio/{audio_id}")
+async def serve_ai_audio(audio_id: str):
+    """Serve a cached AI-generated audio file."""
+    audio_path = UPLOAD_DIR / f"ai_audio_{audio_id}.mp3"
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return FileResponse(str(audio_path), media_type="audio/mpeg")
+
 @app.get("/test-export")
 async def test_export_info():
     """
@@ -274,10 +329,12 @@ async def test_export_info():
 class TranscribeRequest(BaseModel):
     clips: Optional[list] = None  # Optional: if provided, only transcribe these clips
     quick: Optional[bool] = False  # If True, only transcribe first 90s for speed
-    
+
     class Config:
         # Allow None values explicitly
         validate_assignment = True
+class FastExportRequest(BaseModel):
+    timeline: list
 
 @app.get("/api/test/connection")
 async def test_connection():
@@ -770,7 +827,98 @@ async def transcribe_video(session_id: str, request: Request):
             status_code=500,
             detail=f"Transcription failed: {str(e)}"
         )
+class FastExportRequest(BaseModel):
+    timeline: list
 
+
+@app.post("/api/videos/{session_id}/fast-export")
+async def fast_export(session_id: str, body: FastExportRequest):
+
+    import uuid
+    import subprocess
+    from pathlib import Path
+
+    if session_id not in session_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    video_path = Path(session_store[session_id])
+
+    export_id = str(uuid.uuid4())[:8]
+
+    temp_dir = UPLOAD_DIR / f"export_{export_id}"
+    temp_dir.mkdir(exist_ok=True)
+
+    concat_file = temp_dir / "concat.txt"
+
+    clip_files = []
+
+    try:
+
+        # CUT ALL CLIPS
+        for i, clip in enumerate(body.timeline):
+
+            start = clip.get("sourceStart", 0)
+            duration = clip.get("duration", 0)
+
+            clip_path = temp_dir / f"clip_{i}.mp4"
+
+            subprocess.run([
+                "ffmpeg",
+
+                "-ss", str(start),
+
+                "-t", str(duration),
+
+                "-i", str(video_path),
+
+                "-c", "copy",
+
+                "-avoid_negative_ts", "1",
+
+                "-y",
+
+                str(clip_path)
+
+            ], check=True)
+
+            clip_files.append(clip_path)
+
+        # CONCAT FILE
+        with open(concat_file, "w", encoding="utf-8") as f:
+            for c in clip_files:
+                f.write(f"file '{c.absolute().as_posix()}'\n")
+
+        output_path = temp_dir / "final.mp4"
+
+        # JOIN CLIPS
+        subprocess.run([
+            "ffmpeg",
+
+            "-f", "concat",
+
+            "-safe", "0",
+
+            "-i", str(concat_file),
+
+            "-c", "copy",
+
+            "-movflags", "+faststart",
+
+            "-y",
+
+            str(output_path)
+
+        ], check=True)
+
+        return FileResponse(
+            path=str(output_path),
+            filename="export.mp4",
+            media_type="video/mp4"
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @app.post("/api/videos/upload")
 async def upload_video(file: UploadFile = File(...), session_id: Optional[str] = None):
     """
@@ -2838,8 +2986,10 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
     """
     Export endpoint: concatenates all timeline clips (original video + assets) using FFmpeg.
     Each clip is extracted/downloaded separately then concatenated in order.
+    Runs extraction in parallel using asyncio to dramatically speed up export.
+    Supports audio-only overlay clips by mixing them into the final video.
     """
-    import tempfile, httpx
+    import tempfile, httpx, asyncio
     from datetime import datetime
     timestamp = datetime.now().isoformat()
 
@@ -2847,6 +2997,8 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
 
     if not body.clips:
         raise HTTPException(status_code=400, detail="No clips provided.")
+
+    final_duration = max(float(clip.get("end", clip.get("start", 0))) for clip in body.clips)
 
     # Resolve original video path
     video_path = None
@@ -2865,117 +3017,175 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
 
     temp_files = []
     concat_list_path = UPLOAD_DIR / f"{session_id}_export_concat.txt"
+    audio_overlay_files = []
+    sem = asyncio.Semaphore(4)  # Limit concurrent ffmpeg jobs
 
-    try:
-        for i, clip in enumerate(body.clips):
+    def _resolve_proxy_url(asset_url: str) -> str:
+        if "/api/proxy-image?url=" in asset_url or "/api/proxy-video?url=" in asset_url:
+            from urllib.parse import unquote, urlparse, parse_qs
+            qs = parse_qs(urlparse(asset_url).query)
+            return unquote(qs.get("url", [asset_url])[0])
+        return asset_url
+
+    def _find_local_asset(actual_url: str):
+        if "ai-image" in actual_url:
+            img_id = actual_url.split("/")[-1]
+            return UPLOAD_DIR / f"ai_img_{img_id}.jpg"
+        if "assets" in actual_url and "stream" in actual_url:
+            asset_id = actual_url.split("/")[-2]
+            for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp", ".mp3", ".wav", ".m4a", ".ogg"]:
+                candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
+                if candidate.exists():
+                    return candidate
+        return None
+
+    async def _run_ffmpeg(command: list[str], i: int, context: str):
+        result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[export-with-clips] ffmpeg error {context} {i+1}: {result.stderr[-300:]}")
+            raise HTTPException(status_code=500, detail=f"Failed to process clip {i+1}: {result.stderr[-200:]}")
+        return result
+
+    async def _download_external_asset(url: str, path: Path) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as hc:
+                r = await hc.get(url)
+                r.raise_for_status()
+                path.write_bytes(r.content)
+            temp_files.append(path)
+            return True
+        except Exception as e:
+            print(f"[export-with-clips] Failed to download asset {url[:80]}: {e}")
+            return False
+
+    async def process_clip(i, clip):
+        async with sem:
             asset_url = clip.get("assetUrl")
-            src_start  = float(clip.get("sourceStart", clip.get("start", 0)))
-            src_end    = float(clip.get("sourceEnd",   clip.get("end",   0)))
-            duration   = src_end - src_start
+            asset_kind = clip.get("assetKind")
+            src_start = float(clip.get("sourceStart", clip.get("start", 0)))
+            src_end = float(clip.get("sourceEnd", clip.get("end", 0)))
+            duration = src_end - src_start
 
             if duration <= 0:
                 print(f"[export-with-clips] Skipping clip {i+1} with zero duration")
-                continue
+                return None
 
             out_path = UPLOAD_DIR / f"{session_id}_export_clip_{i+1}.mp4"
             temp_files.append(out_path)
 
             if asset_url:
-                # Asset clip — download if external, or use local path
-                if asset_url.startswith("/api/"):
-                    # Local asset — serve directly via ffmpeg
-                    local_asset = None
-                    # Try to find the file
-                    if "ai-image" in asset_url:
-                        img_id = asset_url.split("/")[-1]
-                        local_asset = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
-                    elif "assets" in asset_url and "stream" in asset_url:
-                        asset_id = asset_url.split("/")[-2]
-                        for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp"]:
-                            candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
-                            if candidate.exists():
-                                local_asset = candidate
-                                break
+                actual_url = _resolve_proxy_url(asset_url)
+                if actual_url.startswith("/api/"):
+                    local_asset = _find_local_asset(actual_url)
+                    if not local_asset or not local_asset.exists():
+                        print(f"[export-with-clips] Cannot find local asset for {actual_url}, skipping")
+                        return None
 
-                    if local_asset and local_asset.exists():
-                        # Photo: create a video from the image (must re-encode)
-                        if local_asset.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
-                            result = subprocess.run([
-                                "ffmpeg", "-loop", "1", "-i", str(local_asset),
-                                "-t", str(duration), "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
-                            ], capture_output=True, text=True)
-                        else:
-                            # Video asset — use stream copy for speed
-                            result = subprocess.run([
-                                "ffmpeg", "-i", str(local_asset), "-t", str(duration),
-                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
-                            ], capture_output=True, text=True)
+                    if asset_kind == 'audio':
+                        out_audio = UPLOAD_DIR / f"{session_id}_export_audio_{i+1}.wav"
+                        temp_files.append(out_audio)
+                        audio_overlay_files.append((out_audio, int(float(clip.get("start", 0)) * 1000)))
+                        await _run_ffmpeg([
+                            "ffmpeg", "-i", str(local_asset), "-ss", str(src_start), "-t", str(duration),
+                            "-vn", "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y", str(out_audio)
+                        ], i, "audio extract")
+                        return None
+
+                    if local_asset.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                        await _run_ffmpeg([
+                            "ffmpeg", "-loop", "1", "-i", str(local_asset),
+                            "-t", str(duration), "-r", "30",
+                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                        ], i, "image clip")
                     else:
-                        # Skip unknown local asset
-                        print(f"[export-with-clips] Cannot find local asset for {asset_url}, skipping")
-                        temp_files.pop()
-                        continue
+                        cmd = [
+                            "ffmpeg", "-ss", str(src_start), "-i", str(local_asset), "-t", str(duration),
+                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", str(out_path)
+                        ]
+                        await _run_ffmpeg(cmd, i, "local asset clip")
                 else:
-                    # External URL — download first
-                    print(f"[export-with-clips] Downloading asset: {asset_url[:80]}")
-                    try:
-                        async with httpx.AsyncClient(timeout=30.0) as hc:
-                            r = await hc.get(asset_url)
-                            r.raise_for_status()
-                            content = r.content
-                        dl_path = UPLOAD_DIR / f"{session_id}_asset_dl_{i+1}.tmp"
-                        dl_path.write_bytes(content)
-                        temp_files.append(dl_path)
-                        
-                        # Detect if it's an image or video by checking content
-                        is_image = dl_path.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"] or content[:8] == b'\xff\xd8\xff' or content[:4] == b'\x89PNG'
-                        
-                        if is_image:
-                            # Image: create video with ultrafast encoding
-                            result = subprocess.run([
-                                "ffmpeg", "-loop", "1", "-i", str(dl_path), "-t", str(duration),
-                                "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
-                            ], capture_output=True, text=True)
-                        else:
-                            # Video: use stream copy for speed
-                            result = subprocess.run([
-                                "ffmpeg", "-i", str(dl_path), "-t", str(duration),
-                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
-                            ], capture_output=True, text=True)
-                    except Exception as e:
-                        print(f"[export-with-clips] Failed to download asset: {e}, skipping")
-                        temp_files.pop()
-                        continue
-            else:
-                # Original video clip — use stream copy for speed (no re-encoding)
-                result = subprocess.run([
-                    "ffmpeg",
-                    "-ss", str(src_start), "-t", str(duration),
-                    "-i", str(video_path),
-                    "-c:v", "copy", "-c:a", "copy",
-                    "-avoid_negative_ts", "make_zero",
-                    "-y", str(out_path)
-                ], capture_output=True, text=True)
+                    print(f"[export-with-clips] Downloading external asset: {actual_url[:100]}")
+                    url_lower = actual_url.lower()
+                    is_image = (
+                        any(url_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]) 
+                        or url_lower.startswith("data:image/")
+                    )
+                    is_audio = any(url_lower.endswith(ext) for ext in [".mp3", ".ogg", ".wav", ".m4a"])
+                    dl_ext = ".jpg" if is_image else (".mp3" if is_audio else ".mp4")
+                    dl_path = UPLOAD_DIR / f"{session_id}_asset_dl_{i+1}{dl_ext}"
 
-            if result.returncode != 0:
-                print(f"[export-with-clips] ffmpeg error clip {i+1}: {result.stderr[-300:]}")
-                raise HTTPException(status_code=500, detail=f"Failed to process clip {i+1}: {result.stderr[-200:]}")
+                    if not await _download_external_asset(actual_url, dl_path):
+                        return None
+
+                    if asset_kind == 'audio' or is_audio:
+                        out_audio = UPLOAD_DIR / f"{session_id}_export_audio_{i+1}.wav"
+                        temp_files.append(out_audio)
+                        audio_overlay_files.append((out_audio, int(float(clip.get("start", 0)) * 1000)))
+                        await _run_ffmpeg([
+                            "ffmpeg", "-i", str(dl_path), "-ss", str(src_start), "-t", str(duration),
+                            "-vn", "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y", str(out_audio)
+                        ], i, "audio extract")
+                        return None
+
+                    if is_image:
+                        await _run_ffmpeg([
+                            "ffmpeg", "-loop", "1", "-i", str(dl_path),
+                            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                            "-t", str(duration),
+                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-b:a", "128k", "-shortest", "-y", str(out_path)
+                        ], i, "image clip")
+                    else:
+                        await _run_ffmpeg([
+                            "ffmpeg", "-ss", str(src_start), "-i", str(dl_path), "-t", str(duration),
+                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", str(out_path)
+                        ], i, "external asset clip")
+                
+            else:
+                await _run_ffmpeg([
+                    "ffmpeg",
+                    "-ss", str(src_start), "-i", str(video_path), "-t", str(duration),
+                    "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-avoid_negative_ts", "make_zero",
+                    "-movflags", "+faststart",
+                    "-y", str(out_path)
+                ], i, "original clip")
 
             print(f"[export-with-clips] Clip {i+1} ready: {out_path}")
+            return out_path
 
-        # Filter to only files that exist
-        valid_clips = [f for f in temp_files if f.exists() and str(f).endswith(".mp4")]
+    try:
+        tasks = [process_clip(i, clip) for i, clip in enumerate(body.clips)]
+        await asyncio.gather(*tasks)
 
-        if not valid_clips:
+        valid_clips = []
+        for i in range(len(body.clips)):
+            candidate = UPLOAD_DIR / f"{session_id}_export_clip_{i+1}.mp4"
+            if candidate.exists():
+                valid_clips.append(candidate)
+
+        output_path = None
+        if not valid_clips and not audio_overlay_files:
             raise HTTPException(status_code=400, detail="No clips could be processed for export.")
 
-        if len(valid_clips) == 1:
-            # Single clip — return directly
+        if not valid_clips:
+            output_path = UPLOAD_DIR / f"{session_id}_export_silent_video.mp4"
+            temp_files.append(output_path)
+            await _run_ffmpeg([
+                "ffmpeg", "-f", "lavfi", "-i", f"color=c=black:s=1920x1080:d={final_duration}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", str(output_path)
+            ], 0, "silent video")
+        elif len(valid_clips) == 1:
             output_path = valid_clips[0]
         else:
-            # Multiple clips — concatenate
             with open(concat_list_path, 'w') as f:
                 for clip_file in valid_clips:
                     escaped = str(clip_file.absolute()).replace('\\', '/')
@@ -2984,15 +3194,52 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
             output_path = UPLOAD_DIR / f"{session_id}_export_final.mp4"
             temp_files.append(output_path)
 
-            result = subprocess.run([
+            await _run_ffmpeg([
                 "ffmpeg", "-f", "concat", "-safe", "0",
                 "-i", str(concat_list_path),
                 "-c", "copy", "-y", str(output_path)
-            ], capture_output=True, text=True)
+            ], 0, "concat final video")
 
-            if result.returncode != 0:
-                print(f"[export-with-clips] concat error: {result.stderr[-300:]}")
-                raise HTTPException(status_code=500, detail=f"Failed to concatenate clips: {result.stderr[-200:]}")
+        if audio_overlay_files:
+            overlay_audio_path = UPLOAD_DIR / f"{session_id}_export_audio_overlay.wav"
+            temp_files.append(overlay_audio_path)
+
+            if len(audio_overlay_files) == 1:
+                file_path, delay_ms = audio_overlay_files[0]
+                await _run_ffmpeg([
+                    "ffmpeg", "-i", str(file_path),
+                    "-af", f"adelay={delay_ms}|{delay_ms}",
+                    "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y", str(overlay_audio_path)
+                ], 0, "audio delay")
+            else:
+                cmd = ["ffmpeg", "-y"]
+                for file_path, _ in audio_overlay_files:
+                    cmd.extend(["-i", str(file_path)])
+
+                filter_complex = ""
+                for idx, (_, delay_ms) in enumerate(audio_overlay_files):
+                    filter_complex += f"[{idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}];"
+                filter_complex += ''.join(f"[a{idx}]" for idx in range(len(audio_overlay_files)))
+                filter_complex += f"amix=inputs={len(audio_overlay_files)}:duration=longest:dropout_transition=2[aout]"
+                cmd.extend(["-filter_complex", filter_complex, "-map", "[aout]", "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", str(overlay_audio_path)])
+                await _run_ffmpeg(cmd, 0, "audio mix")
+
+            mixed_path = UPLOAD_DIR / f"{session_id}_export_mixed.mp4"
+            temp_files.append(mixed_path)
+
+            if valid_clips:
+                await _run_ffmpeg([
+                    "ffmpeg", "-i", str(output_path), "-i", str(overlay_audio_path),
+                    "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
+                    "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-y", str(mixed_path)
+                ], 0, "mix overlay audio")
+            else:
+                await _run_ffmpeg([
+                    "ffmpeg", "-i", str(output_path), "-i", str(overlay_audio_path),
+                    "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-y", str(mixed_path)
+                ], 0, "attach overlay audio")
+
+            output_path = mixed_path
 
         print(f"[export-with-clips] Export complete: {output_path}")
         return FileResponse(
@@ -3002,7 +3249,6 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
         )
 
     finally:
-        # Clean up temp files (except the final output which FileResponse will serve)
         output_path_local = locals().get('output_path')
         for f in temp_files:
             try:
@@ -3271,9 +3517,15 @@ async def _export_video_ffmpeg_fallback(session_id: str, composition: dict):
                 source_start = clip.get("sourceStart", 0)
                 source_end = clip.get("sourceEnd", 0)
                 
+                src = str(clip.get("src", ""))
+                is_asset = "proxy" in src or "asset" in src
+                
                 clips.append({
+                    "sourceStart": source_start,
+                    "sourceEnd": source_end,
                     "start": source_start,
-                    "end": source_end
+                    "end": source_end,
+                    "assetUrl": src if is_asset else None
                 })
                 print(f"[ffmpeg-fallback] Regular clip: {source_start}-{source_end}")
             else:
@@ -3284,9 +3536,164 @@ async def _export_video_ffmpeg_fallback(session_id: str, composition: dict):
     
     print(f"[ffmpeg-fallback] Converted {len(clips)} clips, calling FFmpeg export")
     
-    # Use existing FFmpeg export logic
-    export_request = ExportRequest(clips=clips)
-    return await export_video(session_id, export_request)
+    # Use fallback export with clips to properly handle assets
+    export_request = BuildCompositionRequest(clips=clips)
+    return await export_with_clips(session_id, export_request)
+
+
+# ------------------------------
+# FAST EXPORT (cached)
+# ------------------------------
+
+class FastExportRequest(BaseModel):
+    timeline: list
+
+
+@app.post("/api/videos/{session_id}/export-fast")
+async def export_fast(session_id: str, body: FastExportRequest):
+    """Fast cached export endpoint.
+
+    - Uses an ultrafast ffmpeg encode per segment, then concatenates.
+    - Caches the resulting mp4 keyed by session_id + ordered timeline.
+    - On cache hit, returns the mp4 immediately.
+
+    NOTE: First export after edits may take longer; subsequent exports for the same timeline are instant.
+    """
+    from pathlib import Path as _Path
+    import hashlib as _hashlib
+    import json as _json
+    import uuid as _uuid
+    import subprocess as _subprocess
+
+    # Resolve session -> original video file
+    if session_id not in session_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    video_path = _Path(session_store[session_id])
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    timeline = getattr(body, "timeline", None) or []
+
+    def _export_signature(_session_id: str, _timeline: list[dict]) -> str:
+        normalized: list[dict] = []
+        for i, clip in enumerate(_timeline or []):
+            start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
+            duration = clip.get("duration")
+            end = clip.get("end")
+            if duration is None and end is not None:
+                duration = float(end) - start
+            if duration is None:
+                duration = float(clip.get("duration", 0) or 0)
+            normalized.append({"i": i, "start": round(start, 3), "duration": round(float(duration), 3)})
+        material = {"session_id": _session_id, "timeline": normalized}
+        return _hashlib.md5(_json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+    signature = _export_signature(session_id, timeline)
+
+    export_dir = UPLOAD_DIR / "export_cache"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    output_path = export_dir / f"{session_id}_{signature}.mp4"
+
+    if output_path.exists() and output_path.stat().st_size > 1024 * 1024:
+        return FileResponse(
+            path=str(output_path),
+            filename=f"edited-{session_id[:8]}.mp4",
+            media_type="video/mp4",
+        )
+
+    export_id = str(_uuid.uuid4())[:8]
+    temp_dir = UPLOAD_DIR / f"export_{export_id}"
+    temp_dir.mkdir(exist_ok=True)
+
+    concat_file = temp_dir / "concat.txt"
+    clip_files: list[_Path] = []
+
+    try:
+        for i, clip in enumerate(timeline):
+            start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
+
+            duration = clip.get("duration")
+            end = clip.get("end")
+            if duration is None and end is not None:
+                duration = float(end) - start
+            if duration is None:
+                duration = float(clip.get("duration", 0) or 0)
+
+            duration = float(duration or 0)
+            if duration <= 0.05:
+                continue
+
+            clip_path = temp_dir / f"clip_{i}.mp4"
+            clip_files.append(clip_path)
+
+            # Encode each segment fast; this is the performance-critical path
+            cmd = [
+                "ffmpeg",
+                "-ss", str(start),
+                "-t", str(duration),
+                "-i", str(video_path),
+                "-vf",
+                "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "96k",
+                "-ar", "44100",
+                "-ac", "2",
+                "-movflags", "+faststart",
+                "-y",
+                str(clip_path),
+            ]
+            _subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        if not clip_files:
+            raise HTTPException(status_code=400, detail="No valid clips to export")
+
+        with open(concat_file, "w", encoding="utf-8") as f:
+            for c in clip_files:
+                f.write(f"file '{c.absolute().as_posix()}'\n")
+
+        tmp_final = temp_dir / "final.mp4"
+        _subprocess.run(
+            [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                "-y",
+                str(tmp_final),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        tmp_final.replace(output_path)
+
+        return FileResponse(
+            path=str(output_path),
+            filename=f"edited-{session_id[:8]}.mp4",
+            media_type="video/mp4",
+        )
+
+    except _subprocess.CalledProcessError as e:
+        err = e.stderr[-300:] if e.stderr else str(e)
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {err}")
+
+    finally:
+        # best-effort cleanup
+        try:
+            for p in temp_dir.glob("*.mp4"):
+                p.unlink(missing_ok=True)
+            for p in temp_dir.glob("*.txt"):
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @app.post("/api/videos/{session_id}/export")

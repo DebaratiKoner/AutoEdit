@@ -1,4 +1,4 @@
-  /**
+/**
  * Editor Page Component
  * Main editing interface with video player, timeline, and controls
  */
@@ -48,6 +48,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [showTranscript, setShowTranscript] = useState(true);
   const [isAiEditing, setIsAiEditing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [globalVolume, setGlobalVolume] = useState(1); // Global audio volume control (0-1) - only affects audio tracks
   const [aiPrompt, setAiPrompt] = useState('');
   const [chatHistory, setChatHistory] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
 
@@ -120,6 +121,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const isJumpingRef = useRef<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetVideoRef = useRef<HTMLVideoElement>(null);  // dedicated element for asset clips
+  const audioRef = useRef<HTMLAudioElement>(null);       // dedicated element for track-1 audio
+  const audioSrcRef = useRef<string>('');                // tracks current audio src
+  const audioCtxRef = useRef<AudioContext | null>(null); // Web Audio context for gain > 1
+  const gainNodeRef = useRef<GainNode | null>(null);     // GainNode for volume > 100%
   const timelineRef = useRef<HTMLDivElement>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<SessionData | null>(null);
@@ -132,6 +137,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const systemActionRef = useRef<boolean>(false);
   const isPlayingRef = useRef<boolean>(false);
   const photoElapsedRef = useRef<number>(0);
+  const photoStartTimeRef = useRef<number>(0); // performance.now() when photo started playing
 
   const snapshotImgRef = useRef<HTMLImageElement>(null);
 
@@ -148,7 +154,11 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       const data = await res.json();
 
       const isAudio = data.assetType === 'audio' || file.type.startsWith('audio/');
-      const assetDuration = data.assetType === 'video' ? (data.duration || 5) : 5;
+      const assetDuration = data.assetType === 'audio'
+        ? (data.duration || 300)
+        : data.assetType === 'photo'
+          ? (data.duration || 1)
+          : (data.duration || 3);
       const assetUrl = data.assetUrl || `/api/assets/${data.assetId}/stream`;
 
       if (isAudio) {
@@ -162,7 +172,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           duration: assetDuration, timelineStart: insertAt,
           sourceStart: 0, sourceEnd: assetDuration,
           order: session.timeline.filter(s => s.track === 1).length,
-          track: 1, color: getAssetColor('audio'), volume: 1,
+          track: 1, color: getAssetColor('audio'), volume: 1, originalDuration: assetDuration,
         };
         // Phase 4.14: Capture FULL session snapshot BEFORE mutation
         const previousSnapshot = saveFullSessionSnapshot(session);
@@ -192,7 +202,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       };
 
       if (insertAfterClipIdRef.current) {
+        // Per-clip Insert button was clicked — insert after that specific clip
         const i = track0Segs.findIndex(s => s.id === insertAfterClipIdRef.current);
+        const idx = i >= 0 ? i : track0Segs.length - 1;
+        newTrack0 = [
+          ...track0Segs.slice(0, idx + 1),
+          newSeg,
+          ...track0Segs.slice(idx + 1),
+        ];
+      } else if (selectedSegmentId) {
+        // A clip is selected in the sidebar — insert after it
+        const i = track0Segs.findIndex(s => s.id === selectedSegmentId);
         const idx = i >= 0 ? i : track0Segs.length - 1;
         newTrack0 = [
           ...track0Segs.slice(0, idx + 1),
@@ -616,6 +636,118 @@ function getShortName(name: string | undefined | null, fallback: string) {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory, isAiEditing]);
 
+  // ── Track-1 audio sync with Web Audio GainNode (allows volume > 100%) ──────
+  useEffect(() => {
+    const au = audioRef.current;
+    const video = videoRef.current;
+    if (!au || !session) return;
+
+    const audioClips = session.timeline
+      .filter(s => s.track === 1 && s.assetKind === 'audio' && s.assetUrl)
+      .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0));
+
+    const activeAudio = audioClips.find(
+      s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + s.duration
+    );
+
+    if (activeAudio && activeAudio.assetUrl) {
+      const offsetInClip = currentTime - (activeAudio.timelineStart ?? 0);
+      // vol is 0-5: 1 = 100%, 2 = 200%, etc.
+      const vol = Math.max(0, activeAudio.volume ?? 1);
+      // freq is 0.5-2.0: 1 = normal pitch, 0.5 = half speed/pitch, 2.0 = double speed/pitch
+      const freq = Math.max(0.5, Math.min(2.0, activeAudio.frequency ?? 1));
+
+      // Set up Web Audio GainNode on first use (allows gain > 1.0)
+      if (!audioCtxRef.current) {
+        try {
+          const ctx = new AudioContext();
+          const gain = ctx.createGain();
+          const src = ctx.createMediaElementSource(au);
+          src.connect(gain);
+          gain.connect(ctx.destination);
+          audioCtxRef.current = ctx;
+          gainNodeRef.current = gain;
+        } catch(e) { /* fallback to native volume */ }
+      }
+
+      // Apply gain
+      // Map UI volume (0..5) to a perceptually stronger loudness curve.
+      // Humans perceive loudness roughly non-linearly, so linear scaling can feel weak.
+      //
+      // We use an exponential curve with a bit of headroom to keep 100% reasonable
+      // while making 200-500% clearly audible.
+      if (gainNodeRef.current) {
+        // volEffective: 0..5 (includes per-clip + global)
+        const volEffective = Math.max(0, vol * globalVolume);
+
+        // Loudness curve:
+        // - keep vol=1 near 1.0 gain
+        // - amplify higher values aggressively
+        // This yields: 2x -> ~2.7x, 3x -> ~6.0x, 5x -> ~18x (subject to source headroom)
+        const gain = Math.pow(volEffective, 2.1);
+
+        // Prevent totally unusable distortion while still being “very loud”
+        const clampedGain = Math.min(18, gain);
+
+        gainNodeRef.current.gain.value = clampedGain;
+        au.volume = 1; // keep media element normalized; WebAudio does the real gain
+      } else {
+        // Fallback (no WebAudio): native volume is 0..1 so we can’t exceed it.
+        // Still try to make changes obvious.
+        const volEffective = Math.max(0, vol * globalVolume);
+        au.volume = Math.min(1, Math.pow(volEffective, 1.5));
+      }
+
+      // Apply frequency/pitch adjustment using playbackRate
+      au.playbackRate = freq;
+
+      // Duck video volume so track 1 audio overpowers it
+      if (video) {
+        const volEffective = Math.max(0, vol * globalVolume);
+        video.volume = Math.max(0.05, 1 - (volEffective * 0.4));
+      }
+
+      if (audioSrcRef.current !== activeAudio.assetUrl) {
+        au.src = activeAudio.assetUrl;
+        audioSrcRef.current = activeAudio.assetUrl;
+        au.load();
+        if (audioCtxRef.current?.state === 'suspended') {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+      }
+      if (Math.abs(au.currentTime - offsetInClip) > 0.3) {
+        au.currentTime = Math.max(0, offsetInClip);
+      }
+      if (isPlaying && au.paused) {
+        if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume().catch(() => {});
+        au.play().catch(() => {});
+      } else if (!isPlaying && !au.paused) {
+        au.pause();
+      }
+    } else {
+      if (!au.paused) au.pause();
+      if (audioSrcRef.current) { au.src = ''; audioSrcRef.current = ''; }
+      if (video) video.volume = 1;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime, isPlaying, session?.timeline, globalVolume]);
+
+  // Pre-load the next asset video clip so transitions are instant
+  useEffect(() => {
+    if (!session || !assetVideoRef.current) return;
+    const av = assetVideoRef.current;
+    const sorted = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+    // Find the next asset video clip after the current position
+    const nextAsset = sorted.find((s, i) => i >= currentClipIndexRef.current && s.assetKind === 'video' && s.assetUrl);
+    if (nextAsset?.assetUrl && assetSrcRef.current !== nextAsset.assetUrl && assetVideoOpacity === 0) {
+      // Pre-load silently in background
+      av.src = nextAsset.assetUrl;
+      assetSrcRef.current = nextAsset.assetUrl;
+      av.load();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.timeline]);
+
   // Track which asset clip is currently active — based on clip index, not raw video time
   // This fires whenever currentTime changes (every RAF frame during playback)
   useEffect(() => {
@@ -701,6 +833,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         setActiveAssetClip(clip);
         setAssetVideoOpacity(0);
         photoElapsedRef.current = offset;
+        photoStartTimeRef.current = performance.now();
         isSwitchingRef.current = false;
         isJumpingRef.current = false;
         if (shouldPlay) {
@@ -721,6 +854,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
           assetSrcRef.current = clip.assetUrl;
         }
         av.currentTime = offset;
+        av.volume = 1;
         setAssetVideoOpacity(1);
         isSwitchingRef.current = false;
         isJumpingRef.current = false;
@@ -780,27 +914,35 @@ function getShortName(name: string | undefined | null, fallback: string) {
       if (!clip) return;
 
       if (clip.assetKind === 'photo') {
+        // Update currentTime during photo display so the scrubber moves
+        if (isPlayingRef.current) {
+          const wallElapsed = (performance.now() - photoStartTimeRef.current) / 1000;
+          const elapsed = photoElapsedRef.current + wallElapsed;
+          const photoTime = Math.min(elapsed, clip.duration);
+          setCurrentTime((clip.timelineStart ?? 0) + photoTime);
+        }
         rafId = requestAnimationFrame(rafLoop);
         return;
       }
 
-      if (clip.assetUrl && clip.assetKind === 'video' && av && !av.paused) {
+      if (clip.assetUrl && clip.assetKind === 'video' && av) {
+        // Always update currentTime from asset video position (even if briefly paused during buffering)
         const t = av.currentTime;
         setCurrentTime((clip.timelineStart ?? 0) + t);
-        if (t >= clip.duration - EPS) advanceToNextClip(isPlayingRef.current);
-        else rafId = requestAnimationFrame(rafLoop);
+        if (!av.paused && t >= clip.duration - EPS) advanceToNextClip(isPlayingRef.current);
+        // Always keep rAF running for asset video
+        rafId = requestAnimationFrame(rafLoop);
         return;
       }
 
       if (video && !video.paused) {
         const sourceOffset = video.currentTime - (clip.sourceStart ?? 0);
-        setCurrentTime((clip.timelineStart ?? 0) + sourceOffset);
+        setCurrentTime((clip.timelineStart ?? 0) + Math.max(0, sourceOffset));
         const clipEnd = (clip.sourceStart ?? 0) + clip.duration;
         if (video.currentTime >= clipEnd - EPS) advanceToNextClip(isPlayingRef.current);
-        else rafId = requestAnimationFrame(rafLoop);
-      } else {
-        rafId = requestAnimationFrame(rafLoop);
       }
+      // Always keep rAF running so red line stays in sync
+      rafId = requestAnimationFrame(rafLoop);
     };
 
     const handleUnifiedPlay = () => {
@@ -817,6 +959,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       } else if (clip?.assetKind === 'photo') {
         const offset = photoElapsedRef.current;
         const remaining = clip.duration - offset;
+        photoStartTimeRef.current = performance.now(); // reset wall-clock start
         photoTimerRef.current = setTimeout(() => advanceToNextClip(true), remaining * 1000);
       } else if (video) {
         video.play().catch(() => {});
@@ -836,20 +979,37 @@ function getShortName(name: string | undefined | null, fallback: string) {
       rafRunning = false;
       cancelAnimationFrame(rafId);
       clearPhotoTimer();
-      
+      // Save elapsed time for photo so resume works correctly
+      const clip = sortedClips[currentClipIndexRef.current];
+      if (clip?.assetKind === 'photo') {
+        photoElapsedRef.current += (performance.now() - photoStartTimeRef.current) / 1000;
+      }
       if (video && !video.paused) video.pause();
       if (av && !av.paused) av.pause();
     };
 
+    const handleAssetPlay = () => {
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      if (!rafRunning) {
+        rafRunning = true;
+        rafId = requestAnimationFrame(rafLoop);
+      }
+    };
+
+    const handleAssetPause = () => {
+      // Don't stop rAF on asset pause — it may be a brief buffer pause
+    };
+
     video?.addEventListener('play', handleUnifiedPlay);
     video?.addEventListener('pause', handleUnifiedPause);
+    av?.addEventListener('play', handleAssetPlay);
+    av?.addEventListener('pause', handleAssetPause);
     av?.addEventListener('ended', () => advanceToNextClip(isPlayingRef.current));
 
-    // Initial RAF if playing
-    if (!video?.paused || isPlayingRef.current) {
-      rafRunning = true;
-      rafId = requestAnimationFrame(rafLoop);
-    }
+    // Always start rAF loop — it self-throttles when paused
+    rafRunning = true;
+    rafId = requestAnimationFrame(rafLoop);
 
     return () => {
       rafRunning = false;
@@ -857,6 +1017,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
       clearPhotoTimer();
       video?.removeEventListener('play', handleUnifiedPlay);
       video?.removeEventListener('pause', handleUnifiedPause);
+      av?.removeEventListener('play', handleAssetPlay);
+      av?.removeEventListener('pause', handleAssetPause);
       av?.removeEventListener('ended', () => advanceToNextClip(isPlayingRef.current));
     };
   }, [session?.timeline]);
@@ -952,8 +1114,16 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
     if (isDraggingPlayhead && videoRef.current) {
       const mouseX = e.clientX - rect.left;
-      const percentage = Math.max(0, Math.min(1, mouseX / rect.width));
-      const newTime = percentage * totalDur;
+      // Use scroll offset + pixel container width for accurate position
+      const MIN_PX_PER_SEC = 1.5;
+      const MIN_CLIP_PX = 35;
+      const totalPx = Math.max(
+        track0Segments.reduce((sum, s) => sum + Math.max(MIN_CLIP_PX, s.duration * MIN_PX_PER_SEC), 0),
+        200
+      );
+      const scrollLeft = timelineRef.current?.scrollLeft ?? 0;
+      const clickPx = Math.max(0, Math.min(totalPx, mouseX + scrollLeft));
+      const newTime = (clickPx / totalPx) * totalDur;
       
       setCurrentTime(newTime);
       void jumpToTimelineTime(newTime, sessionRef.current, true);
@@ -962,28 +1132,68 @@ function getShortName(name: string | undefined | null, fallback: string) {
     if (resizingSegmentId && resizeType) {
       const session = sessionRef.current;
       const deltaX = e.clientX - resizeInitialX;
-      const deltaTime = (deltaX / rect.width) * totalDur;
-      
+      const MIN_PX_PER_SEC = 4;
+      const MIN_CLIP_PX = 80;
+      const track0Segs = session.timeline.filter(s => s.track === 0);
+      const totalDurLocal = track0Segs.reduce((sum, s) => sum + s.duration, 0) || 1;
+      const totalPxLocal = Math.max(
+        track0Segs.reduce((sum, s) => sum + Math.max(MIN_CLIP_PX, s.duration * MIN_PX_PER_SEC), 0),
+        400
+      );
+      const deltaTime = (deltaX / totalPxLocal) * totalDurLocal;
+
+      const seg = session.timeline.find(s => s.id === resizingSegmentId);
+      // Max = original file duration so you can't exceed it
+      const maxDuration = seg?.assetKind === 'audio'
+        ? (seg.originalDuration && seg.originalDuration > 0 ? seg.originalDuration : totalDurLocal)
+        : (seg?.originalDuration ?? ((seg?.sourceEnd ?? 0) - (seg?.sourceStart ?? 0)));
+
       let newStart = resizeInitialStart;
       let newDuration = resizeInitialDuration;
-      
+
       if (resizeType === 'left') {
+        // Left handle moves the segment start, which changes duration = initialDuration - deltaMoved
         newStart = Math.max(0, resizeInitialStart + deltaTime);
         const effectiveDelta = newStart - resizeInitialStart;
         newDuration = Math.max(0.5, resizeInitialDuration - effectiveDelta);
-        if (newDuration === 0.5) {
-          newStart = resizeInitialStart + (resizeInitialDuration - 0.5);
+
+        // Clamp duration to originalDuration (no extension beyond original)
+        if (maxDuration > 0) {
+          newDuration = Math.min(maxDuration, newDuration);
         }
+
+        // If duration got clamped, recompute start so duration/timelineStart remain consistent.
+        // (timelineStart should shift right when duration is reduced)
+        newStart = resizeInitialStart + (resizeInitialDuration - newDuration);
       } else {
+        // Right handle: duration changes, start stays constant.
         newDuration = Math.max(0.5, resizeInitialDuration + deltaTime);
+        if (maxDuration > 0) newDuration = Math.min(maxDuration, newDuration);
       }
-      
-      const updatedTimeline = session.timeline.map(seg => 
-        seg.id === resizingSegmentId 
-          ? { ...seg, timelineStart: newStart, duration: newDuration, sourceEnd: (seg.sourceStart ?? 0) + newDuration } 
-          : seg
-      );
-      
+
+      const updatedTimeline = session.timeline.map(s => {
+        if (s.id !== resizingSegmentId) return s;
+
+        const updated: typeof s = { ...s, timelineStart: newStart, duration: newDuration };
+
+        if (s.assetKind === 'audio') {
+          updated.duration = newDuration;
+
+          if (resizeType === 'left') {
+            updated.sourceStart = Math.max(0, (s.sourceStart ?? 0) + (resizeInitialDuration - newDuration));
+            updated.sourceEnd = updated.sourceStart + newDuration;
+          } else {
+            const currentSourceStart = s.sourceStart ?? 0;
+            updated.sourceStart = currentSourceStart;
+            updated.sourceEnd = currentSourceStart + newDuration;
+          }
+        } else {
+          updated.sourceEnd = (s.sourceStart ?? 0) + newDuration;
+        }
+
+        return updated;
+      });
+
       setSession({ ...session, timeline: updatedTimeline });
     }
   };
@@ -1030,8 +1240,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
     if (sorted.length === 0) return;
 
     const clampedTime = Math.max(0, Math.min(timelineTime, sorted.reduce((sum, seg) => sum + seg.duration, 0)));
+    // Prefer the clip that STARTS at or after clampedTime over one that ends exactly at clampedTime
     const segmentIndex = sorted.findIndex(
-      seg => clampedTime >= (seg.timelineStart ?? 0) && clampedTime <= (seg.timelineStart ?? 0) + seg.duration
+      seg => clampedTime >= (seg.timelineStart ?? 0) && clampedTime < (seg.timelineStart ?? 0) + seg.duration
     );
     const targetIndex = segmentIndex >= 0 ? segmentIndex : sorted.length - 1;
     const segment = sorted[targetIndex];
@@ -1040,6 +1251,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     currentClipIndexRef.current = targetIndex;
     setSelectedSegmentId(segment.id);
     setCurrentTime((segment.timelineStart ?? 0) + offset);
+    isJumpingRef.current = true; // prevent rAF from overwriting currentTime during seek
 
     if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
 
@@ -1050,6 +1262,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       setAssetVideoOpacity(0);
       setPhotoOverlay({ url: getAssetPreviewUrl(segment.assetUrl), name: segment.name ?? 'Photo' });
       setActiveAssetClip(segment);
+      isJumpingRef.current = false;
       return;
     }
 
@@ -1062,16 +1275,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
       if (assetSrcRef.current !== segment.assetUrl) {
         av.src = segment.assetUrl;
         assetSrcRef.current = segment.assetUrl;
-        av.load();
-        await new Promise<void>(resolve => {
-          const onMeta = () => { av.removeEventListener('loadedmetadata', onMeta); resolve(); };
-          av.addEventListener('loadedmetadata', onMeta);
-          setTimeout(() => { av.removeEventListener('loadedmetadata', onMeta); resolve(); }, 2000);
-        });
       }
       av.currentTime = offset;
       setAssetVideoOpacity(1);
-      if (wasPlaying) { av.play().catch(() => {}); setIsPlaying(true); }
+      isJumpingRef.current = false;
+      if (wasPlaying) { av.play().catch(() => {}); setIsPlaying(true); isPlayingRef.current = true; }
       return;
     }
 
@@ -1083,18 +1291,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
     const targetTime = (segment.sourceStart ?? 0) + offset;
     const wasPlaying = !isScrubbing && !video.paused;
-    video.pause();
-    try {
-      video.currentTime = targetTime;
-      await new Promise<void>(resolve => {
-        const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
-        video.addEventListener('seeked', onSeeked);
-        setTimeout(() => { video.removeEventListener('seeked', onSeeked); resolve(); }, 500);
-      });
-    } catch(e) { /* ignore */ }
+    try { video.currentTime = targetTime; } catch(e) { /* ignore */ }
+    isJumpingRef.current = false;
 
     if (wasPlaying) {
-      try { await video.play(); setIsPlaying(true); } catch {}
+      try { video.play().catch(() => {}); setIsPlaying(true); } catch {}
     }
   }
 
@@ -1110,6 +1311,46 @@ function getShortName(name: string | undefined | null, fallback: string) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isDraggingPlayhead, resizingSegmentId, resizeType, resizeInitialX, resizeInitialStart, resizeInitialDuration]);
+
+  // Keyboard shortcuts: Space = play/pause, ← = rewind 5s, → = forward 5s, J = -10s, L = +10s
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      // Don't fire when typing in an input/textarea
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        const video = videoRef.current;
+        const av = assetVideoRef.current;
+        if (isPlayingRef.current) {
+          video?.pause();
+          av?.pause();
+        } else {
+          const clips = (sessionRef.current?.timeline || []).filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+          const clip = clips[currentClipIndexRef.current];
+          if (clip?.assetKind === 'video' && clip.assetUrl && av) {
+            av.play().catch(() => {});
+          } else {
+            video?.play().catch(() => {});
+          }
+        }
+      } else if (e.code === 'ArrowLeft' || e.code === 'KeyJ') {
+        e.preventDefault();
+        const step = e.code === 'KeyJ' ? 10 : 5;
+        void jumpToTimelineTime(Math.max(0, currentTime - step));
+      } else if (e.code === 'ArrowRight' || e.code === 'KeyL') {
+        e.preventDefault();
+        const step = e.code === 'KeyL' ? 10 : 5;
+        const totalDur = (sessionRef.current?.timeline || []).filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0);
+        void jumpToTimelineTime(Math.min(totalDur, currentTime + step));
+      }
+    };
+
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime]);
 
   // FIXED: Phase 3 - Clip Splitting Names (#1)
   const handleCut = () => {
@@ -1319,7 +1560,23 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
   const handleSegmentClick = (segmentId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const clip = session?.timeline.find(s => s.id === segmentId);
+    if (!clip) return;
+    isJumpingRef.current = true; // block rAF from overwriting currentTime
     setSelectedSegmentId(segmentId);
+    setCurrentTime(clip.timelineStart ?? 0);
+    currentClipIndexRef.current = (session?.timeline || [])
+      .filter(s => s.track === 0).sort((a, b) => a.order - b.order)
+      .findIndex(s => s.id === segmentId);
+    void jumpToTimelineTime((clip.timelineStart ?? 0) + 0.001).then(() => {
+      const video = videoRef.current;
+      const av = assetVideoRef.current;
+      if (clip.assetKind === 'video' && clip.assetUrl && av) {
+        av.play().catch(() => {});
+      } else if (clip.assetKind !== 'photo') {
+        video?.play().catch(() => {});
+      }
+    });
   };
 
   const handleSegmentDragStart = (segmentId: string, e: React.DragEvent) => {
@@ -1637,10 +1894,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
   const handleVolumeChange = (segmentId: string, volume: number) => {
     if (!sessionRef.current) return;
     const session = sessionRef.current;
+    const safeVolume = Math.max(0, Math.min(5, volume));
     
     const previousSnapshot = saveFullSessionSnapshot(session);
     const updatedTimeline = session.timeline.map(seg => 
-      seg.id === segmentId ? { ...seg, volume } : seg
+      seg.id === segmentId ? { ...seg, volume: safeVolume } : seg
     );
     const updatedSession = { 
       ...session, 
@@ -1654,6 +1912,68 @@ function getShortName(name: string | undefined | null, fallback: string) {
     };
     setSession(updatedSession);
     void sessionManager.saveSession(sessionId, updatedSession);
+  };
+
+  const handleWavelengthChange = (segmentId: string, wavelength: number) => {
+    if (!sessionRef.current) return;
+    const session = sessionRef.current;
+    const updatedTimeline = session.timeline.map(seg => {
+      if (seg.id !== segmentId) return seg;
+      const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0) || 1;
+      const maxDuration = (seg.originalDuration && seg.originalDuration > 0) ? seg.originalDuration : track0Dur;
+      const safeDuration = Math.max(0.5, Math.min(maxDuration, wavelength));
+      const sourceStart = seg.sourceStart ?? 0;
+      const sourceEnd = sourceStart + safeDuration;
+      return {
+        ...seg,
+        duration: safeDuration,
+        sourceEnd,
+      };
+    });
+    const previousSnapshot = saveFullSessionSnapshot(session);
+    const updatedSession = {
+      ...session,
+      timeline: updatedTimeline,
+      undoStack: [...session.undoStack, {
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'RESIZE' as const
+      }],
+      redoStack: []
+    };
+    setSession(updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
+  };
+
+  const handleFrequencyChange = (segmentId: string, frequency: number) => {
+    if (!sessionRef.current) return;
+    const session = sessionRef.current;
+    const updatedTimeline = session.timeline.map(seg => {
+      if (seg.id !== segmentId) return seg;
+      const safeFrequency = Math.max(0.5, Math.min(2.0, frequency));
+      return {
+        ...seg,
+        frequency: safeFrequency,
+      };
+    });
+    const previousSnapshot = saveFullSessionSnapshot(session);
+    const updatedSession = {
+      ...session,
+      timeline: updatedTimeline,
+      undoStack: [...session.undoStack, {
+        type: 'FULL_SNAPSHOT' as const,
+        previousSnapshot,
+        actionType: 'FREQUENCY_CHANGE' as const
+      }],
+      redoStack: []
+    };
+    setSession(updatedSession);
+    void sessionManager.saveSession(sessionId, updatedSession);
+  };
+
+  const handleGlobalVolumeChange = (volume: number) => {
+    const safeVolume = Math.max(0, Math.min(5, volume));
+    setGlobalVolume(safeVolume);
   };
 
   // Download transcript as .txt
@@ -1697,75 +2017,54 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
     setIsExporting(true);
 
-    // Get all clips from track 0 (main video clips)
-    const sortedTimeline = [...session.timeline].sort((a, b) => a.order - b.order);
-    const track0Clips = sortedTimeline.filter(s => s.track === 0);
-    
-    if (track0Clips.length === 0) {
-      alert('No video clips to export. Please add clips to the timeline.');
-      setIsExporting(false);
-      return;
-    }
-    
-    logger.debug("Export timeline state:", {
-      totalClips: track0Clips.length,
-      clips: track0Clips.map(seg => ({
-        id: seg.id,
-        order: seg.order,
-        start: seg.sourceStart,
-        end: seg.sourceEnd,
-        duration: seg.duration,
-        name: seg.name || 'Unnamed'
-      }))
-    });
-
-    // Map timeline segments to export format - export ALL track0 clips
-    const clips = track0Clips.map((seg, index) => {
-      const clip: Record<string, any> = {
-        sourceStart: seg.sourceStart ?? 0,
-        sourceEnd:   seg.sourceEnd   ?? seg.duration,
-        start: seg.timelineStart ?? 0,
-        end:   (seg.timelineStart ?? 0) + seg.duration,
-        title: seg.name || `Clip ${index + 1}`,
-        id:    seg.id,
-        assetUrl:  seg.assetUrl,
-        assetKind: seg.assetKind,
-        volume:    seg.volume ?? 1.0,
-      };
-      if (seg.isMerged && seg.segments) {
-        clip.segments = seg.segments;
-        clip.isMerged = true;
-      }
-      return clip;
-    });
-
-    logger.debug("Export final clips array:", {
-      count: clips.length,
-      clips: clips.map(c => ({ id: c.id, title: c.title, duration: c.end - c.start }))
-    });
-    logger.operation(`Exporting ${clips.length} clips using Remotion export endpoint`);
-
     try {
-      // Use the new Remotion export endpoint
-      const res = await fetch(`/api/videos/${sessionId}/export-with-clips`, {
+      // const exportClips = [...session.timeline]
+      //   .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0))
+      //   .map(c => ({
+      //     ...c,
+      //     start: c.timelineStart ?? 0,
+      //     end: (c.timelineStart ?? 0) + (c.duration ?? 0),
+      //   }));
+
+
+      // Use cached fast export endpoint for performance.
+      // Backend endpoint: POST /api/videos/{session_id}/export-fast
+      const endpoint = 'export-fast';
+
+      logger.operation('Using fast cached export');
+
+      // Backend expects a timeline of clips, not a Remotion composition.
+      // Cache signature is based on ordered timeline (so keep stable ordering).
+      const timeline = [...session.timeline]
+        .filter(c => c.track === 0) // export-fast only handles track 0 video segments
+        .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0))
+        .map(c => ({
+          sourceStart: c.sourceStart ?? 0,
+          duration: c.duration ?? 0,
+          end: (c.sourceStart ?? 0) + (c.duration ?? 0),
+        }));
+
+      const res = await fetch(`/api/videos/${sessionId}/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          clips,
-          options: {
-            fps: 30,
-            width: 1920,
-            height: 1080
-          }
+        body: JSON.stringify({
+          timeline,
         }),
       });
+
 
       logger.debug("Export response status:", res.status, res.statusText);
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Export failed' }));
-        logger.error("Export failed:", err);
-        alert(`Export failed: ${err.detail || res.statusText}`);
+        let errMessage = 'Export failed';
+        try {
+          const errData = await res.json();
+          errMessage = errData.detail?.message || errData.detail || res.statusText;
+        } catch (e) {
+          errMessage = res.statusText;
+        }
+        logger.error("Export failed:", errMessage);
+        alert(`Export failed: ${errMessage}`);
         return;
       }
 
@@ -1781,8 +2080,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
       
-      logger.operation(`Export completed successfully: ${clips.length} clips exported`);
-      alert(`Successfully exported ${clips.length} clips!`);
+      logger.operation(`Export completed successfully`);
+      alert(`Successfully exported video!`);
     } catch (err) {
       logger.error("Export error:", err);
       alert(`Export failed: ${err instanceof Error ? err.message : 'Network error'}`);
@@ -1844,7 +2143,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
               <video
                 key={sessionId}
                 ref={videoRef}
-                controls
                 className="video-element"
                 style={{ width: '100%', height: '100%', objectFit: 'contain', flex: 1 }}
                 crossOrigin="anonymous"
@@ -1854,24 +2152,25 @@ function getShortName(name: string | undefined | null, fallback: string) {
                 Your browser does not support the video tag.
               </video>
 
-              {/* Asset video overlay — fades in over the original video */}
-              {/* When active: pointer-events enabled so user can interact with it */}
+              {/* Asset video overlay — no native controls, custom bar below handles play/pause */}
               <video
                 ref={assetVideoRef}
-                controls={assetVideoOpacity > 0}
                 style={{
                   position: 'absolute', top: 0, left: 0,
                   width: '100%', height: '100%',
                   objectFit: 'contain',
                   zIndex: 4,
                   opacity: assetVideoOpacity,
-                  transition: 'opacity 0.18s ease',
-                  pointerEvents: assetVideoOpacity > 0 ? 'auto' : 'none',
+transition: 'opacity 0.02s linear',
+                  pointerEvents: 'none',
                   backgroundColor: '#000',
                 }}
                 crossOrigin="anonymous"
                 preload="auto"
                 playsInline
+                muted
+                onPlay={() => { setIsPlaying(true); isPlayingRef.current = true; }}
+                onPause={() => { setIsPlaying(false); isPlayingRef.current = false; }}
               />
 
               <img
@@ -1889,6 +2188,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   backgroundColor: 'transparent'
                 }}
               />
+
+              {/* Hidden audio element for track-1 audio clips */}
+              <audio ref={audioRef} preload="auto" style={{ display: 'none' }} />
 
               </>
             )}
@@ -1949,6 +2251,120 @@ function getShortName(name: string | undefined | null, fallback: string) {
             )}
           </div>
 
+          {/* Custom video controls — shows total timeline duration including assets */}
+          {(() => {
+            const totalDur = Math.max(
+              (session.timeline || []).filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0),
+              0.1
+            );
+            const pct = totalDur > 0 ? Math.min(100, (currentTime / totalDur) * 100) : 0;
+            const hasAudioClip = (session.timeline || []).some(s => s.track === 1 && s.assetKind === 'audio');
+            return (
+              <div style={{ background: '#111', borderTop: '1px solid #222', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
+                {/* Play/Pause */}
+                <button
+                  className="btn btn-icon"
+                  style={{ padding: '4px', flexShrink: 0 }}
+                  onClick={() => {
+                    const video = videoRef.current;
+                    const av = assetVideoRef.current;
+                    if (isPlaying) {
+                      video?.pause();
+                      av?.pause();
+                    } else {
+                      const clip = (session.timeline || []).filter(s => s.track === 0).sort((a, b) => a.order - b.order)[currentClipIndexRef.current];
+                      if (clip?.assetKind === 'video' && clip.assetUrl && av) {
+                        av.volume = 1;
+                        av.play().catch(() => {});
+                      } else {
+                        if (video) video.volume = 1;
+                        video?.play().catch(() => {});
+                      }
+                    }
+                  }}
+                  aria-label={isPlaying ? 'Pause' : 'Play'}
+                >
+                  {isPlaying ? (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  )}
+                </button>
+
+                {/* Time */}
+                <span style={{ fontSize: '0.72rem', fontFamily: 'monospace', color: '#9fc5ff', flexShrink: 0, minWidth: '80px' }}>
+                  {formatTime(currentTime)} / {formatTime(totalDur)}
+                </span>
+
+                {/* Global Volume Control */}
+                {hasAudioClip && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginLeft: '10px', marginRight: '10px' }}>
+                    <button
+                      type="button"
+                      onClick={() => handleGlobalVolumeChange(globalVolume > 0 ? 0 : 1)}
+                      style={{ padding: '2px', background: 'transparent', border: 'none', cursor: 'pointer', color: '#9fc5ff' }}
+                      title={globalVolume > 0 ? 'Mute' : 'Unmute'}
+                    >
+                      {globalVolume === 0 ? (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                          <line x1="23" y1="9" x2="17" y2="15"></line>
+                          <line x1="17" y1="9" x2="23" y2="15"></line>
+                        </svg>
+                      ) : globalVolume < 0.3 ? (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                        </svg>
+                      ) : globalVolume < 0.7 ? (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                        </svg>
+                      ) : (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                          <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                        </svg>
+                      )}
+                    </button>
+                    <input
+                      type="range"
+                      min="0"
+                      max="500"
+                      step="5"
+                      value={Math.round(globalVolume * 100)}
+                      onChange={(e) => handleGlobalVolumeChange(parseInt(e.target.value) / 100)}
+                      title="Audio Volume (0-100%)"
+                      style={{ width: '60px', cursor: 'pointer', accentColor: '#4a9eff' }}
+                    />
+                  </div>
+                )}
+
+                {/* Scrubber — spans full timeline including assets */}
+                <div
+                  style={{ flex: 1, height: '4px', background: '#333', borderRadius: '2px', cursor: 'pointer', position: 'relative' }}
+                  onClick={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const pctClick = (e.clientX - rect.left) / rect.width;
+                    void jumpToTimelineTime(pctClick * totalDur);
+                  }}
+                >
+                  {/* Progress fill */}
+                  <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: '#4a9eff', borderRadius: '2px', transition: 'width 0.05s linear' }} />
+                  {/* Thumb */}
+                  <div style={{ position: 'absolute', top: '50%', left: `${pct}%`, transform: 'translate(-50%, -50%)', width: '10px', height: '10px', borderRadius: '50%', background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.5)' }} />
+                </div>
+
+                {/* Keyboard hint */}
+                <span style={{ fontSize: '0.6rem', color: '#444', flexShrink: 0, whiteSpace: 'nowrap' }}>
+                  
+                </span>
+              </div>
+            );
+          })()}
+
           {/* Editing Controls */}
           <div className="editing-controls">
             <button className="btn btn-icon" title="Cut at playhead position" onClick={handleCut}>
@@ -1993,28 +2409,147 @@ function getShortName(name: string | undefined | null, fallback: string) {
               </svg>
             </button>
 
-            {/* Volume Control for selected audio segment */}
-            {selectedSegmentId && session.timeline.find(s => s.id === selectedSegmentId)?.assetKind === 'audio' && (
-              <div className="volume-control" style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', gap: '8px', background: '#1a1a2e', padding: '4px 12px', borderRadius: '6px', border: '1px solid #333' }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1abc9c" strokeWidth="2">
-                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                </svg>
-                <input 
-                  type="range" 
-                  min="0" 
-                  max="2" 
-                  step="0.05" 
-                  value={session.timeline.find(s => s.id === selectedSegmentId)?.volume ?? 1} 
-                  onChange={(e) => handleVolumeChange(selectedSegmentId, parseFloat(e.target.value))}
-                  title="Volume"
-                  style={{ width: '90px', cursor: 'pointer', accentColor: '#1abc9c' }}
-                />
-                <span style={{ fontSize: '0.7rem', color: '#1abc9c', minWidth: '36px', fontVariantNumeric: 'tabular-nums' }}>
-                  {Math.round((session.timeline.find(s => s.id === selectedSegmentId)?.volume ?? 1) * 100)}%
+            {/* Audio controls for selected audio segment - MAIN AUDIO FOCUS */}
+            {selectedSegmentId && session.timeline.find(s => s.id === selectedSegmentId)?.assetKind === 'audio' && (() => {
+              const seg = session.timeline.find(s => s.id === selectedSegmentId)!;
+              const effectiveVol = Math.max(0, Math.min(5, seg.volume ?? 1));
+              const vol = Math.round(effectiveVol * 100);
+              const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0) || 1;
+              const maxDur = (seg.originalDuration && seg.originalDuration > 0) ? seg.originalDuration : track0Dur;
+              const duration = Math.round(seg.duration * 10) / 10;
+              return (
+              <div className="volume-control" style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', gap: '14px', background: '#1a1a2e', padding: '10px 14px', borderRadius: '8px', border: '1px solid rgba(26,188,156,0.3)', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '0.7rem', color: '#1abc9c', fontWeight: '500', minWidth: 'fit-content' }}>
+                  📻 Audio Adjustments (Main Focus)
                 </span>
+                
+                {/* Sound/Volume Control - OVERPOWERS VIDEO */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(26,188,156,0.1)', borderRadius: '4px' }}>
+                  <button
+                    type="button"
+                    onClick={() => handleVolumeChange(selectedSegmentId, Math.max(0, effectiveVol - 0.2))}
+                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#1abc9c', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
+                    title="Decrease volume (−20%)"
+                  >
+                    −
+                  </button>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#1abc9c" strokeWidth="2.5">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                  </svg>
+                  <input
+                    type="range"
+                    min="0"
+                    max="500"
+                    step="5"
+                    value={vol}
+                    onChange={(e) => handleVolumeChange(selectedSegmentId, parseInt(e.target.value) / 100)}
+                    title={`Audio volume: ${vol}% - ${vol >= 100 ? 'OVERPOWERS video background sound' : 'below video'}`}
+                    style={{ width: '110px', cursor: 'pointer', accentColor: '#1abc9c' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleVolumeChange(selectedSegmentId, Math.min(5, effectiveVol + 0.2))}
+                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#1abc9c', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
+                    title="Increase volume (+20%)"
+                  >
+                    +
+                  </button>
+                  <span style={{ fontSize: '0.72rem', color: '#1abc9c', minWidth: '55px', fontVariantNumeric: 'tabular-nums', fontWeight: '500' }}>
+                    {vol}% {vol >= 100 && '🔊'}
+                  </span>
+                </div>
+
+                {/* Duration Control - Audio Length */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(26,188,156,0.1)', borderRadius: '4px' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const newDur = Math.max(0.5, duration - 0.5);
+                      handleWavelengthChange(selectedSegmentId, newDur);
+                    }}
+                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#8fd8d2', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
+                    title="Decrease duration (−0.5s)"
+                  >
+                    −
+                  </button>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8fd8d2" strokeWidth="2.5">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                  </svg>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max={maxDur}
+                    step="0.1"
+                    value={duration}
+                    onChange={(e) => handleWavelengthChange(selectedSegmentId, parseFloat(e.target.value))}
+                    title={`Audio duration: ${duration.toFixed(1)}s of ${maxDur.toFixed(1)}s`}
+                    style={{ width: '130px', cursor: 'pointer', accentColor: '#8fd8d2' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const newDur = Math.min(maxDur, duration + 0.5);
+                      handleWavelengthChange(selectedSegmentId, newDur);
+                    }}
+                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#8fd8d2', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
+                    title="Increase duration (+0.5s)"
+                  >
+                    +
+                  </button>
+                  <span style={{ fontSize: '0.72rem', color: '#8fd8d2', minWidth: '58px', fontVariantNumeric: 'tabular-nums', fontWeight: '500' }}>
+                    {duration.toFixed(1)}s
+                  </span>
+                </div>
+
+                {/* Pitch/Frequency Control */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(255,107,107,0.1)', borderRadius: '4px' }}>
+                  <button
+                    type="button"
+                    onClick={() => handleFrequencyChange(selectedSegmentId, Math.max(0.5, (seg.frequency ?? 1) - 0.1))}
+                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#ff9999', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
+                    title="Lower pitch (−0.1x)"
+                  >
+                    −
+                  </button>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9999" strokeWidth="2.5">
+                    <path d="M9 12l2 2 4-4"/>
+                    <path d="M21 12c-1 0-3-1-3-3s2-3 3-3 3 1 3 3-2 3-3 3"/>
+                    <path d="M3 12c1 0 3-1 3-3s-2-3-3-3-3 1-3 3 2 3 3 3"/>
+                  </svg>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="2.0"
+                    step="0.1"
+                    value={seg.frequency ?? 1}
+                    onChange={(e) => handleFrequencyChange(selectedSegmentId, parseFloat(e.target.value))}
+                    title={`Pitch: ${(seg.frequency ?? 1).toFixed(1)}x (0.5x = half speed, 2.0x = double speed)`}
+                    style={{ width: '110px', cursor: 'pointer', accentColor: '#ff9999' }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleFrequencyChange(selectedSegmentId, Math.min(2.0, (seg.frequency ?? 1) + 0.1))}
+                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#ff9999', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
+                    title="Raise pitch (+0.1x)"
+                  >
+                    +
+                  </button>
+                  <span style={{ fontSize: '0.72rem', color: '#ff9999', minWidth: '42px', fontVariantNumeric: 'tabular-nums', fontWeight: '500' }}>
+                    {(seg.frequency ?? 1).toFixed(1)}x
+                  </span>
+                </div>
+
+                {/* Info Display */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(52,73,94,0.2)', borderRadius: '4px', marginLeft: 'auto' }}>
+                  <span style={{ fontSize: '0.65rem', color: '#7f8c8d', whiteSpace: 'nowrap' }}>
+                    📊 {seg.duration.toFixed(1)}s / {maxDur.toFixed(1)}s
+                  </span>
+                </div>
               </div>
-            )}
+              );
+            })()}
           </div>
 
 {/* Timeline — Clip Section */}
@@ -2024,6 +2559,12 @@ function getShortName(name: string | undefined | null, fallback: string) {
               {(() => {
                 const track0Segments = (session.timeline || []).filter(s => s.track === 0);
                 const totalDur = track0Segments.reduce((sum, s) => sum + (s.duration || 0), 0) || 1;
+                const MIN_PX_PER_SEC = 1.5;
+                const MIN_CLIP_PX = 35;
+                const totalPx = Math.max(
+                  track0Segments.reduce((sum, s) => sum + Math.max(MIN_CLIP_PX, s.duration * MIN_PX_PER_SEC), 0),
+                  200
+                );
                 return (
                   <>
                     <div className="timeline-header">
@@ -2031,22 +2572,25 @@ function getShortName(name: string | undefined | null, fallback: string) {
                     </div>
 
                     {/* Scrollable area: ruler + video track + playhead */}
+                    <div style={{ position: 'relative' }}>
                     <div
                       className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`}
                       ref={timelineRef}
                       style={{ overflowX: 'auto', overflowY: 'hidden', position: 'relative' }}
                       onClick={(e) => {
                         if (!videoRef.current || isDraggingPlayhead) return;
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        const pct = (e.clientX - rect.left) / rect.width;
-                        const clickTime = pct * totalDur;
+                        const container = e.currentTarget;
+                        const rect = container.getBoundingClientRect();
+                        // Account for scroll offset and pixel container width
+                        const clickPx = (e.clientX - rect.left) + container.scrollLeft;
+                        const clickTime = (clickPx / totalPx) * totalDur;
                         void jumpToTimelineTime(clickTime);
                       }}
                       onDragOver={handleTimelineDragOver}
                       onDrop={handleTimelineDrop}
                     >
-                      {/* Inner container — min-width ensures clips don't squish */}
-                      <div style={{ minWidth: `${Math.max(100, track0Segments.length * 80)}px`, position: 'relative' }}>
+                      {/* Inner container — pixel-based so it grows and scrolls */}
+                      <div style={{ width: `${totalPx}px`, minWidth: '100%', position: 'relative' }}>
                       {/* Timeline Ruler (Timestamps) */}
                       <div className="timeline-ruler" style={{ position: 'relative', height: '14px', borderBottom: '1px solid #333', marginBottom: '4px' }}>
                         {[...Array(11)].map((_, i) => {
@@ -2063,11 +2607,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
                         })}
                       </div>
 
-                      {/* Single clip track (track 0) */}
+                      {/* Single clip track (track 0) — pixel widths */}
                       <div
                         className="timeline-track"
                         data-track={0}
-                        style={{ position: 'relative', height: '44px', background: 'rgba(10, 10, 20, 0.4)', borderRadius: '6px', border: '1px solid #2a2a3e', overflow: 'hidden', marginTop: '4px', display: 'flex' }}
+                        style={{ position: 'relative', height: '44px', background: 'rgba(10, 10, 20, 0.4)', borderRadius: '6px', border: '1px solid #2a2a3e', overflow: 'hidden', marginTop: '4px', display: 'flex', width: '100%' }}
                         onDragOver={handleTrackDragOver}
                         onDrop={(e) => handleTrackDrop(0, e)}
                       >
@@ -2078,9 +2622,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
                           track0Segments
                             .sort((a, b) => a.order - b.order)
                             .map((segment, index) => {
-                              const widthPercent = (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * 100;
+                              const clipPx = Math.max(MIN_CLIP_PX, segment.duration * MIN_PX_PER_SEC);
                               
-                              // Use "clip 1", "clip 2" format (lowercase)
                               const clipLabel = segment.assetKind === 'photo'
                                 ? 'Photo'
                                 : segment.assetKind === 'video'
@@ -2097,8 +2640,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
                                   style={{
                                     position: 'relative',
                                     height: '100%',
-                                    flex: `0 0 ${widthPercent}%`,
-                                    width: `${widthPercent}%`,
+                                    flex: `0 0 ${clipPx}px`,
+                                    width: `${clipPx}px`,
                                     backgroundColor: segment.assetKind
                                       ? getAssetColor(segment.assetKind)
                                       : (segment.color || getClipColor(segment.order)),
@@ -2138,61 +2681,95 @@ function getShortName(name: string | undefined | null, fallback: string) {
                         )}
                       </div>
 
-                      {/* Playhead — inside scrollable area */}
+                      {/* Audio track — inside scroll so it aligns with video clips */}
                       <div
-                        className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
-                        style={{ left: `${(currentTime / totalDur) * 100}%`, top: 0, height: '100%', zIndex: 10 }}
-                        onMouseDown={handlePlayheadMouseDown}
-                      />
-                      </div>{/* end inner min-width container */}
-                    </div>{/* end scrollable timeline-content */}
-
-                    {/* Audio track — OUTSIDE scroll, always visible, full width */}
-                    <div
-                      className="timeline-track audio-track"
-                      data-track={1}
-                      style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '4px', border: '1px solid rgba(26,188,156,0.18)', height: '34px', overflow: 'visible', marginTop: '3px', marginLeft: '1rem', marginRight: '1rem' }}
-                      onDragOver={handleTrackDragOver}
-                      onDrop={(e) => handleTrackDrop(1, e)}
-                    >
-                      {(session.timeline || []).filter(s => s.track === 1).length === 0 && (
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#3a5a54', fontSize: '0.65rem', fontStyle: 'italic', gap: '4px', pointerEvents: 'none' }}>
-                          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-                          audio
-                        </div>
-                      )}
-                      {(session.timeline || []).filter(s => s.track === 1).map((segment) => {
-                          const leftPercent = ((segment.timelineStart ?? 0) / Math.max(totalDur, 1)) * 100;
-                          const widthPercent = (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * 100;
+                        className="timeline-track audio-track"
+                        data-track={1}
+                        style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '4px', border: '1px solid rgba(26,188,156,0.18)', height: '34px', overflow: 'visible', marginTop: '3px' }}
+                        onDragOver={handleTrackDragOver}
+                        onDrop={(e) => handleTrackDrop(1, e)}
+                      >
+                        {(session.timeline || []).filter(s => s.track === 1).length === 0 && (
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#3a5a54', fontSize: '0.65rem', fontStyle: 'italic', gap: '4px', pointerEvents: 'none' }}>
+                            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                            audio
+                          </div>
+                        )}
+                        {(session.timeline || []).filter(s => s.track === 1).map((segment) => {
+                          const leftPx = ((segment.timelineStart ?? 0) / Math.max(totalDur, 1)) * totalPx;
+                          const widthPx = Math.max(4, (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * totalPx);
                           const vol = segment.volume ?? 1;
+                          const isActive = currentTime >= (segment.timelineStart ?? 0) && currentTime < (segment.timelineStart ?? 0) + segment.duration;
+                          // Color intensity increases with volume - green at 100%, yellow-orange-red as it gets louder
+                          let bgColor = '#1abc9c';
+                          if (vol > 2) bgColor = '#ff6b6b'; // Red for very loud (200%+)
+                          else if (vol > 1.5) bgColor = '#ffa500'; // Orange for loud (150%+)
+                          else if (vol > 1) bgColor = '#f1c40f'; // Yellow for high (100%+)
                           return (
                             <div
                               key={segment.id}
                               className={`timeline-segment${selectedSegmentId === segment.id ? ' selected' : ''}${draggedSegmentId === segment.id ? ' dragging' : ''}`}
-                              title={`${getShortName(segment.name, 'Audio')} — ${Math.round(vol * 100)}% vol`}
+                              title={`${getShortName(segment.name, 'Audio')} • Volume: ${Math.round(vol * 100)}% ${vol > 1 ? '(overpowers video background sound)' : ''} • Pitch: ${(segment.frequency ?? 1).toFixed(1)}x • Scroll to adjust, Ctrl+Scroll for pitch`}
                               style={{
                                 position: 'absolute', top: 0, height: '100%',
-                                left: `${leftPercent}%`, width: `${widthPercent}%`,
-                                backgroundColor: '#1abc9c', boxSizing: 'border-box',
-                                border: selectedSegmentId === segment.id ? '2px solid #fff' : '1px solid rgba(26,188,156,0.5)',
+                                left: `${leftPx}px`, width: `${widthPx}px`,
+                                backgroundColor: bgColor,
+                                boxSizing: 'border-box',
+                                border: selectedSegmentId === segment.id ? '2px solid #fff' : isActive ? `2px solid ${bgColor}` : '1px solid rgba(26,188,156,0.5)',
                                 cursor: resizingSegmentId === segment.id ? 'ew-resize' : 'grab',
                                 borderRadius: '3px', display: 'flex', alignItems: 'center', overflow: 'hidden',
-                                zIndex: selectedSegmentId === segment.id ? 10 : 1,
+                                zIndex: selectedSegmentId === segment.id ? 10 : isActive ? 5 : 1,
+                                opacity: isActive ? 1 : 0.85,
+                                boxShadow: isActive ? `0 0 8px ${bgColor}80` : 'none',
+                                transition: 'all 0.2s ease',
                               }}
                               onClick={(e) => handleSegmentClick(segment.id, e)}
                               draggable={resizingSegmentId !== segment.id}
                               onDragStart={(e) => handleSegmentDragStart(segment.id, e)}
                               onDragEnd={handleSegmentDragEnd}
+                              onWheel={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                // Scroll up = increase, scroll down = decrease, step 10%
+                                const delta = e.deltaY < 0 ? 0.1 : -0.1;
+                                if (e.ctrlKey || e.metaKey) {
+                                  // Ctrl+scroll adjusts frequency/pitch
+                                  const currentFreq = segment.frequency ?? 1;
+                                  const newFreq = Math.min(2.0, Math.max(0.5, currentFreq + delta));
+                                  handleFrequencyChange(segment.id, Math.round(newFreq * 10) / 10);
+                                } else {
+                                  // Regular scroll adjusts volume
+                                  const newVol = Math.min(5, Math.max(0, vol + delta));
+                                  handleVolumeChange(segment.id, Math.round(newVol * 10) / 10);
+                                }
+                              }}
                             >
                               <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 2 }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'left')} />
-                              <span style={{ fontSize: '0.6rem', color: '#fff', padding: '0 8px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1, textShadow: '0 1px 2px rgba(0,0,0,0.8)', zIndex: 1 }}>
-                                {getShortName(segment.name, 'Audio')}{vol !== 1 ? ` ${Math.round(vol * 100)}%` : ''}
+                              <span style={{ fontSize: '0.6rem', color: '#fff', padding: '0 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: 1, textShadow: '0 1px 2px rgba(0,0,0,0.8)', zIndex: 1, textAlign: 'center', fontWeight: vol > 1 ? '600' : '500' }}>
+                                {getShortName(segment.name, 'Audio')} {Math.round(vol * 100)}% {vol > 1 && '🔊'}
                               </span>
                               <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 2 }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'right')} />
                             </div>
                           );
                         })}
-                    </div>
+                      </div>
+
+                      {/* Playhead — inside pixel container, aligned with clips */}
+                      <div
+                        className={`timeline-playhead ${isDraggingPlayhead ? 'dragging' : ''}`}
+                        style={{
+                          position: 'absolute',
+                          left: `${(currentTime / totalDur) * totalPx}px`,
+                          top: 0,
+                          bottom: 0,
+                          zIndex: 20,
+                          pointerEvents: 'auto',
+                        }}
+                        onMouseDown={handlePlayheadMouseDown}
+                      />
+                      </div>{/* end inner pixel-width container */}
+                    </div>{/* end scrollable timeline-content */}
+                    </div>{/* end position:relative wrapper */}
                   </>
                 );
               })()}
@@ -2264,7 +2841,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
                           e.currentTarget.style.borderTop = '';
                           const draggedId = e.dataTransfer.getData('text/plain');
                           if (!draggedId || draggedId === clip.id) return;
-                          git status                          const track0 = session.timeline
+                          const track0 = session.timeline
                             .filter(s => s.track === 0)
                             .sort((a, b) => a.order - b.order);
                           const fromIdx = track0.findIndex(s => s.id === draggedId);
@@ -2303,8 +2880,19 @@ function getShortName(name: string | undefined | null, fallback: string) {
                           outline: selectedSegmentId === clip.id ? '1px solid #4a9eff' : 'none',
                         }}
                         onClick={() => {
+                          isJumpingRef.current = true; // block rAF from overwriting currentTime
                           setSelectedSegmentId(clip.id);
-                          void jumpToTimelineTime(clip.timelineStart ?? 0);
+                          setCurrentTime(clip.timelineStart ?? 0);
+                          currentClipIndexRef.current = i;
+                          void jumpToTimelineTime((clip.timelineStart ?? 0) + 0.001).then(() => {
+                            const video = videoRef.current;
+                            const av = assetVideoRef.current;
+                            if (clip.assetKind === 'video' && clip.assetUrl && av) {
+                              av.play().catch(() => {});
+                            } else if (clip.assetKind !== 'photo') {
+                              video?.play().catch(() => {});
+                            }
+                          });
                         }}
                       >
                         {/* Drag handle */}
@@ -2412,6 +3000,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   track: 1,
                   color: getAssetColor('audio'),
                   volume: 1,
+                  originalDuration: assetDuration,
                 };
               // Phase 4.14: Capture FULL session snapshot BEFORE mutation
               const previousSnapshot = saveFullSessionSnapshot(session);
@@ -2446,44 +3035,48 @@ function getShortName(name: string | undefined | null, fallback: string) {
               const track0Segments = session.timeline.filter(s => s.track === 0).sort((a, b) => a.order - b.order);
               let newTrack0: TimelineSegment[] = [];
 
-              let cutMade = false;
-              for (let i = 0; i < track0Segments.length; i++) {
-                const seg = track0Segments[i];
-                const start = seg.timelineStart ?? 0;
-                const end = start + seg.duration;
-                
-                if (currentTime > start + 0.05 && currentTime < end - 0.05) {
-                  const cutOffset = currentTime - start;
-                  const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
-                  
-                  const segment1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
-                  const segment2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: seg.duration - cutOffset };
-                  
-                  newTrack0 = [
-                    ...track0Segments.slice(0, i),
-                    segment1,
-                    newSegment,
-                    segment2,
-                    ...track0Segments.slice(i + 1),
-                  ];
-                  cutMade = true;
-                  break;
-                }
-              }
-
-              if (!cutMade) {
-                let insertIdx = track0Segments.length;
+              // Priority: selected clip → red line position
+              if (selectedSegmentId) {
+                // Insert after the selected clip
+                const selIdx = track0Segments.findIndex(s => s.id === selectedSegmentId);
+                const insertAfter = selIdx >= 0 ? selIdx : track0Segments.length - 1;
+                newTrack0 = [
+                  ...track0Segments.slice(0, insertAfter + 1),
+                  newSegment,
+                  ...track0Segments.slice(insertAfter + 1),
+                ];
+              } else {
+                // Fall back to red line: split clip at currentTime or insert at boundary
+                let cutMade = false;
                 for (let i = 0; i < track0Segments.length; i++) {
-                  if (currentTime <= (track0Segments[i].timelineStart ?? 0) + 0.05) {
-                    insertIdx = i;
+                  const seg = track0Segments[i];
+                  const start = seg.timelineStart ?? 0;
+                  const end = start + seg.duration;
+                  if (currentTime > start + 0.05 && currentTime < end - 0.05) {
+                    const cutOffset = currentTime - start;
+                    const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
+                    const segment1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
+                    const segment2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: seg.duration - cutOffset };
+                    newTrack0 = [...track0Segments.slice(0, i), segment1, newSegment, segment2, ...track0Segments.slice(i + 1)];
+                    cutMade = true;
                     break;
                   }
                 }
-                newTrack0 = [
-                  ...track0Segments.slice(0, insertIdx),
-                  newSegment,
-                  ...track0Segments.slice(insertIdx),
-                ];
+                if (!cutMade) {
+                  // Insert after the last clip whose start <= currentTime
+                  let insertAfter = track0Segments.length - 1;
+                  for (let i = 0; i < track0Segments.length; i++) {
+                    if (currentTime < (track0Segments[i].timelineStart ?? 0)) {
+                      insertAfter = i - 1;
+                      break;
+                    }
+                  }
+                  newTrack0 = [
+                    ...track0Segments.slice(0, insertAfter + 1),
+                    newSegment,
+                    ...track0Segments.slice(insertAfter + 1),
+                  ];
+                }
               }
 
               // Recalculate timelineStart
@@ -2604,7 +3197,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
                         }
                       }
                     }}
-                    placeholder="e.g. Trim the first 5 seconds, add subtitles, and highlight the middle segment."
+                    placeholder="Type message."
                     disabled={isAiEditing || !session?.transcript}
                     style={{ flex: 1, padding: '0.5rem', borderRadius: '6px', border: '1px solid #333', background: '#1a1a2e', color: '#fff', fontSize: '0.82rem', resize: 'vertical', minHeight: '40px', fontFamily: 'inherit' }}
                   />
