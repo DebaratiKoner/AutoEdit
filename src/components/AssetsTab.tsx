@@ -10,7 +10,7 @@ const FREESOUND_PROXY = '/api/freesound';
 const imgProxy = (url: string) => url ? `/api/proxy-image?url=${encodeURIComponent(url)}` : '';
 const vidProxy = (url: string) => url ? `/api/proxy-video?url=${encodeURIComponent(url)}` : '';
 
-export type AssetFilter = 'all' | 'video' | 'photo' | 'audio' | 'ai';
+export type AssetFilter = 'all' | 'video' | 'photo' | 'audio';
 
 export interface PixabayVideoSize { url: string; width: number; height: number; size: number; thumbnail: string; }
 export interface PixabayVideo {
@@ -78,12 +78,6 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   const [singleTotal, setSingleTotal] = useState(0);
   const [singleLoading, setSingleLoading] = useState(false);
   const [singleError, setSingleError] = useState<string | null>(null);
-
-  // AI Generated audio state
-  const [aiAudioText, setAiAudioText]     = useState('');
-  const [aiAudioItems, setAiAudioItems]   = useState<Array<{ url: string; duration: number; text: string; voice: string; id: number }>>([]);
-  const [aiAudioLoading, setAiAudioLoading] = useState(false);
-  const [aiAudioError, setAiAudioError]   = useState<string | null>(null);
 
   // All-mode per-section state
   const [videoSec, setVideoSec] = useState<SectionState>(emptySec());
@@ -180,30 +174,6 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   };
 
   const closePreview = () => { setPreview(null); previewRef.current?.pause(); };
-
-  const generateAiAudio = async () => {
-    if (!aiAudioText.trim()) return;
-    setAiAudioLoading(true);
-    setAiAudioError(null);
-    try {
-      const res = await fetch('/api/generate-image', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: aiAudioText.trim() }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || 'Generation failed');
-      }
-      const data = await res.json();
-      setAiAudioItems(prev => [{ url: data.url, duration: 5, text: aiAudioText.trim(), voice: '', id: Date.now() }, ...prev]);
-      setAiAudioText('');
-    } catch (e) {
-      setAiAudioError(e instanceof Error ? e.message : 'Failed to generate');
-    } finally {
-      setAiAudioLoading(false);
-    }
-  };
 
   // ── Asset card renderer ────────────────────────────────────────────────────
   const renderCard = (asset: PixabayAsset) => {
@@ -333,7 +303,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
 
         <div className="assets-filters">
           <div className="assets-filters-row" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-            {(['all', 'video', 'photo', 'audio', 'ai'] as AssetFilter[]).map(f => (
+            {(['all', 'video', 'photo', 'audio'] as AssetFilter[]).map(f => (
               <button key={f} className={`assets-filter-btn${filter === f ? ' active' : ''}`}
                 onClick={() => changeFilter(f)}>
                 {f === 'all' ? 'All' : f === 'video' ? 'Video' : f === 'photo' ? 'Photos' : f === 'audio' ? 'Audio' : '✨ AI Generated'}
@@ -353,7 +323,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
       </div>
 
       {/* Results */}
-      <div className="assets-results">
+      <div className="assets-results" style={{ flex: 1, overflowY: 'auto', paddingRight: '4px' }}>
         {/* ALL mode — three sections */}
         {filter === 'all' && (
           <>
@@ -375,7 +345,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
         )}
 
         {/* Single-filter mode */}
-        {filter !== 'all' && filter !== 'ai' && (
+        {filter !== 'all' && (
           <>
             {singleLoading && singleItems.length === 0 && (
               <div className="assets-loading"><div className="assets-spinner"/><span>Searching...</span></div>
@@ -399,76 +369,6 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
               </button>
             )}
           </>
-        )}
-        {/* AI Generated Images panel */}
-        {filter === 'ai' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-            <div style={{ fontSize: '0.72rem', color: '#666' }}>
-              Describe an image and generate it .
-            </div>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              <input
-                style={{ flex: 1, padding: '0.45rem 0.6rem', borderRadius: '6px', border: '1px solid #333', background: '#1a1a2e', color: '#fff', fontSize: '0.82rem' }}
-                placeholder="Describe an image..."
-                value={aiAudioText}
-                onChange={e => setAiAudioText(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && generateAiAudio()}
-              />
-              <button
-                className="btn btn-primary"
-                style={{ padding: '0.45rem 0.9rem', fontSize: '0.8rem', whiteSpace: 'nowrap' }}
-                onClick={generateAiAudio}
-                disabled={aiAudioLoading || !aiAudioText.trim()}
-              >
-                {aiAudioLoading ? 'Generating...' : 'Generate'}
-              </button>
-            </div>
-            {aiAudioError && <div style={{ color: '#e74c3c', fontSize: '0.75rem' }}>{aiAudioError}</div>}
-            {aiAudioItems.length > 0 && (
-              <div className="assets-grid">
-                {aiAudioItems.map(item => (
-                  <div key={item.id} className="asset-card">
-                    <div className="asset-card-thumb">
-                      <img src={item.url} alt={item.text} loading="lazy"
-                        onError={e => { (e.target as HTMLImageElement).src = FALLBACK; }} />
-                      <div className="asset-card-badge photo">AI</div>
-                    </div>
-                    <div className="asset-card-info">
-                      <p className="asset-card-tags" style={{ fontSize: '0.7rem' }}>{item.text.slice(0, 50)}</p>
-                      <div className="asset-card-actions">
-                        <button
-                          className="asset-add-btn"
-                          style={{ fontSize: '0.7rem', padding: '3px 7px' }}
-                          onClick={() => {
-                            const fakeAsset = {
-                              _kind: 'photo' as const,
-                              id: item.id,
-                              tags: item.text,
-                              previewURL: item.url,
-                              webformatURL: item.url,
-                              largeImageURL: item.url,
-                              imageWidth: 1024,
-                              imageHeight: 1024,
-                              user: 'AI',
-                              userImageURL: '',
-                            };
-                            onAddToTimeline(fakeAsset as any, 5);
-                          }}
-                        >
-                          Insert
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            {aiAudioItems.length === 0 && !aiAudioLoading && (
-              <div style={{ color: '#444', fontSize: '0.75rem', textAlign: 'center', padding: '1.5rem 0' }}>
-                Generated images will appear here
-              </div>
-            )}
-          </div>
         )}
 
       </div>

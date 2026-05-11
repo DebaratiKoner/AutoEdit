@@ -7,7 +7,6 @@ import type { ValidationResult } from '../types';
 
 export class FileValidator {
   private static readonly SUPPORTED_FORMATS = ['mp4', 'mov', 'webm'];
-  private static readonly MIN_HEIGHT = 360;
 
   /**
    * Get list of supported video formats
@@ -47,39 +46,6 @@ export class FileValidator {
         format: extension,
       },
     };
-  }
-
-  /**
-   * Validate video resolution meets minimum requirements
-   * @param file - Video file to validate
-   * @returns Promise<ValidationResult> indicating if resolution meets requirements
-   */
-  async validateResolution(file: File): Promise<ValidationResult> {
-    try {
-      const resolution = await this.getVideoResolution(file);
-      
-      if (resolution.height < FileValidator.MIN_HEIGHT) {
-        return {
-          valid: false,
-          error: `Resolution too low: ${resolution.height}p. Minimum ${FileValidator.MIN_HEIGHT}p required.`,
-          details: {
-            resolution,
-          },
-        };
-      }
-
-      return {
-        valid: true,
-        details: {
-          resolution,
-        },
-      };
-    } catch (error) {
-      return {
-        valid: false,
-        error: 'Unable to read video resolution. Please ensure the file is a valid video.',
-      };
-    }
   }
 
   /**

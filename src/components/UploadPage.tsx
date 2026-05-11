@@ -68,13 +68,6 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
       return;
     }
 
-    // Validate resolution
-    const resolutionResult = await fileValidator.validateResolution(file);
-    if (!resolutionResult.valid) {
-      setError(resolutionResult.error || 'Invalid resolution');
-      return;
-    }
-
     try {
       setIsUploading(true);
       // 1. Upload file to backend — backend assigns the session ID

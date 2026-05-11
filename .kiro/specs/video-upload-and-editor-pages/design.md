@@ -339,7 +339,7 @@ interface SessionData {
 
 **Validation Rules**:
 - Supported formats: MP4, MOV, WebM
-- Minimum resolution: 1280x720 (720p)
+- Minimum resolution: None (allows any resolution, e.g., 144p)
 - Maximum file size: 2GB
 
 #### 4. FFmpeg Service
@@ -553,9 +553,6 @@ The application handles four primary categories of errors:
 try {
   const validation = await fileValidator.validateResolution(file);
   if (!validation.valid) {
-    showError(`Resolution too low: ${validation.details.resolution.height}p. Minimum 720p required.`);
-    return;
-  }
 } catch (error) {
   showError('Unable to validate video file. Please try again.');
 }
@@ -648,7 +645,6 @@ function saveSession(data: SessionData): void {
 4. **Be Consistent**: Use the same terminology throughout the application
 
 **Good Examples**:
-- ✅ "Video resolution too low (480p). Minimum 720p required."
 - ✅ "Upload failed. Check your internet connection and try again."
 - ✅ "Export in progress. This may take up to 5 minutes."
 

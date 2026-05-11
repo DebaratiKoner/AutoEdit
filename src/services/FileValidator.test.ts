@@ -109,20 +109,17 @@ describe('FileValidator', () => {
       expect(result.details?.resolution).toEqual({ width: 3840, height: 2160 });
     });
 
-    it('should reject 480p video', async () => {
+    it('should accept 480p video', async () => {
       const file = createMockVideoFile(854, 480);
       const result = await validator.validateResolution(file);
-      expect(result.valid).toBe(false);
-      expect(result.error).toContain('Resolution too low: 480p');
-      expect(result.error).toContain('Minimum 720p required');
+      expect(result.valid).toBe(true);
       expect(result.details?.resolution).toEqual({ width: 854, height: 480 });
     });
 
-    it('should reject video below 720p', async () => {
+    it('should accept video below 720p', async () => {
       const file = createMockVideoFile(1024, 576);
       const result = await validator.validateResolution(file);
-      expect(result.valid).toBe(false);
-      expect(result.error).toContain('Resolution too low: 576p');
+      expect(result.valid).toBe(true);
     });
   });
 
@@ -141,19 +138,17 @@ describe('FileValidator', () => {
       expect(result.details?.resolution).toEqual({ width: 1282, height: 721 });
     });
 
-    it('should reject 719p resolution (just below boundary)', async () => {
+    it('should accept 719p resolution (just below boundary)', async () => {
       const file = createMockVideoFile(1278, 719);
       const result = await validator.validateResolution(file);
-      expect(result.valid).toBe(false);
-      expect(result.error).toBe('Resolution too low: 719p. Minimum 720p required.');
+      expect(result.valid).toBe(true);
       expect(result.details?.resolution).toEqual({ width: 1278, height: 719 });
     });
 
-    it('should reject very low resolution (360p)', async () => {
-      const file = createMockVideoFile(640, 360);
+    it('should accept very low resolution (144p)', async () => {
+      const file = createMockVideoFile(256, 144);
       const result = await validator.validateResolution(file);
-      expect(result.valid).toBe(false);
-      expect(result.error).toBe('Resolution too low: 360p. Minimum 720p required.');
+      expect(result.valid).toBe(true);
     });
 
     it('should accept non-standard resolution above 720p', async () => {
@@ -312,27 +307,19 @@ describe('FileValidator', () => {
 
     /**
      * Property 3: Resolution validation threshold
-     * For any video with height >= 720, validation SHALL pass.
-     * For any video with height < 720, validation SHALL fail.
+     * Any video resolution is allowed (e.g. 144p and up), validation SHALL pass.
      */
     it('Property 3: should validate resolution threshold correctly', async () => {
       await fc.assert(
         fc.asyncProperty(
-          fc.integer({ min: 640, max: 3840 }),
-          fc.integer({ min: 360, max: 2160 }),
+          fc.integer({ min: 144, max: 3840 }),
+          fc.integer({ min: 144, max: 2160 }),
           async (width, height) => {
             const file = createMockVideoFile(width, height);
             const result = await validator.validateResolution(file);
             
-            if (height >= 720) {
-              expect(result.valid).toBe(true);
-              expect(result.details?.resolution).toEqual({ width, height });
-            } else {
-              expect(result.valid).toBe(false);
-              expect(result.error).toContain('Resolution too low');
-              expect(result.error).toContain(`${height}p`);
-              expect(result.error).toContain('720p');
-            }
+            expect(result.valid).toBe(true);
+            expect(result.details?.resolution).toEqual({ width, height });
           }
         ),
         { numRuns: 100 }

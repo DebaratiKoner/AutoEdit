@@ -41,8 +41,6 @@ This document specifies requirements for two core pages of the AutoEdit AI video
 2. THE File_Validator SHALL accept files with MOV format
 3. THE File_Validator SHALL accept files with WebM format
 4. WHEN a user selects a file with an unsupported format, THE File_Validator SHALL display an error message listing supported formats
-5. THE File_Validator SHALL verify the file has a minimum resolution of 720p
-6. WHEN a user selects a file below 720p resolution, THE File_Validator SHALL display an error message indicating the minimum resolution requirement
 
 ### Requirement 3: Video Upload Process
 
