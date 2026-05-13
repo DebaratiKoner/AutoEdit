@@ -1496,6 +1496,10 @@ class FastExportRequest(BaseModel):
     timeline: list = []
     clips: list = []
 
+class ExportZipRequest(BaseModel):
+    timeline: list
+    transcriptSegments: list = []
+
 def _export_signature(session_id: str, timeline: list) -> str:
     import json
     import hashlib
@@ -1652,6 +1656,170 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
             temp_dir.rmdir()
         except Exception:
             pass
+
+@app.post("/api/videos/{session_id}/export-zip")
+async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
+    import zipfile
+    import tempfile
+    import httpx
+    import json
+    import shutil
+    from datetime import datetime
+
+    video_path = None
+    try:
+        video_path = _get_video_path(session_id)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Source video not found")
+        
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"export_{session_id}_"))
+    clips_dir = temp_dir / "clips"
+    clips_dir.mkdir(exist_ok=True)
+    
+    try:
+        # Flatten timeline
+        flattened_timeline = []
+        for clip in body.timeline:
+            if clip.get("segments"):
+                for seg in clip["segments"]:
+                    flat = dict(clip)
+                    flat["sourceStart"] = seg.get("sourceStart", seg.get("start", 0))
+                    flat["sourceEnd"] = seg.get("sourceEnd", seg.get("end", 0))
+                    flat.pop("segments", None)
+                    flattened_timeline.append(flat)
+            else:
+                flattened_timeline.append(clip)
+
+        clip_files = []
+        chapters_meta = []
+        
+        for i, clip in enumerate(flattened_timeline):
+            asset_url = clip.get("assetUrl")
+            src_start = float(clip.get("sourceStart", clip.get("start", 0)))
+            src_end = float(clip.get("sourceEnd", clip.get("end", 0)))
+            duration = src_end - src_start
+            
+            if duration <= 0:
+                continue
+                
+            title = clip.get("title", clip.get("name", f"Clip_{i+1}"))
+            safe_title = "".join([c if c.isalnum() or c in " _-" else "_" for c in title])
+            
+            out_path = clips_dir / f"{i+1:02d}_{safe_title}.mp4"
+            
+            if asset_url:
+                if asset_url.startswith("/api/"):
+                    local_asset = None
+                    if "ai-image" in asset_url:
+                        img_id = asset_url.split("/")[-1]
+                        local_asset = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
+                    elif "assets" in asset_url and "stream" in asset_url:
+                        asset_id = asset_url.split("/")[-2]
+                        for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp"]:
+                            candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
+                            if candidate.exists():
+                                local_asset = candidate
+                                break
+                    if local_asset and local_asset.exists():
+                        if local_asset.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                            subprocess.run([
+                                "ffmpeg", "-loop", "1", "-i", str(local_asset),
+                                "-t", str(duration), "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                            ], capture_output=True, text=True, check=True)
+                        else:
+                            subprocess.run([
+                                "ffmpeg", "-i", str(local_asset), "-t", str(duration),
+                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
+                            ], capture_output=True, text=True, check=True)
+                    else:
+                        print(f"Local asset not found: {asset_url}")
+                        continue
+                else:
+                    async with httpx.AsyncClient(timeout=30.0) as hc:
+                        r = await hc.get(asset_url)
+                        r.raise_for_status()
+                        content = r.content
+                    dl_path = temp_dir / f"dl_{i}.tmp"
+                    dl_path.write_bytes(content)
+                    
+                    is_image = dl_path.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"] or content[:8] == b'\xff\xd8\xff' or content[:4] == b'\x89PNG'
+                    if is_image:
+                        subprocess.run([
+                            "ffmpeg", "-loop", "1", "-i", str(dl_path), "-t", str(duration),
+                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                        ], capture_output=True, text=True, check=True)
+                    else:
+                        subprocess.run([
+                            "ffmpeg", "-i", str(dl_path), "-t", str(duration),
+                            "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
+                        ], capture_output=True, text=True, check=True)
+            else:
+                subprocess.run([
+                    "ffmpeg", "-ss", str(src_start), "-t", str(duration),
+                    "-i", str(video_path),
+                    "-c:v", "copy", "-c:a", "copy", "-avoid_negative_ts", "make_zero", "-y", str(out_path)
+                ], capture_output=True, text=True, check=True)
+            
+            if out_path.exists():
+                clip_files.append(out_path)
+                chapters_meta.append({
+                    "index": i + 1,
+                    "title": title,
+                    "duration": round(duration, 2),
+                    "file": out_path.name
+                })
+                
+        # Concat clips into main_edited_video.mp4
+        concat_list_path = temp_dir / "concat.txt"
+        main_video_path = temp_dir / "main_edited_video.mp4"
+        if clip_files:
+            with open(concat_list_path, 'w') as f:
+                for cf in clip_files:
+                    f.write(f"file '{cf.absolute().as_posix()}'\n")
+            
+            subprocess.run([
+                "ffmpeg", "-f", "concat", "-safe", "0",
+                "-i", str(concat_list_path), "-c", "copy", "-y", str(main_video_path)
+            ], capture_output=True, text=True, check=True)
+            
+        # Write metadata
+        meta_path = temp_dir / "chapters.json"
+        metadata = {
+            "session_id": session_id,
+            "export_date": datetime.now().isoformat(),
+            "chapters": chapters_meta,
+            "transcript_segments": body.transcriptSegments
+        }
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+            
+        # Create ZIP
+        zip_path = UPLOAD_DIR / f"{session_id}_export.zip"
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            if main_video_path.exists():
+                zipf.write(main_video_path, main_video_path.name)
+            for cf in clip_files:
+                if cf.exists():
+                    zipf.write(cf, f"clips/{cf.name}")
+            if meta_path.exists():
+                zipf.write(meta_path, meta_path.name)
+                
+        return FileResponse(
+            str(zip_path),
+            media_type="application/zip",
+            filename=f"autoedit_{session_id[:8]}.zip"
+        )
+    except subprocess.CalledProcessError as e:
+        err = e.stderr if e.stderr else str(e)
+        print(f"[export-zip] FFmpeg error: {err}")
+        raise HTTPException(status_code=500, detail=f"FFmpeg error: {err}")
+    except Exception as e:
+        print(f"[export-zip] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 # ============================================================================
 # ROBUSTNESS LAYER: Helper functions for AI editing validation and execution

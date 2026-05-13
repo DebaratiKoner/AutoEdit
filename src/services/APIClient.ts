@@ -280,6 +280,45 @@ export class APIClient {
   }
 
   /**
+   * Export edited video as a ZIP containing main video, clips, and metadata
+   * @param sessionId - Session identifier
+   * @param timeline - Array of timeline segments
+   * @param transcriptSegments - Array of transcript segments for metadata
+   * @returns Promise resolving to a Blob (the ZIP file)
+   */
+  async exportZipVideo(
+    sessionId: string,
+    timeline: TimelineSegment[],
+    transcriptSegments: any[] = []
+  ): Promise<Blob> {
+    const response = await fetch(`${this.baseUrl}/videos/${sessionId}/export-zip`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ timeline, transcriptSegments }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorMessage = `Export failed with status ${response.status}`;
+      try {
+        const errorJson = JSON.parse(errorText);
+        if (errorJson.detail) {
+          errorMessage = typeof errorJson.detail === 'string'
+            ? errorJson.detail
+            : JSON.stringify(errorJson.detail);
+        }
+      } catch {
+        if (errorText) errorMessage = errorText;
+      }
+      throw new APIError(response.status, errorMessage, errorText);
+    }
+
+    return await response.blob();
+  }
+
+  /**
    * Retrieve session data
    * @param sessionId - Session identifier
    * @returns Promise resolving to session response

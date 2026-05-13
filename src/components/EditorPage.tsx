@@ -96,6 +96,12 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   const sessionManager = new SessionManager();
 
+  const getAvailableAudioTrack = (start: number, duration: number, audioSegs: TimelineSegment[]) => {
+    // Always place new audio on a new track at the bottom to ensure they stack downwards
+    const maxTrack = Math.max(0, ...audioSegs.map(s => s.track));
+    return maxTrack + 1;
+  };
+
   // LZ Compressor singleton (avoids repeated imports)
   const LZCompressor = {
     compress: (data: string): string => {
@@ -128,8 +134,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       transcript: currentSession.transcript,
       transcriptSegments: structuredClone(currentSession.transcriptSegments || []),
       transcriptHistory: structuredClone(currentSession.transcriptHistory || []),
-      undoStack: structuredClone(currentSession.undoStack),
-      redoStack: structuredClone(currentSession.redoStack),
+      undoStack: [], // Do not clone undo/redo stacks to prevent O(2^N) memory exponential blow-up
+      redoStack: [],
       lastModified: Date.now(),
     };
     const json = JSON.stringify(snapshot);
@@ -148,8 +154,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         timeline: structuredClone(snapshot.timeline || []),
         transcriptSegments: structuredClone(snapshot.transcriptSegments || []),
         transcriptHistory: structuredClone(snapshot.transcriptHistory || []),
-        undoStack: structuredClone(snapshot.undoStack || []),
-        redoStack: structuredClone(snapshot.redoStack || []),
+        undoStack: [],
+        redoStack: [],
         lastModified: Date.now(), // Update timestamp
       };
     } catch (error) {
@@ -293,8 +299,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         const totalDur = track0Segs.reduce((sum, s) => sum + s.duration, 0);
         const insertAt = Math.min(currentTime, totalDur);
         const audioSegs = session.timeline.filter(s => s.track >= 1);
-        const maxTrack = Math.max(0, ...audioSegs.map(s => s.track));
-        const trackToUse = maxTrack + 1;
+        const trackToUse = getAvailableAudioTrack(insertAt, assetDuration, audioSegs);
 
         const newSeg: TimelineSegment = {
           id: `local-${Date.now()}`, name: file.name,
@@ -687,12 +692,12 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
 /**
  * CRITICAL: Preserve custom clip names across ALL mutations.
- * Returns seg.name if set, otherwise null (no fallback to "Clip N").
- * Sequential "Clip 1,2,3" ONLY for initial untouched clips.
+ * Returns seg.name if set (never overwrite with "Clip N").
  */
 function preserveClipName(seg: TimelineSegment): string {
   return seg.name ?? `Clip`;
 }
+
 
 function getShortName(name: string | undefined | null, fallback: string) {
     if (!name || typeof name !== 'string') return fallback;
@@ -820,6 +825,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
     if (activeAudio && activeAudio.assetUrl) {
       const offsetInClip = currentTime - (activeAudio.timelineStart ?? 0);
+      const activeVideo = session.timeline.find(s => s.track === 0 && currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + s.duration);
+      const activeVideoVol = activeVideo?.volume ?? 1;
       // vol is 0-5: 1 = 100%, 2 = 200%, etc.
       const vol = Math.max(0, activeAudio.volume ?? 1);
       // freq is 0.5-2.0: 1 = normal pitch, 0.5 = half speed/pitch, 2.0 = double speed/pitch
@@ -873,7 +880,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       if (video) {
         const volEffective = Math.max(0, vol * globalVolume);
         const duckedVolume = Math.max(0.05, 1 - (volEffective * 0.4));
-        video.volume = duckedVolume * videoVolume; // Apply both ducking and explicit video volume
+        video.volume = Math.min(1, duckedVolume * videoVolume * activeVideoVol);
       }
 
       if (audioSrcRef.current !== activeAudio.assetUrl) {
@@ -896,7 +903,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
     } else {
       if (!au.paused) au.pause();
       if (audioSrcRef.current) { au.src = ''; audioSrcRef.current = ''; }
-      if (video) video.volume = videoVolume; // Use explicit video volume when no audio
+      const activeVideo = session.timeline.find(s => s.track === 0 && currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + s.duration);
+      const activeVideoVol = activeVideo?.volume ?? 1;
+      if (video) video.volume = Math.min(1, videoVolume * activeVideoVol);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTime, isPlaying, session?.timeline, globalVolume, videoVolume]);
@@ -1028,7 +1037,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
           assetSrcRef.current = clip.assetUrl;
         }
         av.currentTime = offset;
-        av.volume = 1;
+        av.volume = Math.min(1, (clip.volume ?? 1) * videoVolume);
         setAssetVideoOpacity(1);
         isSwitchingRef.current = false;
         isJumpingRef.current = false;
@@ -1546,13 +1555,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
     const color1 = segmentToCut.color || availableColors[0];
     const color2 = availableColors[(availableColors.indexOf(color1) + 1) % availableColors.length];
     
-    // FIXED: Smart name splitting - "MyClip" → "MyClip-A/B", "Clip1-A" → "Clip1-A1/A2"
-    const baseNameMatch = segmentToCut.name?.match(/^(.+?)(?:-([AB]\\d+))?$/i);
-    const baseName = baseNameMatch ? baseNameMatch[1].trim() : (segmentToCut.name || `Clip ${segmentToCut.order + 1}`);
-    const partNum = baseNameMatch?.[2] ? parseInt(baseNameMatch[2].slice(1)) : 0;
+    const baseName = segmentToCut.name || `Clip ${segmentToCut.order + 1}`;
     
-    const segment1Name = partNum > 0 ? `${baseName}-${String.fromCharCode(65 + partNum)}${1}` : `${baseName}-A`;
-    const segment2Name = partNum > 0 ? `${baseName}-${String.fromCharCode(65 + partNum)}${2}` : `${baseName}-B`;
+    const segment1Name = `${baseName}-1`;
+    const segment2Name = `${baseName}-2`;
+
     
     const segment1: TimelineSegment = {
       ...segmentToCut,
@@ -2186,86 +2193,77 @@ function getShortName(name: string | undefined | null, fallback: string) {
   // Asset management functions
 
   const handleExport = async () => {
-    logger.operation("Export process started");
-    
-    if (!session || session.timeline.length === 0) {
-      alert('No clips to export.');
-      return;
-    }
+  logger.operation("Export started");
 
-    setIsExporting(true);
+  if (!session || session.timeline.length === 0) {
+    alert("No clips to export");
+    return;
+  }
 
-    try {
-      // const exportClips = [...session.timeline]
-      //   .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0))
-      //   .map(c => ({
-      //     ...c,
-      //     start: c.timelineStart ?? 0,
-      //     end: (c.timelineStart ?? 0) + (c.duration ?? 0),
-      //   }));
+  setIsExporting(true);
 
+  try {
+    const exportClips = [...session.timeline]
+      .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0))
+      .map(c => ({
+        id: c.id,
+        start: c.sourceStart ?? c.sourceStart ?? 0,
+        end: c.sourceEnd ?? c.sourceEnd ?? 0,
+        timelineStart: c.timelineStart ?? 0,
+        duration: c.duration,
+        assetUrl: c.assetUrl,
+        assetKind: c.assetKind,
+        volume: c.volume ?? 1,
+        track: c.track ?? 0,
+        name: c.name ?? "Clip"
+      }));
 
-      const orderedTimeline = [...session.timeline]
-        .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0))
-        .map(c => {
-          const sourceStart = c.sourceStart ?? 0;
-          const sourceEnd = c.sourceEnd ?? (sourceStart + (c.duration ?? 0));
-          return {
-            id: c.id,
-            start: c.timelineStart ?? 0,
-            end: (c.timelineStart ?? 0) + (c.duration ?? 0),
-            sourceStart,
-            sourceEnd,
-            duration: c.duration ?? Math.max(0, sourceEnd - sourceStart),
-            segments: (c as any).segments,
-            assetUrl: c.assetUrl,
-            assetKind: c.assetKind,
-            track: c.track,
-            volume: c.volume,
-          };
-        });
-
-      const hasAssetsOrAudioOverlays = orderedTimeline.some(c => c.assetUrl || c.track !== 0);
-      const endpoint = hasAssetsOrAudioOverlays ? `/api/videos/${sessionId}/export-with-clips` : `/api/videos/${sessionId}/export-fast`;
-
-      logger.operation(hasAssetsOrAudioOverlays ? 'Using full timeline export' : 'Using fast cached export');
-
-      const timeline = orderedTimeline.filter(c => c.track === 0);
-      const requestBody = !hasAssetsOrAudioOverlays
-        ? { timeline }
-        : { clips: orderedTimeline };
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
+    const response = await fetch(
+      `/api/videos/${sessionId}/export-with-clips`,
+      {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json',
+          "Content-Type": "application/json"
         },
-        body: JSON.stringify(requestBody),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Export failed: ${response.status} ${errorText}`);
+        body: JSON.stringify({
+          clips: exportClips,
+          options: {
+            fps: 30,
+            width: 1280,
+            height: 720
+          }
+        })
       }
+    );
 
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `edited-${sessionId.slice(0, 8)}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
-      logger.operation(`Export download completed`);
-    } catch (err) {
-      logger.error("Export error:", err);
-      alert(`Export failed: ${err instanceof Error ? err.message : 'Network error'}`);
-    } finally {
-      window.setTimeout(() => setIsExporting(false), 1000);
+    if (!response.ok) {
+      throw new Error("Export failed");
     }
-  };
+
+    // DIRECT DOWNLOAD
+    const blob = await response.blob();
+
+    const downloadUrl = window.URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = `edited-video-${Date.now()}.mp4`;
+
+    document.body.appendChild(a);
+    a.click();
+
+    // cleanup
+    a.remove();
+    window.URL.revokeObjectURL(downloadUrl);
+
+    logger.operation("Video downloaded instantly");
+  } catch (err) {
+    console.error(err);
+    alert("Export failed");
+  } finally {
+    setIsExporting(false);
+  }
+};
 
   const handleResetConfirm = async () => {
     if (session) {
@@ -2472,52 +2470,6 @@ transition: 'opacity 0.02s linear',
 
                 {/* Audio and Video Volume Controls */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginLeft: '10px', marginRight: '10px' }}>
-                  {/* Audio Volume Control */}
-                  {hasAudioClip && (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <button
-                        type="button"
-                        onClick={() => handleGlobalVolumeChange(globalVolume > 0 ? 0 : 1)}
-                        style={{ padding: '2px', background: 'transparent', border: 'none', cursor: 'pointer', color: '#1abc9c' }}
-                        title={globalVolume > 0 ? 'Mute audio' : 'Unmute audio'}
-                      >
-                        {globalVolume === 0 ? (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                            <line x1="23" y1="9" x2="17" y2="15"></line>
-                            <line x1="17" y1="9" x2="23" y2="15"></line>
-                          </svg>
-                        ) : globalVolume < 0.3 ? (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                          </svg>
-                        ) : globalVolume < 0.7 ? (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                            <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                          </svg>
-                        ) : (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                          </svg>
-                        )}
-                      </button>
-                      <input
-                        type="range"
-                        min="0"
-                        max="500"
-                        step="5"
-                        value={Math.round(globalVolume * 100)}
-                        onChange={(e) => handleGlobalVolumeChange(parseInt(e.target.value) / 100)}
-                        title="Audio Volume (0-500%)"
-                        style={{ width: '60px', cursor: 'pointer', accentColor: '#1abc9c' }}
-                      />
-                    </div>
-                  )}
-
                   {/* Video Volume Control */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                     <button
@@ -2619,153 +2571,11 @@ transition: 'opacity 0.02s linear',
                 <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
               </svg>
             </button>
-
-            {/* Audio controls for selected audio segment - MAIN AUDIO FOCUS */}
-            {selectedSegmentId && session.timeline.find(s => s.id === selectedSegmentId)?.assetKind === 'audio' && (() => {
-              const seg = session.timeline.find(s => s.id === selectedSegmentId)!;
-              const effectiveVol = Math.max(0, Math.min(5, seg.volume ?? 1));
-              const vol = Math.round(effectiveVol * 100);
-              const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0) || 1;
-              const maxDur = (seg.originalDuration && seg.originalDuration > 0) ? seg.originalDuration : track0Dur;
-              const duration = Math.round(seg.duration * 10) / 10;
-              return (
-              <div className="volume-control" style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', gap: '14px', background: '#1a1a2e', padding: '10px 14px', borderRadius: '8px', border: '1px solid rgba(26,188,156,0.3)', flexWrap: 'wrap' }}>
-                <span style={{ fontSize: '0.7rem', color: '#1abc9c', fontWeight: '500', minWidth: 'fit-content' }}>
-                  📻 Audio Adjustments
-                </span>
-                
-                {/* Sound/Volume Control */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(26,188,156,0.1)', borderRadius: '4px' }}>
-                  <button
-                    type="button"
-                    onClick={() => handleVolumeChange(selectedSegmentId, Math.max(0, effectiveVol - 0.2))}
-                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#1abc9c', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
-                    title="Decrease volume (−20%)"
-                  >
-                    −
-                  </button>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#1abc9c" strokeWidth="2.5">
-                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                  </svg>
-                  <input
-                    type="range"
-                    min="0"
-                    max="500"
-                    step="5"
-                    value={vol}
-                    onChange={(e) => handleVolumeChange(selectedSegmentId, parseInt(e.target.value) / 100)}
-                    title={`Audio volume: ${vol}%`}
-                    style={{ width: '110px', cursor: 'pointer', accentColor: '#1abc9c' }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleVolumeChange(selectedSegmentId, Math.min(5, effectiveVol + 0.2))}
-                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#1abc9c', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
-                    title="Increase volume (+20%)"
-                  >
-                    +
-                  </button>
-                  <span style={{ fontSize: '0.72rem', color: '#1abc9c', minWidth: '55px', fontVariantNumeric: 'tabular-nums', fontWeight: '500' }}>
-                    {vol}%
-                  </span>
-                </div>
-
-                {/* Duration Control - Audio Length */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(26,188,156,0.1)', borderRadius: '4px' }}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const newDur = Math.max(0.5, duration - 0.5);
-                      handleWavelengthChange(selectedSegmentId, newDur);
-                    }}
-                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#8fd8d2', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
-                    title="Decrease duration (−0.5s)"
-                  >
-                    −
-                  </button>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8fd8d2" strokeWidth="2.5">
-                    <circle cx="12" cy="12" r="10"></circle>
-                    <polyline points="12 6 12 12 16 14"></polyline>
-                  </svg>
-                  <input
-                    type="range"
-                    min="0.5"
-                    max={maxDur}
-                    step="0.1"
-                    value={duration}
-                    onChange={(e) => handleWavelengthChange(selectedSegmentId, parseFloat(e.target.value))}
-                    title={`Audio duration: ${duration.toFixed(1)}s of ${maxDur.toFixed(1)}s`}
-                    style={{ width: '130px', cursor: 'pointer', accentColor: '#8fd8d2' }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const newDur = Math.min(maxDur, duration + 0.5);
-                      handleWavelengthChange(selectedSegmentId, newDur);
-                    }}
-                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#8fd8d2', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
-                    title="Increase duration (+0.5s)"
-                  >
-                    +
-                  </button>
-                  <span style={{ fontSize: '0.72rem', color: '#8fd8d2', minWidth: '58px', fontVariantNumeric: 'tabular-nums', fontWeight: '500' }}>
-                    {duration.toFixed(1)}s
-                  </span>
-                </div>
-
-                {/* Pitch/Frequency Control */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(255,107,107,0.1)', borderRadius: '4px' }}>
-                  <button
-                    type="button"
-                    onClick={() => handleFrequencyChange(selectedSegmentId, Math.max(0.5, (seg.frequency ?? 1) - 0.1))}
-                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#ff9999', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
-                    title="Lower pitch (−0.1x)"
-                  >
-                    −
-                  </button>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9999" strokeWidth="2.5">
-                    <path d="M9 12l2 2 4-4"/>
-                    <path d="M21 12c-1 0-3-1-3-3s2-3 3-3 3 1 3 3-2 3-3 3"/>
-                    <path d="M3 12c1 0 3-1 3-3s-2-3-3-3-3 1-3 3 2 3 3 3"/>
-                  </svg>
-                  <input
-                    type="range"
-                    min="0.5"
-                    max="2.0"
-                    step="0.1"
-                    value={seg.frequency ?? 1}
-                    onChange={(e) => handleFrequencyChange(selectedSegmentId, parseFloat(e.target.value))}
-                    title={`Pitch: ${(seg.frequency ?? 1).toFixed(1)}x (0.5x = half speed, 2.0x = double speed)`}
-                    style={{ width: '110px', cursor: 'pointer', accentColor: '#ff9999' }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleFrequencyChange(selectedSegmentId, Math.min(2.0, (seg.frequency ?? 1) + 0.1))}
-                    style={{ width: '26px', height: '26px', borderRadius: '4px', border: '1px solid #333', background: '#111', color: '#ff9999', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold' }}
-                    title="Raise pitch (+0.1x)"
-                  >
-                    +
-                  </button>
-                  <span style={{ fontSize: '0.72rem', color: '#ff9999', minWidth: '42px', fontVariantNumeric: 'tabular-nums', fontWeight: '500' }}>
-                    {(seg.frequency ?? 1).toFixed(1)}x
-                  </span>
-                </div>
-
-                {/* Info Display */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', background: 'rgba(52,73,94,0.2)', borderRadius: '4px', marginLeft: 'auto' }}>
-                  <span style={{ fontSize: '0.65rem', color: '#7f8c8d', whiteSpace: 'nowrap' }}>
-                    📊 {seg.duration.toFixed(1)}s / {maxDur.toFixed(1)}s
-                  </span>
-                </div>
-              </div>
-              );
-            })()}
           </div>
 
 {/* Timeline — Clip Section */}
-          <div className="timeline">
-            <div className="timeline-inner">
+          <div className="timeline" style={{ display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+            <div className="timeline-inner" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
               {/* Total timeline duration = sum of all clip durations (includes assets on track 0) */}
               {(() => {
           const { timeToPx, pxToTime, totalDur, totalPx } = getTimePxMapping(session.timeline || []);
@@ -2779,11 +2589,11 @@ transition: 'opacity 0.02s linear',
                     </div>
 
                     {/* Scrollable area: ruler + video track + playhead */}
-                    <div style={{ position: 'relative' }}>
+                    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
                     <div
                       className={`timeline-content ${isDraggingPlayhead ? 'dragging' : ''}`}
                       ref={timelineRef}
-                      style={{ overflow: 'auto', position: 'relative', maxHeight: '400px' }}
+                      style={{ overflow: 'auto', position: 'relative', flex: 1, minHeight: '300px', maxHeight: '65vh' }}
                       onClick={(e) => {
                         if (!videoRef.current || isDraggingPlayhead) return;
                         const container = e.currentTarget;
@@ -2797,7 +2607,7 @@ transition: 'opacity 0.02s linear',
                     >
                       {/* Inner container — pixel-based so it grows and scrolls, paddingBottom prevents scrollbar overlap */}
         
-                      <div style={{ width: `${scrollableTimelinePx}px`, minWidth: '100%', position: 'relative', paddingBottom: '24px' }}>
+                      <div style={{ width: `${scrollableTimelinePx}px`, minWidth: '100%', position: 'relative', paddingBottom: '80px', paddingTop: '4px' }}>
                       {/* Timeline Ruler (Timestamps) */}
                       <div className="timeline-ruler" style={{ position: 'sticky', top: 0, zIndex: 30, backgroundColor: '#17191f', width: `${totalPx}px`, maxWidth: '100%', height: '18px', borderBottom: '1px solid #333' }}>
                         {[...Array(11)].map((_, i) => {
@@ -2819,7 +2629,7 @@ transition: 'opacity 0.02s linear',
                       <div
                         className="timeline-track"
                         data-track={0}
-                        style={{ position: 'sticky', top: '18px', zIndex: 25, height: '44px', backgroundColor: '#17191f', borderRadius: '6px', border: '1px solid #2a2a3e', overflow: 'hidden', marginTop: '4px', display: 'flex', width: `${totalPx}px`, maxWidth: '100%', boxShadow: '0 4px 10px rgba(0,0,0,0.5)' }}
+                        style={{ position: 'sticky', top: '18px', zIndex: 25, height: '48px', backgroundColor: '#17191f', borderRadius: '6px', border: '1px solid #2a2a3e', overflow: 'hidden', marginTop: '8px', display: 'flex', width: `${totalPx}px`, maxWidth: '100%', boxShadow: '0 4px 10px rgba(0,0,0,0.5)' }}
                         onDragOver={handleTrackDragOver}
                         onDrop={(e) => handleTrackDrop(0, e)}
                       >
@@ -2893,7 +2703,7 @@ transition: 'opacity 0.02s linear',
                       {(() => {
                         const audioSegs = (session.timeline || []).filter(s => s.track >= 1);
                         const maxAudioTrack = Math.max(1, ...audioSegs.map(s => s.track));
-                        const audioTrackIndices = Array.from({ length: maxAudioTrack }, (_, i) => i + 1);
+                        const audioTrackIndices = Array.from({ length: maxAudioTrack + 1 }, (_, i) => i + 1);
 
                         return audioTrackIndices.map(trackNum => {
                           const segmentsInTrack = audioSegs.filter(s => s.track === trackNum);
@@ -2902,16 +2712,15 @@ transition: 'opacity 0.02s linear',
                               key={`audio-track-${trackNum}`}
                               className="timeline-track audio-track"
                               data-track={trackNum}
-                              style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '4px', border: '1px solid rgba(26,188,156,0.18)', height: '34px', overflow: 'visible', marginTop: '3px', width: `${totalPx}px`, maxWidth: '100%' }}
+                              style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '6px', border: '1px solid rgba(26,188,156,0.18)', height: '48px', minHeight: '48px', overflow: 'hidden', marginTop: '8px', width: `${totalPx}px`, maxWidth: '100%' }}
                               onDragOver={handleTrackDragOver}
                               onDrop={(e) => handleTrackDrop(trackNum, e)}
                             >
-                              {segmentsInTrack.length === 0 && trackNum === 1 && audioSegs.length === 0 && (
-                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#3a5a54', fontSize: '0.65rem', fontStyle: 'italic', gap: '4px', pointerEvents: 'none' }}>
-                                  <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-                                  audio
-                                </div>
-                              )}
+                              <div style={{ position: 'sticky', left: '0px', width: 'fit-content', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', paddingLeft: '10px', height: '100%', color: 'rgba(26,188,156,0.25)', fontSize: '0.75rem', fontWeight: 600, letterSpacing: '0.5px', gap: '6px', pointerEvents: 'none', zIndex: 0 }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                                AUDIO TRACK {trackNum}
+                              </div>
+                              
                               {segmentsInTrack.map((segment) => {
                                 const leftPx = ((segment.timelineStart ?? 0) / Math.max(totalDur, 1)) * totalPx;
                                 const widthPx = Math.max(4, (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * totalPx);
@@ -2934,7 +2743,7 @@ transition: 'opacity 0.02s linear',
                                       boxSizing: 'border-box',
                                       border: selectedSegmentId === segment.id ? '2px solid #fff' : isActive ? `2px solid ${bgColor}` : '1px solid rgba(26,188,156,0.5)',
                                       cursor: resizingSegmentId === segment.id ? 'ew-resize' : 'grab',
-                                      borderRadius: '3px', display: 'flex', alignItems: 'center', overflow: 'hidden',
+                                      borderRadius: '4px', display: 'flex', alignItems: 'center', overflow: 'hidden',
                                       zIndex: selectedSegmentId === segment.id ? 10 : isActive ? 5 : 1,
                                       opacity: isActive ? 1 : 0.85,
                                       boxShadow: isActive ? `0 0 8px ${bgColor}80` : 'none',
@@ -2962,11 +2771,11 @@ transition: 'opacity 0.02s linear',
                                       // If no modifier is pressed, let the event bubble up so the timeline scrolls naturally
                                     }}
                                   >
-                                    <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 2 }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'left')} />
+                                    <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '10px', cursor: 'ew-resize', zIndex: 12, background: 'linear-gradient(90deg, rgba(0,0,0,0.5) 0%, transparent 100%)' }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'left')} />
                                     <span style={{ fontSize: '0.6rem', color: '#fff', padding: '0 6px', whiteSpace: 'normal', wordBreak: 'break-word', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', textShadow: '0 1px 2px rgba(0,0,0,0.8)', zIndex: 1, textAlign: 'center', fontWeight: '500' }}>
                                       {segment.name || 'Audio'} {Math.round(vol * 100)}%
                                     </span>
-                                    <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '6px', cursor: 'ew-resize', zIndex: 2 }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'right')} />
+                                    <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '10px', cursor: 'ew-resize', zIndex: 12, background: 'linear-gradient(270deg, rgba(0,0,0,0.5) 0%, transparent 100%)' }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'right')} />
                                   </div>
                                 );
                               })}
@@ -3023,7 +2832,7 @@ transition: 'opacity 0.02s linear',
 {activeTab === 'clips' && (
             <div className="clips-tab">
               <div style={{ marginBottom: '0.75rem' }}>
-                <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fff' }}>All Timeline Items</h3>
+                <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fff' }}>Timeline Clips</h3>
               </div>
               {/* Hidden file input for per-clip local insert */}
               <input
@@ -3211,8 +3020,7 @@ transition: 'opacity 0.02s linear',
                 const insertAt = Math.min(currentTime, totalDur);
 
                 const audioSegs = session.timeline.filter(s => s.track >= 1);
-                const maxTrack = Math.max(0, ...audioSegs.map(s => s.track));
-                const trackToUse = maxTrack + 1;
+                const trackToUse = getAvailableAudioTrack(insertAt, assetDuration, audioSegs);
 
                 const newSegment: TimelineSegment = {
                   id: `asset-${Date.now()}`,
