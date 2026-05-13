@@ -1615,12 +1615,12 @@ function getShortName(name: string | undefined | null, fallback: string) {
     }, 100);
   };
 
-  const handleDelete = () => {
+  const handleDelete = (specificId?: string) => {
     if (!session) return;
 
     const previousSnapshot = saveFullSessionSnapshot(session);
 
-    let targetId = selectedSegmentId;
+    let targetId = typeof specificId === 'string' ? specificId : selectedSegmentId;
 
     // Auto-select the first track-0 clip if nothing is selected
     targetId = targetId || (
@@ -2590,7 +2590,7 @@ transition: 'opacity 0.02s linear',
             <button 
               className="btn btn-icon" 
               title="Delete selected segment" 
-              onClick={handleDelete}
+              onClick={() => handleDelete()}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="3 6 5 6 21 6" />
@@ -3171,7 +3171,7 @@ transition: 'opacity 0.02s linear',
                             className="btn btn-icon"
                             style={{ padding: '4px', color: '#e74c3c' }}
                             title="Delete clip"
-                          onClick={(e) => { e.stopPropagation(); handleDelete(); }}
+                          onClick={(e) => { e.stopPropagation(); handleDelete(clip.id); }}
                           >
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                               <polyline points="3 6 5 6 21 6" />

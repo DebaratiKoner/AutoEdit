@@ -25,7 +25,9 @@ async def get_audio_assets(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        # trust_env=False bypasses system proxy env vars (HTTP_PROXY/HTTPS_PROXY/etc)
+        # which can sometimes break DNS resolution in certain environments.
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
             data = response.json()
@@ -49,4 +51,9 @@ async def get_audio_assets(
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=f"Freesound error: {e.response.text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to reach Freesound: {str(e)}")
+        # Helpful hint: if you see getaddrinfo failures, it's often a proxy/DNS env issue.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach Freesound (url={url}): {str(e)}"
+        )
+

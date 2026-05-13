@@ -81,9 +81,6 @@ os.makedirs("uploads", exist_ok=True)  # ensure exists via os as well
 # Session → file path mapping — persisted to disk so server restarts don't lose it
 SESSION_STORE_PATH = Path("uploads/.sessions.json")
 
-# Transcription cache — persisted to disk so transcriptions survive restarts
-TRANSCRIPTION_CACHE_PATH = Path("uploads/.transcriptions.json")
-
 def _load_session_store() -> dict:
     if SESSION_STORE_PATH.exists():
         try:
@@ -97,45 +94,10 @@ def _save_session_store(store: dict) -> None:
     import json
     SESSION_STORE_PATH.write_text(json.dumps(store))
 
-def _load_transcription_cache() -> dict:
-    """Load transcription cache from disk"""
-    if TRANSCRIPTION_CACHE_PATH.exists():
-        try:
-            import json
-            return json.loads(TRANSCRIPTION_CACHE_PATH.read_text())
-        except Exception:
-            return {}
-    return {}
-
-def _save_transcription_cache(cache: dict) -> None:
-    """Save transcription cache to disk"""
-    import json
-    TRANSCRIPTION_CACHE_PATH.write_text(json.dumps(cache, indent=2))
-
-def _get_cache_key(session_id: str, clips: list = None) -> str:
-    """Generate a cache key for transcription based on session and clips"""
-    import hashlib
-    
-    if clips and len(clips) > 0:
-        # For edited mode, include clip timings in the cache key
-        clips_str = str(sorted([(c.get('start', 0), c.get('end', 0)) for c in clips]))
-        cache_key = f"{session_id}_edited_{hashlib.md5(clips_str.encode()).hexdigest()[:8]}"
-    else:
-        # For full mode, just use session_id
-        cache_key = f"{session_id}_full"
-    
-    return cache_key
-
 session_store: dict[str, str] = _load_session_store()
-transcription_cache: dict[str, dict] = _load_transcription_cache()
 
-# OpenAI client. Keep transcription calls bounded so a stalled upstream request
-# cannot leave the editor waiting forever.
-client = OpenAI(timeout=25.0, max_retries=1)
-
-class TranscriptionResponse(BaseModel):
-    transcript: str
-    segments: Optional[list] = None
+# OpenAI client
+client = OpenAI()
 
 class GenerateClipsRequest(BaseModel):
     segments: list
@@ -244,61 +206,6 @@ async def serve_ai_image(img_id: str):
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(str(img_path), media_type="image/jpeg")
 
-
-class GenerateAudioRequest(BaseModel):
-    text: str
-    voice: str = "alloy"  # alloy, echo, fable, onyx, nova, shimmer
-
-@app.post("/api/generate-audio")
-async def generate_audio(body: GenerateAudioRequest):
-    """Generate speech audio using OpenAI TTS from text."""
-    if not body.text or not body.text.strip():
-        raise HTTPException(status_code=400, detail="text is required")
-    if not client.api_key:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    try:
-        import uuid as _uuid
-        audio_id = str(_uuid.uuid4())[:8]
-        audio_path = UPLOAD_DIR / f"ai_audio_{audio_id}.mp3"
-
-        response = client.audio.speech.create(
-            model="tts-1",
-            voice=body.voice,
-            input=body.text.strip(),
-        )
-        response.stream_to_file(str(audio_path))
-
-        # Get duration via ffprobe
-        duration = 5.0
-        try:
-            import json as _json
-            result = subprocess.run([
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "json", str(audio_path)
-            ], capture_output=True, text=True)
-            meta = _json.loads(result.stdout)
-            duration = float(meta.get("format", {}).get("duration", 5.0))
-        except Exception:
-            pass
-
-        return JSONResponse({
-            "url": f"/api/assets/ai-audio/{audio_id}",
-            "duration": round(duration, 2),
-            "text": body.text.strip(),
-            "voice": body.voice,
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
-
-
-@app.get("/api/assets/ai-audio/{audio_id}")
-async def serve_ai_audio(audio_id: str):
-    """Serve a cached AI-generated audio file."""
-    audio_path = UPLOAD_DIR / f"ai_audio_{audio_id}.mp3"
-    if not audio_path.exists():
-        raise HTTPException(status_code=404, detail="Audio not found")
-    return FileResponse(str(audio_path), media_type="audio/mpeg")
-
 @app.get("/test-export")
 async def test_export_info():
     """
@@ -326,16 +233,6 @@ async def test_export_info():
         },
         "recommendation": "Use /export-with-clips for new implementations"
     }
-
-class TranscribeRequest(BaseModel):
-    clips: Optional[list] = None  # Optional: if provided, only transcribe these clips
-    quick: Optional[bool] = False  # If True, only transcribe first 90s for speed
-
-    class Config:
-        # Allow None values explicitly
-        validate_assignment = True
-class FastExportRequest(BaseModel):
-    timeline: list
 
 @app.get("/api/test/connection")
 async def test_connection():
@@ -383,563 +280,132 @@ async def test_connection():
     
     return JSONResponse(results)
 
-@app.delete("/api/transcriptions/cache")
-async def clear_transcription_cache():
-    """Clear all cached transcriptions"""
-    global transcription_cache
-    transcription_cache.clear()
-    _save_transcription_cache(transcription_cache)
-    return JSONResponse({"message": "Transcription cache cleared"})
-
-@app.get("/api/debug/transcription-cache/{session_id}")
-async def debug_transcription_cache(session_id: str):
-    """Debug endpoint to check transcription cache status for a session"""
-    cache_keys = list(transcription_cache.keys())
-    session_keys = [key for key in cache_keys if key.startswith(session_id)]
-    
-    result = {
-        "session_id": session_id,
-        "all_cache_keys": cache_keys,
-        "session_cache_keys": session_keys,
-        "has_full_transcript": f"{session_id}_full" in transcription_cache,
-        "cache_details": {}
-    }
-    
-    for key in session_keys:
-        cache_entry = transcription_cache[key]
-        result["cache_details"][key] = {
-            "transcript_length": len(cache_entry.get("transcript", "")),
-            "segments_count": len(cache_entry.get("segments", [])),
-            "mode": cache_entry.get("mode", "unknown"),
-            "timestamp": cache_entry.get("timestamp", "unknown")
-        }
-    
-    return JSONResponse(result)
-
-
-@app.get("/api/transcriptions/cache")
-async def get_transcription_cache():
-    """Get information about cached transcriptions"""
-    cache_info = {}
-    for key, value in transcription_cache.items():
-        cache_info[key] = {
-            "mode": value.get("mode", "unknown"),
-            "timestamp": value.get("timestamp", "unknown"),
-            "segments_count": len(value.get("segments", []))
-        }
-    return JSONResponse({
-        "cache_count": len(transcription_cache),
-        "cached_transcriptions": cache_info
-    })
-
-@app.options("/api/videos/{session_id}/transcribe")
-async def transcribe_options(session_id: str):
-    """Handle CORS preflight for transcribe endpoint"""
-    return JSONResponse(content={}, status_code=200)
-
-@app.get("/api/test/transcribe-test")
-async def test_transcribe_endpoint():
-    """Test endpoint to verify server is working"""
-    print("[test] Test endpoint called")
-    return JSONResponse({"status": "ok", "message": "Server is working"})
-
 @app.post("/api/videos/{session_id}/transcribe")
-async def transcribe_video(session_id: str, request: Request):
+async def transcribe_video(session_id: str):
     """
-    Transcribe video audio using OpenAI Whisper API with caching.
-    
-    CRITICAL: If clips are provided, only transcribes the EDITED timeline.
-    This ensures transcript reflects the current edited state, not the original video.
-    
-    Caches transcription results to avoid re-transcribing the same content.
+    Transcribe video audio using OpenAI Whisper API.
+    Simple implementation that transcribes the entire video.
     """
-    import sys
-    print(f"[transcribe] === ENDPOINT CALLED ===", flush=True)
-    sys.stdout.flush()
+    print(f"[transcribe] Starting transcription for session_id={session_id}")
     
-    # Parse request body manually
-    try:
-        body = await request.json()
-        print(f"[transcribe] session_id={session_id}", flush=True)
-        print(f"[transcribe] body type: {type(body)}", flush=True)
-        print(f"[transcribe] body content: {body}", flush=True)
-    except Exception as e:
-        print(f"[transcribe] Error parsing request body: {e}", flush=True)
-        raise HTTPException(status_code=400, detail=f"Invalid request body: {str(e)}")
+    # Check if OpenAI API key is configured
+    if not client.api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OpenAI API key not configured. Set OPENAI_API_KEY environment variable."
+        )
+    
+    # Find the video file
+    video_path = None
+    if session_id in session_store:
+        stored = Path(session_store[session_id])
+        if stored.exists():
+            video_path = stored
+    
+    if video_path is None:
+        for fname in os.listdir(str(UPLOAD_DIR)):
+            if fname.startswith(session_id) and not fname.endswith("_audio.mp3"):
+                video_path = UPLOAD_DIR / fname
+                break
+    
+    if video_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Video file not found for session {session_id}"
+        )
+    
+    print(f"[transcribe] Found video: {video_path}")
+    
+    # Extract audio from video
+    audio_path = UPLOAD_DIR / f"{session_id}_audio.mp3"
     
     try:
-        print(f"[transcribe] Received request for session_id={session_id}", flush=True)
-        print(f"[transcribe] Body type: {type(body)}", flush=True)
-        print(f"[transcribe] Body content: {body}", flush=True)
+        print(f"[transcribe] Extracting audio...")
+        result = subprocess.run([
+            "ffmpeg",
+            "-i", str(video_path),
+            "-vn",  # No video
+            "-acodec", "libmp3lame",
+            "-ar", "16000",  # 16kHz sample rate
+            "-ac", "1",  # Mono
+            "-b:a", "32k",  # 32kbps bitrate
+            "-y",  # Overwrite
+            str(audio_path)
+        ], capture_output=True, text=True)
         
-        # Check if OpenAI API key is configured
-        if not client.api_key:
-            raise HTTPException(
-                status_code=500,
-                detail="OpenAI API key not configured. Set OPENAI_API_KEY environment variable."
+        if result.returncode != 0:
+            print(f"[transcribe] ffmpeg error: {result.stderr[-500:]}")
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+        
+        print(f"[transcribe] Audio extracted successfully")
+        
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="ffmpeg not found. Please install ffmpeg and ensure it is on your PATH."
+        )
+    except subprocess.CalledProcessError as e:
+        error_output = e.stderr if isinstance(e.stderr, str) else str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract audio: {error_output}"
+        )
+    
+    # Transcribe using OpenAI Whisper API
+    try:
+        print(f"[transcribe] Calling Whisper API...")
+        with open(audio_path, "rb") as audio_file:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json"
             )
         
-        # Parse body if provided - handle both None and empty body
-        clips = None
-        quick_mode = True
-        if body is not None and isinstance(body, dict):
-            clips = body.get('clips', None)
-            quick_mode = body.get('quick', True)
+        print(f"[transcribe] Transcription complete")
         
-        print(f"[transcribe] session_id={session_id}")
-        print(f"[transcribe] clips provided: {len(clips) if clips else 0}")
+        # Clean up audio file
+        if audio_path.exists():
+            audio_path.unlink()
         
-        # Generate cache key based on session and clips
-        cache_key = _get_cache_key(session_id, clips)
-        print(f"[transcribe] cache_key={cache_key}")
-        
-        # Check if transcription is already cached
-        # Skip cache when clips are provided — timeline may have changed
-        if not clips and cache_key in transcription_cache:
-            cached_result = transcription_cache[cache_key]
-            print(f"[transcribe] CACHE HIT: Returning cached transcription")
-            return JSONResponse({
-                "transcript": cached_result["transcript"],
-                "segments": cached_result["segments"],
-                "mode": cached_result["mode"],
-                "cached": True
-            })
-        
-        print(f"[transcribe] CACHE MISS: Proceeding with transcription")
-        
-        if clips:
-            print(f"[transcribe] EDITED MODE: Transcribing only edited clips")
-            for i, clip in enumerate(clips):
-                print(f"[transcribe]   Clip {i+1}: {clip.get('start', 0):.2f}s - {clip.get('end', 0):.2f}s")
-        else:
-            print(f"[transcribe] FULL MODE: Transcribing entire original video")
-        print(f"[transcribe] Uploads folder contents: {os.listdir(str(UPLOAD_DIR))}")
-
-        # Resolve video path: check session store first, then scan disk by prefix
-        video_path = None
-
-        # 1. Check in-memory session store (valid within same server process)
-        if session_id in session_store:
-            stored = Path(session_store[session_id])
-            print(f"[transcribe] session_store hit → {stored}")
-            print(f"[transcribe] File exists: {stored.exists()}")
-            if stored.exists():
-                video_path = stored
-
-        # 2. Fallback: scan uploads dir for any file starting with session_id
-        if video_path is None:
-            for fname in os.listdir(str(UPLOAD_DIR)):
-                if fname.startswith(session_id) and not fname.endswith("_audio.mp3"):
-                    video_path = UPLOAD_DIR / fname
-                    print(f"[transcribe] Matched file: {video_path}")
-                    break
-
-        # 3. Last resort: try known extensions explicitly
-        if video_path is None:
-            for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv"]:
-                candidate = UPLOAD_DIR / f"{session_id}{ext}"
-                print(f"[transcribe] Searching for: {candidate}")
-                if candidate.exists():
-                    video_path = candidate
-                    print(f"[transcribe] Matched file: {video_path}")
-                    break
-
-        if video_path is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Video file not found for session {session_id}"
-            )
-        
-        # CRITICAL FIX: Extract audio and segment in one pass for max speed
-        clip_map = []  # built during clip extraction, used for timestamp remapping
-
-        chunk_dir = UPLOAD_DIR / f"{session_id}_chunks_{uuid.uuid4().hex[:8]}"
-        chunk_dir.mkdir(exist_ok=True)
-        chunk_pattern = str(chunk_dir / "chunk_%03d.mp3")
-
-        try:
-            if clips and len(clips) > 0:
-                # EDITED MODE: Extract audio only for the clips in the edited timeline.
-                # Use ultra-low bitrate (8kbps, 8kHz mono) so even long videos stay small
-                # and Whisper finishes in 10-20s regardless of video length.
-                print(f"[transcribe] Extracting audio for {len(clips)} edited clips...")
-
-                temp_audio_files = []
-                concat_list_path = UPLOAD_DIR / f"{session_id}_concat_list.txt"
-
-                # Build clip_map as we extract — used later for timestamp remapping
-                clip_map = []   # {audio_start, audio_end, timeline_start}
-                audio_cursor = 0.0
-
-                try:
-                    for i, clip in enumerate(clips):
-                        c_start    = float(clip.get("start", 0))
-                        c_end      = float(clip.get("end", 0))
-                        c_dur      = c_end - c_start
-                        tl_start   = float(clip.get("timelineStart", c_start))
-
-                        if c_dur <= 0:
-                            print(f"[transcribe] WARNING: Clip {i+1} has zero/negative duration, skipping")
-                            continue
-
-                        temp_clip_audio = UPLOAD_DIR / f"{session_id}_clip_{i+1}_audio.mp3"
-                        temp_audio_files.append(temp_clip_audio)
-
-                        clip_map.append({
-                            "audio_start":    audio_cursor,
-                            "audio_end":      audio_cursor + c_dur,
-                            "timeline_start": tl_start,
-                        })
-                        audio_cursor += c_dur
-
-                        print(f"[transcribe] Clip {i+1}: source {c_start:.2f}s-{c_end:.2f}s → timeline {tl_start:.2f}s (audio offset {clip_map[-1]['audio_start']:.2f}s)")
-
-                        result = subprocess.run([
-                            "ffmpeg",
-                            "-ss", str(c_start),
-                            "-t",  str(c_dur),
-                            "-i",  str(video_path),
-                            "-vn",
-                            "-acodec", "libmp3lame",
-                            "-ar", "8000",   # 8kHz — enough for speech, tiny file
-                            "-ac", "1",
-                            "-b:a", "8k",    # 8kbps — ~60KB/min
-                            "-threads", "0",
-                            "-y",
-                            str(temp_clip_audio)
-                        ], capture_output=True, text=True, timeout=max(30, min(180, int(c_dur * 3 + 30))))
-
-                        if result.returncode != 0:
-                            print(f"[transcribe] ffmpeg error clip {i+1}: {result.stderr[-300:]}")
-                            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-
-                    if not temp_audio_files:
-                        raise HTTPException(status_code=400, detail="No valid clips to transcribe")
-
-                    # Concatenate all clip audio files into one
-                    print(f"[transcribe] Concatenating {len(temp_audio_files)} segments (total audio: {audio_cursor:.1f}s)...")
-                    with open(concat_list_path, 'w') as f:
-                        for tf in temp_audio_files:
-                            escaped = str(tf.absolute()).replace('\\', '/')
-                            f.write(f"file '{escaped}'\n")
-
-                    result = subprocess.run([
-                        "ffmpeg", "-f", "concat", "-safe", "0",
-                        "-i", str(concat_list_path),
-                        "-f", "segment", "-segment_time", "30",
-                        "-c", "copy", "-y", chunk_pattern
-                    ], capture_output=True, text=True, timeout=max(60, min(240, int(audio_cursor * 2 + 30))))
-
-                    if result.returncode != 0:
-                        print(f"[transcribe] ffmpeg concat/segment error: {result.stderr[-300:]}")
-                        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-
-                    print(f"[transcribe] Concatenation and segmentation done → {chunk_dir}")
-
-                finally:
-                    for tf in temp_audio_files:
-                        if tf.exists():
-                            tf.unlink()
-                    if concat_list_path.exists():
-                        concat_list_path.unlink()
-
-            else:
-                # FULL MODE: Extract entire original video audio at ultra-low bitrate directly into segments
-                print(f"[transcribe] Full-video mode, extracting and segmenting all audio at 8kbps...")
-                full_extract_cmd = [
-                    "ffmpeg"
-                ]
-                if quick_mode:
-                    full_extract_cmd.extend(["-t", "90"])
-                full_extract_cmd.extend([
-                    "-i", str(video_path),
-                    "-vn",
-                    "-acodec", "libmp3lame",
-                    "-ar", "8000",
-                    "-ac", "1",
-                    "-b:a", "8k",
-                    "-f", "segment",
-                    "-segment_time", "30",
-                    "-threads", "0",
-                    "-y", chunk_pattern
-                ])
-                result = subprocess.run(
-                    full_extract_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=180 if quick_mode else 360
-                )
-
-                if result.returncode != 0:
-                    print(f"[transcribe] ffmpeg full extraction/segmentation error: {result.stderr[-300:]}")
-                    raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-
-                print(f"[transcribe] Full audio extraction and segmentation complete")
-        
-        except FileNotFoundError:
-            raise HTTPException(
-                status_code=500,
-                detail="ffmpeg not found. Please install ffmpeg and ensure it is on your PATH."
-            )
-        except subprocess.TimeoutExpired as e:
-            error_output = e.stderr if isinstance(e.stderr, str) else str(e)
-            print(f"[transcribe] ffmpeg timeout: {error_output}")
-            raise HTTPException(
-                status_code=504,
-                detail="Audio extraction timed out. Try trimming the clip shorter and transcribing again."
-            )
-        except subprocess.CalledProcessError as e:
-            error_output = e.stderr if isinstance(e.stderr, str) else (e.stderr.decode() if e.stderr else str(e))
-            print(f"[transcribe] ffmpeg error: {error_output}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to extract audio: {error_output}"
-            )
-        
-        # Transcribe using OpenAI Whisper API — chunked for concurrent speed
-        print(f"[transcribe] Preparing concurrent OpenAI Whisper API calls")
-        import concurrent.futures
-
-        chunk_files = sorted(list(chunk_dir.glob("chunk_*.mp3")))
-        print(f"[transcribe] Discovered {len(chunk_files)} chunks")
-
-        def transcribe_chunk(chunk_file, index):
-            max_retries = 2
-            retry_delay = 1
-            for attempt in range(max_retries):
-                try:
-                    with open(chunk_file, "rb") as f:
-                        return client.audio.transcriptions.create(
-                            model="whisper-1",
-                            file=f,
-                            response_format="verbose_json",
-                            language="en"
-                        )
-                except Exception as e:
-                    error_message = str(e)
-                    print(f"[transcribe] Attempt {attempt + 1} failed for chunk {index}: {error_message}")
-                    if attempt == max_retries - 1:
-                        if "Connection error" in error_message or "getaddrinfo failed" in error_message:
-                            raise HTTPException(status_code=503, detail="Unable to connect to OpenAI API.")
-                        elif "API key" in error_message or "authentication" in error_message.lower():
-                            raise HTTPException(status_code=401, detail="OpenAI API authentication failed.")
-                        else:
-                            raise HTTPException(status_code=500, detail=f"OpenAI API error: {error_message}")
-                    import time
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-
-        transcript_text = ""
-        raw_segs = []
-
-        chunk_seconds = 30.0
-        max_workers = max(1, min(6, len(chunk_files)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {
-                executor.submit(transcribe_chunk, chunk_file, i): (i, chunk_file)
-                for i, chunk_file in enumerate(chunk_files)
-            }
-            
-            results = [None] * len(chunk_files)
-            for future in concurrent.futures.as_completed(future_to_chunk):
-                i, chunk_file = future_to_chunk[future]
-                results[i] = future.result()
-
-        for i, res in enumerate(results):
-            if not res: continue
-            transcript_text += res.text.strip() + " "
-            time_offset = i * chunk_seconds
-            if hasattr(res, 'segments') and res.segments:
-                for seg in res.segments:
-                    if isinstance(seg, dict):
-                        raw_segs.append({
-                            "start": float(seg["start"]) + time_offset,
-                            "end": float(seg["end"]) + time_offset,
-                            "text": seg["text"]
-                        })
-                    else:
-                        raw_segs.append({
-                            "start": float(seg.start) + time_offset,
-                            "end": float(seg.end) + time_offset,
-                            "text": seg.text
-                        })
-
-        transcript_text = transcript_text.strip()
+        # Extract transcript and segments
+        transcript = response.text
         segments = []
-        mode = "edited" if clips else "full"
-        # Clean up audio files
-        for chunk_file in chunk_files:
-            if chunk_file.exists():
-                chunk_file.unlink()
-        try:
-            chunk_dir.rmdir()
-        except:
-            pass
-        print(f"[transcribe] Cleaned up chunks and original audio")
-
-        if raw_segs:
-            if clips and len(clips) > 0 and clip_map:
-                # Remap Whisper timestamps (relative to concatenated audio) → timeline positions
-                print(f"[transcribe] Remapping {len(raw_segs)} Whisper segments to timeline time...")
-                print(f"[transcribe] clip_map: {clip_map}")
-
-                for seg in raw_segs:
-                    w_start = seg["start"]
-                    w_end   = seg["end"]
-
-                    # Find which clip window this segment's start falls in
-                    matched = None
-                    for cm in clip_map:
-                        if w_start >= cm["audio_start"] and w_start < cm["audio_end"]:
-                            matched = cm
-                            break
-                    # If past the last clip (rounding), use the last one
-                    if matched is None:
-                        matched = clip_map[-1]
-
-                    offset_in_clip = w_start - matched["audio_start"]
-                    end_offset     = w_end   - matched["audio_start"]
-
+        
+        if hasattr(response, 'segments') and response.segments:
+            for seg in response.segments:
+                if isinstance(seg, dict):
                     segments.append({
-                        "start": round(matched["timeline_start"] + offset_in_clip, 2),
-                        "end":   round(matched["timeline_start"] + end_offset,     2),
-                        "text":  seg["text"].strip(),
+                        "start": round(float(seg["start"]), 2),
+                        "end": round(float(seg["end"]), 2),
+                        "text": seg["text"].strip()
                     })
-
-                print(f"[transcribe] Remapped {len(segments)} segments. First: {segments[0] if segments else 'none'}")
-            else:
-                # Full-video mode: Whisper timestamps are already correct
-                segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"].strip()} for s in raw_segs]
-                print(f"[transcribe] Full-video: {len(segments)} segments")
-        
-        # Cache the transcription result
-        transcription_result = {
-            "transcript": transcript_text,
-            "segments": segments,
-            "mode": mode,
-            "timestamp": str(datetime.now())
-        }
-        
-        transcription_cache[cache_key] = transcription_result
-        _save_transcription_cache(transcription_cache)
-        print(f"[transcribe] Cached transcription result with key: {cache_key}")
+                else:
+                    segments.append({
+                        "start": round(float(seg.start), 2),
+                        "end": round(float(seg.end), 2),
+                        "text": seg.text.strip()
+                    })
         
         return JSONResponse({
-            "transcript": transcript_text,
-            "segments": segments,
-            "mode": mode,
-            "cached": False
+            "transcript": transcript,
+            "segments": segments
         })
         
-    except HTTPException:
-        raise
-    except subprocess.CalledProcessError as e:
-        error_output = e.stderr if isinstance(e.stderr, str) else (e.stderr.decode() if e.stderr else str(e))
-        print(f"[transcribe] subprocess error: {error_output}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to extract audio from video: {error_output}"
-        )
     except Exception as e:
-        print(f"[transcribe] exception: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Transcription failed: {str(e)}"
-        )
-class FastExportRequest(BaseModel):
-    timeline: list
+        # Clean up audio file on error
+        if audio_path.exists():
+            audio_path.unlink()
+        
+        error_message = str(e)
+        print(f"[transcribe] Error: {error_message}")
+        
+        if "Connection error" in error_message or "getaddrinfo failed" in error_message:
+            raise HTTPException(status_code=503, detail="Unable to connect to OpenAI API.")
+        elif "API key" in error_message or "authentication" in error_message.lower():
+            raise HTTPException(status_code=401, detail="OpenAI API authentication failed.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Transcription failed: {error_message}")
 
-
-@app.post("/api/videos/{session_id}/fast-export")
-async def fast_export(session_id: str, body: FastExportRequest):
-
-    import uuid
-    import subprocess
-    from pathlib import Path
-
-    if session_id not in session_store:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    video_path = Path(session_store[session_id])
-
-    export_id = str(uuid.uuid4())[:8]
-
-    temp_dir = UPLOAD_DIR / f"export_{export_id}"
-    temp_dir.mkdir(exist_ok=True)
-
-    concat_file = temp_dir / "concat.txt"
-
-    clip_files = []
-
-    try:
-
-        # CUT ALL CLIPS
-        for i, clip in enumerate(body.timeline):
-
-            start = clip.get("sourceStart", 0)
-            duration = clip.get("duration", 0)
-
-            clip_path = temp_dir / f"clip_{i}.mp4"
-
-            subprocess.run([
-                "ffmpeg",
-
-                "-ss", str(start),
-
-                "-t", str(duration),
-
-                "-i", str(video_path),
-
-                "-c", "copy",
-
-                "-avoid_negative_ts", "1",
-
-                "-y",
-
-                str(clip_path)
-
-            ], check=True)
-
-            clip_files.append(clip_path)
-
-        # CONCAT FILE
-        with open(concat_file, "w", encoding="utf-8") as f:
-            for c in clip_files:
-                f.write(f"file '{c.absolute().as_posix()}'\n")
-
-        output_path = temp_dir / "final.mp4"
-
-        # JOIN CLIPS
-        subprocess.run([
-            "ffmpeg",
-
-            "-f", "concat",
-
-            "-safe", "0",
-
-            "-i", str(concat_file),
-
-            "-c", "copy",
-
-            "-movflags", "+faststart",
-
-            "-y",
-
-            str(output_path)
-
-        ], check=True)
-
-        return FileResponse(
-            path=str(output_path),
-            filename="export.mp4",
-            media_type="video/mp4"
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
 @app.post("/api/videos/upload")
 async def upload_video(file: UploadFile = File(...), session_id: Optional[str] = None):
     """
@@ -1319,6 +785,8 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     """
     import json as _json
 
+    original_transcript = None
+
     # Validate prompt
     if not body.prompt or not body.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required.")
@@ -1327,65 +795,18 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     if not body.segments:
         raise HTTPException(status_code=400, detail="segments are required.")
     
-    # CRITICAL: Always try to get the original full video transcript first
-    # This ensures we always use the master transcript, never re-transcribe
-    original_cache_key = f"{session_id}_full"  # Direct key for original video
-    original_transcript = None
-    
-    # Also check for any cache key that starts with session_id and contains "full"
-    for cache_key in transcription_cache.keys():
-        if cache_key.startswith(session_id) and ("full" in cache_key or cache_key == f"{session_id}_full"):
-            original_transcript = transcription_cache[cache_key]
-            print(f"[edit-with-ai] Found original transcript in cache with key '{cache_key}' (length: {len(original_transcript.get('transcript', ''))})")
-            break
-    
-    if original_transcript is None:
-        print(f"[edit-with-ai] No original transcript found in cache. Available keys: {list(transcription_cache.keys())}")
-        print(f"[edit-with-ai] Looking for keys starting with: {session_id}")
-    
-    # CRITICAL: Validate transcript exists - check segments OR original transcript
+    # CRITICAL: Validate transcript exists in segments
     has_transcript_in_segments = any(
         seg.get('text') and seg.get('text').strip() 
         for seg in body.segments
     )
     
-    has_transcript = has_transcript_in_segments or original_transcript is not None
+    has_transcript = has_transcript_in_segments
     
     total_transcript_length = sum(
         len(seg.get('text', '').strip()) 
         for seg in body.segments
     )
-    
-    # ALWAYS map original transcript to current segments if available
-    if original_transcript and original_transcript.get('segments'):
-        print(f"[edit-with-ai] Mapping original transcript to current segments")
-        for segment in body.segments:
-            # Only map if segment doesn't already have good transcript
-            if not segment.get('text') or len(segment.get('text', '').strip()) < 50:
-                segment_start = segment.get('sourceStart', segment.get('start', 0))
-                segment_end = segment.get('sourceEnd', segment.get('end', 0))
-                
-                # Find overlapping transcript segments from original
-                overlapping_text = []
-                for orig_seg in original_transcript['segments']:
-                    orig_start = orig_seg.get('start', 0)
-                    orig_end = orig_seg.get('end', 0)
-                    
-                    # Check if original segment overlaps with current segment
-                    if (orig_start < segment_end and orig_end > segment_start):
-                        overlapping_text.append(orig_seg.get('text', '').strip())
-                
-                # Combine overlapping text
-                if overlapping_text:
-                    segment['text'] = ' '.join(overlapping_text)
-                    print(f"[edit-with-ai] Mapped transcript to segment {segment.get('index', '?')}: {len(segment['text'])} chars")
-        
-        # Recalculate after mapping
-        has_transcript = True
-        total_transcript_length = sum(
-            len(seg.get('text', '').strip()) 
-            for seg in body.segments
-        )
     
     print(f"[edit-with-ai] session_id={session_id}, prompt={body.prompt!r}, segments={len(body.segments)}")
     print(f"[edit-with-ai] Transcript check: has_transcript={has_transcript}, total_length={total_transcript_length}")
@@ -1394,8 +815,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     content_based_keywords = [
         'about', 'mention', 'discuss', 'talk', 'say', 'explain',
         'describe', 'topic', 'subject', 'content', 'word', 'phrase',
-        'name the clips', 'title', 'label', 'transcript', 'chapter names',
-        'name clips from transcript'
+        'name clips from transcript', 'based on transcript'
     ]
 
     is_content_based = any(
@@ -1405,8 +825,8 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
     # Allow basic structural commands without transcript (including chapter division)
     basic_structural_keywords = [
-        'delete clip', 'remove clip', 'merge clip', 'keep clip', 'reorder', 'move clip',
-        'chapters', 'divide', 'split', 'cut into', 'break into'
+        'delete', 'remove', 'merge', 'keep', 'reorder', 'move', 'swap',
+        'chapters', 'divide', 'split', 'cut', 'break', 'rename', 'title', 'name'
     ]
 
     is_basic_structural = any(
@@ -1418,26 +838,14 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     if is_content_based and not has_transcript:
         print(f"[edit-with-ai] ERROR: Content-based command requires transcript")
         
-        # Provide helpful guidance based on cache state
-        cache_info = f"Available cache keys: {list(transcription_cache.keys())}"
-        if not transcription_cache:
-            suggestion = "No transcripts found in cache. Please transcribe the video first by clicking 'Transcribe Video'."
-        else:
-            suggestion = f"Original transcript not found. {cache_info}. Please transcribe the full video first."
-        
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "TRANSCRIPT_REQUIRED",
                 "message": "Transcript required for content-based editing. Please generate transcript first by clicking 'Transcribe Video'.",
-                "suggestion": suggestion,
+                "suggestion": "Please transcribe the video first by clicking 'Transcribe Video'.",
                 "command_type": "content-based",
-                "requires_transcript": True,
-                "debug_info": {
-                    "session_id": session_id,
-                    "cache_keys": list(transcription_cache.keys()),
-                    "original_cache_key_attempted": f"{session_id}_full"
-                }
+                "requires_transcript": True
             }
         )
     
@@ -1471,7 +879,6 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
     # Extract requested chapter/clip count from prompt
     import re as _re
-
     # Match ranges like "7-8 clips" → use the higher number
     range_match = _re.search(r'\b(\d+)\s*[-–]\s*(\d+)\s*(?:chapters?|parts?|sections?|clips?|segments?)?\b', body.prompt.lower())
     if range_match:
@@ -1482,49 +889,121 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         if not chapter_count_match:
             chapter_count_match = _re.search(r'(?:divide|split|break|cut)\s+(?:the\s+)?(?:video\s+)?into\s+(\d+)', body.prompt.lower())
         requested_chapters = int(chapter_count_match.group(1)) if chapter_count_match else None
+    splits_needed = (requested_chapters - 1) if requested_chapters else None
 
-    math_hint = ""
-    if requested_chapters and requested_chapters > 1:
+    # Check if user explicitly asked for RENAMING (descriptive names from transcript)
+    # "chapter" alone in a divide/split context means count, not rename
+    is_rename_requested = any(word in body.prompt.lower() for word in [
+        'rename', 'give names', 'name the clips', 'chapter names', 'descriptive',
+        'name from transcript', 'name according', 'title the clips', 'label the clips'
+    ])
+    is_content_based_split = any(word in body.prompt.lower() for word in ['transcript', 'topic', 'content', 'subject', 'say'])
+
+    # Only apply chapter instruction for whole-video division, NOT for specific clip splits
+    is_specific_clip_split = bool(_re.search(r'clip\s*\d+', body.prompt.lower()))
+
+    # Build chapter-specific instruction
+    chapter_instruction = ""
+    if requested_chapters and splits_needed and not is_specific_clip_split:
         total_duration = max((seg.get('end', 0) for seg in clips_with_ids), default=0)
         if total_duration > 0:
-            split_points = [round(total_duration * i / requested_chapters, 2) for i in range(1, requested_chapters)]
-            math_hint = f"\n\n[MATH HINT: If dividing the full {total_duration:.1f}s video into {requested_chapters} equal parts, the split_time values would be approx: {', '.join(str(t) for t in split_points)}]"
+            if is_rename_requested:
+                name_directive = "followed by a 'name_clips' action giving each part a descriptive title based on the transcript."
+            else:
+                name_directive = f"followed by a 'name_clips' action naming each part 'Clip 1', 'Clip 2', ... 'Clip {requested_chapters}'."
+
+            if is_content_based_split:
+                chapter_instruction = (
+                    f"\n\nCRITICAL: User wants EXACTLY {requested_chapters} parts based on the transcript content. "
+                    f"You MUST output EXACTLY {splits_needed} split action(s). "
+                    f"Video is {total_duration}s. "
+                    f"Analyze the transcript to find logical topic transitions and use those timestamps for split_time. "
+                    f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
+                )
+            else:
+                split_points = [round(total_duration * i / requested_chapters, 2) for i in range(1, requested_chapters)]
+                chapter_instruction = (
+                    f"\n\nCRITICAL: User wants EXACTLY {requested_chapters} equal parts. "
+                    f"You MUST output EXACTLY {splits_needed} split action(s). "
+                    f"Video is {total_duration}s. "
+                    f"Use these EXACT split_time values: {', '.join(str(t) for t in split_points)}. "
+                    f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
+                )
+    elif requested_chapters and splits_needed and is_specific_clip_split:
+        # Specific clip split — find that clip and compute correct split points
+        clip_num_match = _re.search(r'clip\s*(\d+)', body.prompt.lower())
+        if clip_num_match:
+            clip_num = int(clip_num_match.group(1))
+            target_clip = next((s for s in clips_with_ids if s.get('index') == clip_num or s.get('id', '').endswith(f'-{clip_num}')), None)
+            if not target_clip and clip_num <= len(clips_with_ids):
+                target_clip = clips_with_ids[clip_num - 1]
+            if target_clip:
+                clip_start = target_clip.get('start', 0)
+                clip_end = target_clip.get('end', 0)
+                split_points = [round(clip_start + (clip_end - clip_start) * i / requested_chapters, 2) for i in range(1, requested_chapters)]
+                split_points_str = ", ".join(f"{t}s" for t in split_points)
+                
+                if is_rename_requested:
+                    name_directive = "After splitting, use name_clips to give each part a descriptive title based on the transcript."
+                else:
+                    name_directive = f"After splitting, use name_clips to name each part 'Clip 1', 'Clip 2', ... 'Clip {requested_chapters}'."
+                
+                chapter_instruction = (
+                    f"\n\nCRITICAL SPLIT REQUIREMENT:\n"
+                    f"Split clip {clip_num} (range: {clip_start}s to {clip_end}s) into EXACTLY {requested_chapters} parts.\n"
+                    f"This requires EXACTLY {splits_needed} split action(s).\n"
+                    f"Correct split_time values (within clip range): {split_points_str}\n"
+                    f"Use clip_index: {clip_num} for all split actions.\n"
+                    f"CRITICAL: split_time MUST be between {clip_start} and {clip_end}.\n"
+                    f"{name_directive}"
+                )
 
     system_prompt = (
-        "You are an expert AI video editor. Convert natural language instructions into a JSON array of edit actions.\n\n"
-        "CLIP DATA PROVIDED:\n"
-        "You will receive the current state of clips. Each line shows Index. Title | Timeline:START-END | Source:START-END | Duration:Ds\n"
-        "- Source = timestamps in the ORIGINAL video file. 'split_time' MUST ALWAYS use Source timestamps.\n"
-        "- Timeline = position in the edited video.\n\n"
-        "HOW ACTIONS WORK (CRITICAL):\n"
-        "1. Actions are executed SEQUENTIALLY. Every 'cut', 'split', 'merge', 'swap', or 'keep' alters the clip indexes for the next action.\n"
-        "2. 'split' uses absolute Source timestamps. The engine automatically finds the clip containing that timestamp, so sequential splits are easy: just provide the exact Source timestamps to split at.\n"
-        "3. 'name_clips' is applied AT THE VERY END after all other actions. Use the FINAL expected indexes for naming.\n\n"
-        "SUPPORTED ACTIONS:\n"
-        "- SPLIT: {\"type\":\"split\", \"split_time\": <Source timestamp in seconds>}\n"
-        "- DELETE CLIP: {\"type\":\"cut\", \"clip_index\": N}\n"
-        "- DELETE TIME RANGE: {\"type\":\"cut_time\", \"start\": <Timeline start>, \"end\": <Timeline end>}\n"
-        "- MERGE: {\"type\":\"merge\", \"clip_indexes\": [N, M]}\n"
-        "- SWAP: {\"type\":\"swap\", \"clip_indexes\": [N, M]}\n"
-        "- KEEP ONLY: {\"type\":\"keep\", \"clip_indexes\": [N, M]}\n"
-        "- RENAME: {\"type\":\"name_clips\", \"clips\": [{\"index\": 1, \"title\": \"New Name\"}, ...]}\n\n"
-        "COMBINING MULTIPLE INSTRUCTIONS:\n"
-        "You MUST support fulfilling multiple different instructions at once. For example, if the user asks to divide into parts, swap clips, delete a clip, and rename them, you should output an array containing ALL of those actions in logical sequence (splits first, then cuts/swaps/merges, then renames).\n\n"
-        "EXAMPLES:\n"
-        "User: 'Delete clip 2, then split clip 1 at 15s, and swap the new parts'\n"
-        "Actions: [\n"
-        "  {\"type\":\"cut\", \"clip_index\": 2},\n"
-        "  {\"type\":\"split\", \"split_time\": 15},\n"
-        "  {\"type\":\"swap\", \"clip_indexes\": [1, 2]}\n"
-        "]\n\n"
-        "User: 'Divide into 3 equal parts and name them'\n"
-        "Actions: [\n"
-        "  {\"type\":\"split\", \"split_time\": <1/3 point>},\n"
-        "  {\"type\":\"split\", \"split_time\": <2/3 point>},\n"
-        "  {\"type\":\"name_clips\", \"clips\": [{\"index\": 1, \"title\": \"Part 1\"}, {\"index\": 2, \"title\": \"Part 2\"}, {\"index\": 3, \"title\": \"Part 3\"}]}\n"
-        "]\n\n"
-        "CRITICAL: Return ONLY valid JSON starting with { and ending with }. Do not include markdown formatting like ```json. Do not include conversational text."
-        + math_hint
+        "You are an AI video editor. Convert instructions into JSON edit actions.\n\n"
+        "CLIP DATA: Each line shows Index. Title | Timeline:START-END | Source:START-END | Duration:Ds\n"
+        "- Source = timestamps in the ORIGINAL video file\n"
+        "- split_time MUST be a Source timestamp (absolute seconds from original video start)\n"
+        "- Timeline = position in the edited video (use for cut_time)\n\n"
+        "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n\n"
+        "SPLIT — CRITICAL EXAMPLES:\n"
+        "Clip 1: Source 0-60s\n"
+        "  'split at 10s' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
+        "  'first 10s and rest' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
+        "  'split into 3 equal parts' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":40}\n"
+        "  ]\n"
+        "  'split into 4 parts' → split_times: 15, 30, 45\n"
+        "  FORMULA for N parts of clip with Source S-E:\n"
+        "    split_times = [round(S + (E-S)*i/N, 2) for i in 1..N-1]\n"
+        "    Use clip_index: same number for ALL splits (engine finds sub-clips by timestamp)\n\n"
+        "Clip 2: Source 30-90s\n"
+        "  'split clip 2 at 10s from start' → split_time = 30+10 = 40\n"
+        "  'split clip 2 into first 20s and rest' → split_time = 30+20 = 50\n\n"
+        "DELETE TIME RANGE (timeline seconds):\n"
+        "  'delete first 10s of clip 1' → {\"type\":\"cut_time\",\"start\":clip1_tl_start,\"end\":clip1_tl_start+10}\n"
+        "  'delete last 20s of clip 2' → {\"type\":\"cut_time\",\"start\":clip2_tl_end-20,\"end\":clip2_tl_end}\n\n"
+        "DELETE CLIP: {\"type\":\"delete\",\"clip_index\":N}\n"
+        "RENAME CLIP: {\"type\":\"rename\",\"clip_index\":N,\"title\":\"New Name\"}\n"
+        "RENAME MULTIPLE (after split): {\"type\":\"name_clips\",\"clips\":[{\"index\":N,\"title\":\"Name\"}]}\n"
+        "MERGE (combine multiple clips): {\"type\":\"merge\",\"clip_indexes\":[N,M]}\n"
+        "SWAP (exchange positions): {\"type\":\"swap\",\"clip_indexes\":[N,M]}\n\n"
+        "COMBINED COMMANDS — put all actions in one actions array:\n"
+        "  'swap clip 1 and 2' → [{\"type\":\"swap\",\"clip_indexes\":[1,2]}]\n"
+        "  'merge clip 2 and 3' → [{\"type\":\"merge\",\"clip_indexes\":[2,3]}]\n"
+        "  'rename clip 1 to Intro' → [{\"type\":\"rename\",\"clip_index\":1,\"title\":\"Intro\"}]\n"
+        "  'split clip 1 at 10s and rename first part Intro' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":10},\n"
+        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"Intro\"},{\"index\":2,\"title\":\"Clip 2\"}]}\n"
+        "  ]\n"
+        "  'split into 3 parts and name them' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":T1},\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":T2},\n"
+        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"Part 1\"},{\"index\":2,\"title\":\"Part 2\"},{\"index\":3,\"title\":\"Part 3\"}]}\n"
+        "  ]\n\n"
+        "Return ONLY: {\"actions\":[...]}  No markdown, no explanation.\n"
+        f"Currently {len(clips_with_ids)} clip(s). Total: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
+        + chapter_instruction
     )
 
     # INTELLIGENT PREPROCESSING: Handle common single-clip scenarios
@@ -1572,7 +1051,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         f"Clips:\n{segments_text}\n\n"
         f"Instruction: {body.prompt.strip()}\n\n"
         f"State: {len(clips_with_ids)} clip(s). Total duration: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
-        + (f"\nREMINDER: Please accommodate the requested splits." if requested_chapters else "")
+        + (f"\nREMINDER: produce EXACTLY {requested_chapters} parts using {splits_needed} split action(s)." if requested_chapters else "")
     )
 
     try:
@@ -1583,19 +1062,28 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         import re as _re3
         enhanced_prompt = body.prompt.strip()
 
-        # Safely extract multiple split hints for ANY clip mentioned
-        for match in _re3.finditer(r'split\s+clip\s*(\d+)\s+(?:at|into\s+first)\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?', enhanced_prompt, _re3.IGNORECASE):
-            clip_num = int(match.group(1))
-            offset_s = float(match.group(2))
+        # Pattern: "split clip N at Xs" or "split clip N into first Xs and rest"
+        split_at_match = _re3.search(
+            r'(?:split|divide|cut)\s+(?:clip|part|video)?\s*(\d+)\s+(?:at|into\s+first)\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?',
+            enhanced_prompt, _re3.IGNORECASE
+        )
+        if split_at_match:
+            clip_num = int(split_at_match.group(1))
+            offset_s = float(split_at_match.group(2))
             if clip_num <= len(clips_with_ids):
                 target = clips_with_ids[clip_num - 1]
                 src_start = float(target.get('start', 0))
                 computed_split = round(src_start + offset_s, 2)
                 enhanced_prompt += f"\n[COMPUTED: split_time for clip {clip_num} at {offset_s}s from start = {computed_split}]"
 
-        for match in _re3.finditer(r'split\s+clip\s*(\d+)\s+into\s+(\d+)\s+(?:equal\s+)?parts?', enhanced_prompt, _re3.IGNORECASE):
-            clip_num = int(match.group(1))
-            n_parts  = int(match.group(2))
+        # Pattern: "split clip N into M parts/equal parts"
+        split_parts_match = _re3.search(
+            r'(?:split|divide|cut)\s+(?:clip|part|video)?\s*(\d+)\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
+            enhanced_prompt, _re3.IGNORECASE
+        )
+        if split_parts_match and not split_at_match:
+            clip_num = int(split_parts_match.group(1))
+            n_parts  = int(split_parts_match.group(2))
             if clip_num <= len(clips_with_ids) and n_parts >= 2:
                 target = clips_with_ids[clip_num - 1]
                 src_start = float(target.get('start', 0))
@@ -1607,7 +1095,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             f"Clips:\n{segments_text}\n\n"
             f"Instruction: {enhanced_prompt}\n\n"
             f"State: {len(clips_with_ids)} clip(s). Total: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
-            + (f"\nREMINDER: Please accommodate the requested splits." if requested_chapters else "")
+            + (f"\nREMINDER: produce EXACTLY {requested_chapters} parts using {splits_needed} split action(s)." if requested_chapters else "")
         )
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1620,22 +1108,12 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         raw = response.choices[0].message.content.strip()
         print(f"[edit-with-ai] raw response: {raw}")
 
-        # Robustly extract JSON block from markdown or conversational text
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else raw
+        # Strip markdown code fences if model wraps in ```json ... ```
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
             if raw.startswith("json"):
-                raw = raw[4:].strip()
-                
-        # Fallback: Find the first { or [ and last } or ]
-        import re as _re_json
-        json_match = _re_json.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', raw)
-        if json_match:
-            raw = json_match.group(1).strip()
-        else:
-            raw = '{"actions": []}'
+                raw = raw[4:]
+            raw = raw.strip()
 
         # Robust JSON parsing — handle all malformed cases from the AI
         try:
@@ -1668,8 +1146,8 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         if not isinstance(result["actions"], list):
             raise ValueError("'actions' field is not a list")
 
-        # Validate each action matches the supported types
-        valid_types = {"name_clips", "cut", "cut_time", "split", "merge", "swap", "keep"}
+        # Validate each action matches the supported types (added "delete")
+        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep"}
         for action in result["actions"]:
             if action.get("type") not in valid_types:
                 raise ValueError(f"Invalid action type: {action.get('type')!r}")
@@ -1687,11 +1165,6 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 }]
             }
 
-        has_explicit_name_action = any(
-            action.get("type") == "name_clips"
-            for action in result["actions"]
-        )
-
         # ROBUSTNESS LAYER: Parse AI output into structured operations
         operations, warnings = _parse_ai_actions_to_operations(result["actions"], clips_with_ids)
         
@@ -1700,8 +1173,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         warnings.extend(apply_warnings)
 
         # POST-PROCESSING: If user requested N clips but we got fewer, split manually
-        is_specific_split = bool(_re.search(r'split\s+clip\s*\d+', body.prompt.lower()))
-        if requested_chapters and not is_specific_split and len(final_clips) < requested_chapters:
+        if requested_chapters and not is_specific_clip_split and len(final_clips) < requested_chapters:
             print(f"[edit-with-ai] Need {requested_chapters} clips, have {len(final_clips)} — splitting manually")
             # Collect all source segments from all current clips
             all_source_segs = []
@@ -1766,7 +1238,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             for name in original_names.values()
         )
 
-        if (clips_were_split or requested_chapters is not None) and not has_explicit_name_action:
+        if clips_were_split or requested_chapters is not None:
             if has_custom_names:
                 # Preserve existing custom names; only fill in blanks with "Clip N"
                 for i, clip in enumerate(normalized_clips):
@@ -1807,7 +1279,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         
         # FINAL NAMING PASS — only if no custom names at all
         # (enforcement block above already handles the has_custom_names case)
-        if not has_custom_names and not has_explicit_name_action and (len(normalized_clips) > len(clips_with_ids) or requested_chapters is not None):
+        if not has_custom_names and (len(normalized_clips) > len(clips_with_ids) or requested_chapters is not None):
             for i, clip in enumerate(normalized_clips):
                 clip['title'] = f'Clip {i + 1}'
                 clip['name']  = f'Clip {i + 1}'
@@ -2020,6 +1492,166 @@ class BuildCompositionRequest(BaseModel):
     clips: list  # Simple clips array
     options: dict = {}  # Build options (fps, width, height, etc.)
 
+class FastExportRequest(BaseModel):
+    timeline: list = []
+    clips: list = []
+
+def _export_signature(session_id: str, timeline: list) -> str:
+    import json
+    import hashlib
+    normalized = []
+    for i, clip in enumerate(timeline or []):
+        start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
+        duration = clip.get("duration")
+        end = clip.get("end")
+        if duration is None and end is not None:
+            duration = float(end) - start
+        if duration is None:
+            duration = float(clip.get("duration", 0) or 0)
+        normalized.append({"i": i, "start": round(start, 3), "duration": round(float(duration), 3)})
+
+    material = {"session_id": session_id, "timeline": normalized}
+    return hashlib.md5(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+@app.post("/api/videos/{session_id}/fast-export")
+async def fast_export_endpoint(session_id: str, body: FastExportRequest):
+    """Fast export endpoint with caching."""
+    video_path = None
+    if session_id in session_store:
+        stored = Path(session_store[session_id])
+        if stored.exists():
+            video_path = stored
+
+    if video_path is None:
+        for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv"]:
+            candidate = UPLOAD_DIR / f"{session_id}{ext}"
+            if candidate.exists():
+                video_path = candidate
+                break
+
+    if video_path is None:
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    timeline = body.timeline if body.timeline else body.clips
+    if not timeline:
+        raise HTTPException(status_code=400, detail="No clips/timeline provided")
+
+    signature = _export_signature(session_id, timeline)
+
+    export_dir = UPLOAD_DIR / "export_cache"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    output_path = export_dir / f"{session_id}_{signature}.mp4"
+
+    if output_path.exists() and output_path.stat().st_size > 1024 * 1024:
+        return FileResponse(
+            path=str(output_path),
+            filename=f"edited-{session_id[:8]}.mp4",
+            media_type="video/mp4",
+        )
+
+    export_id = str(uuid.uuid4())[:8]
+    temp_dir = UPLOAD_DIR / f"export_{export_id}"
+    temp_dir.mkdir(exist_ok=True)
+
+    concat_file = temp_dir / "concat.txt"
+    clip_files = []
+
+    try:
+        # Flatten merged clips
+        flattened_timeline = []
+        for clip in timeline:
+            if clip.get("segments"):
+                for seg in clip["segments"]:
+                    flat = dict(clip)
+                    flat["sourceStart"] = seg.get("sourceStart", seg.get("start", 0))
+                    flat["sourceEnd"] = seg.get("sourceEnd", seg.get("end", 0))
+                    flat.pop("segments", None)
+                    flattened_timeline.append(flat)
+            else:
+                flattened_timeline.append(clip)
+
+        for i, clip in enumerate(flattened_timeline):
+            start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
+            duration = clip.get("duration")
+            end = clip.get("end")
+            if duration is None and end is not None:
+                duration = float(end) - start
+            if duration is None:
+                duration = float(clip.get("duration", 0) or 0)
+
+            duration = float(duration or 0)
+            if duration <= 0.05:
+                continue
+
+            clip_path = temp_dir / f"clip_{i}.mp4"
+            clip_files.append(clip_path)
+
+            cmd = [
+                "ffmpeg",
+                "-ss", str(start),
+                "-t", str(duration),
+                "-i", str(video_path),
+                "-vf",
+                "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "96k",
+                "-ar", "44100",
+                "-ac", "2",
+                "-movflags", "+faststart",
+                "-y",
+                str(clip_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+        if not clip_files:
+            raise HTTPException(status_code=400, detail="No valid clips to export")
+
+        with open(concat_file, "w", encoding="utf-8") as f:
+            for c in clip_files:
+                f.write(f"file '{c.absolute().as_posix()}'\n")
+
+        tmp_final = temp_dir / "final.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                "-y",
+                str(tmp_final),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        tmp_final.replace(output_path)
+
+        return FileResponse(
+            path=str(output_path),
+            filename=f"edited-{session_id[:8]}.mp4",
+            media_type="video/mp4",
+        )
+
+    except subprocess.CalledProcessError as e:
+        err = e.stderr[-300:] if e.stderr else str(e)
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {err}")
+    finally:
+        # best-effort cleanup
+        try:
+            for p in temp_dir.glob("*.mp4"):
+                p.unlink(missing_ok=True)
+            for p in temp_dir.glob("*.txt"):
+                p.unlink(missing_ok=True)
+            temp_dir.rmdir()
+        except Exception:
+            pass
 
 # ============================================================================
 # ROBUSTNESS LAYER: Helper functions for AI editing validation and execution
@@ -2126,17 +1758,30 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
                 else:
                     warnings.append(f"name_clips: clip index {idx} missing title, skipped")
         
-        elif action_type == "cut":
+        elif action_type == "rename":
+            idx = action.get("clip_index")
+            title = action.get("title")
+            if idx in index_to_id and title:
+                clip_id = index_to_id[idx]
+                operations.append({
+                    "type": "rename",
+                    "clipId": clip_id,
+                    "params": {"title": title}
+                })
+            else:
+                warnings.append(f"rename: clip index {idx} out of range or missing title")
+
+        elif action_type in ("cut", "delete"):
             # Delete operation
             idx = action.get("clip_index")
             print(f"[parse_actions] cut action: clip_index={idx}")
-            if isinstance(idx, int) and idx > 0:
-                clip_id = index_to_id.get(idx)
+            if idx in index_to_id:
+                clip_id = index_to_id[idx]
                 print(f"[parse_actions]   → Mapped to clip_id={clip_id}")
                 operations.append({
-                    "type": "delete_by_position",
-                    "clipId": None,
-                    "params": {"position": idx}
+                    "type": "delete",
+                    "clipId": clip_id,
+                    "params": {}
                 })
             else:
                 print(f"[parse_actions]   → Index {idx} out of range (valid: {list(index_to_id.keys())})")
@@ -2157,10 +1802,18 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
             idx = action.get("clip_index")
             split_time = action.get("split_time")
             if split_time is not None:
+                # For sequential splits, always try to find the clip containing this timestamp
+                # rather than relying on changing clip indexes
+                if idx in index_to_id:
+                    clip_id = index_to_id[idx]
+                else:
+                    # Use a placeholder - the split operation will find the right clip by timestamp
+                    clip_id = f"clip-{idx}"
+                
                 operations.append({
-                    "type": "split_by_position",
-                    "clipId": None,
-                    "params": {"position": idx, "split_time": split_time}
+                    "type": "split",
+                    "clipId": clip_id,
+                    "params": {"split_time": split_time}
                 })
             else:
                 warnings.append(f"split: missing split_time, skipped")
@@ -2169,11 +1822,11 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
             # Merge operation
             indexes = action.get("clip_indexes", [])
             clip_ids = [index_to_id.get(idx) for idx in indexes if idx in index_to_id]
-            if len([idx for idx in indexes if isinstance(idx, int) and idx > 0]) >= 2:
+            if len(clip_ids) >= 2:
                 operations.append({
-                    "type": "merge_by_position",
-                    "clipId": None,
-                    "params": {"positions": indexes}
+                    "type": "merge",
+                    "clipId": clip_ids[0],  # First clip ID preserved
+                    "params": {"mergeIds": clip_ids}
                 })
             else:
                 warnings.append(f"merge: insufficient valid clip indexes, skipped")
@@ -2183,11 +1836,11 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
             indexes = action.get("clip_indexes", [])
             if len(indexes) == 2:
                 clip_ids = [index_to_id.get(idx) for idx in indexes if idx in index_to_id]
-                if len([idx for idx in indexes if isinstance(idx, int) and idx > 0]) == 2:
+                if len(clip_ids) == 2:
                     operations.append({
-                        "type": "swap_by_position",
+                        "type": "swap",
                         "clipId": None,
-                        "params": {"positions": indexes}
+                        "params": {"swapIds": clip_ids}
                     })
                 else:
                     warnings.append(f"swap: one or more clip indexes invalid, skipped")
@@ -2197,17 +1850,17 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
         elif action_type == "keep":
             # Keep operation (delete all others)
             indexes = action.get("clip_indexes", [])
-            keep_ids = [idx for idx in indexes if isinstance(idx, int) and idx > 0]
-            invalid_indexes = []
+            keep_ids = [index_to_id.get(idx) for idx in indexes if idx in index_to_id]
+            invalid_indexes = [idx for idx in indexes if idx not in index_to_id]
             
             if invalid_indexes:
                 warnings.append(f"keep: clip indexes {invalid_indexes} out of range (valid: 1-{len(clips)}), skipped")
             
             if keep_ids:
                 operations.append({
-                    "type": "keep_by_position",
+                    "type": "keep",
                     "clipId": None,
-                    "params": {"positions": indexes}
+                    "params": {"keepIds": keep_ids}
                 })
             else:
                 warnings.append(f"keep: no valid clip indexes found, keeping all clips")
@@ -2231,48 +1884,6 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
         op_type = op.get("type")
         clip_id = op.get("clipId")
         params = op.get("params", {})
-
-        def _clip_id_at_position(position):
-            if not isinstance(position, int):
-                return None
-            idx = position - 1
-            if 0 <= idx < len(current_clips):
-                return current_clips[idx].get("id")
-            return None
-
-        if op_type == "merge_by_position":
-            positions = params.get("positions", [])
-            merge_ids = [_clip_id_at_position(pos) for pos in positions]
-            merge_ids = [clip_id for clip_id in merge_ids if clip_id]
-            if len(merge_ids) >= 2:
-                op_type = "merge"
-                clip_id = merge_ids[0]
-                params = {"mergeIds": merge_ids}
-            else:
-                warnings.append(f"merge: positions {positions} out of range after earlier edits, skipped")
-                continue
-
-        if op_type == "swap_by_position":
-            positions = params.get("positions", [])
-            swap_ids = [_clip_id_at_position(pos) for pos in positions]
-            swap_ids = [clip_id for clip_id in swap_ids if clip_id]
-            if len(swap_ids) == 2:
-                op_type = "swap"
-                params = {"swapIds": swap_ids}
-            else:
-                warnings.append(f"swap: positions {positions} out of range after earlier edits, skipped")
-                continue
-
-        if op_type == "keep_by_position":
-            positions = params.get("positions", [])
-            keep_ids = [_clip_id_at_position(pos) for pos in positions]
-            keep_ids = [clip_id for clip_id in keep_ids if clip_id]
-            if keep_ids:
-                op_type = "keep"
-                params = {"keepIds": keep_ids}
-            else:
-                warnings.append(f"keep: positions {positions} out of range after earlier edits, skipped")
-                continue
         
         if op_type == "rename":
             # Rename clip by ID
@@ -2283,15 +1894,6 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                     clip["name"] = new_title
                     print(f"[rename] Renamed clip {clip_id} to '{new_title}'")
                     break
-
-        elif op_type == "delete_by_position":
-            pos = params.get("position")
-            resolved_id = _clip_id_at_position(pos)
-            if resolved_id:
-                current_clips = [c for c in current_clips if c.get("id") != resolved_id]
-                print(f"[delete_by_position] Deleted position {pos} ({resolved_id})")
-            else:
-                warnings.append(f"delete: clip position {pos} out of range (have {len(current_clips)} clips), skipped")
 
         elif op_type == "delete":
             # Delete clip by ID
@@ -2426,33 +2028,22 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
             print(f"[cut_time] Result: {len(new_clips)} clips remaining")
             current_clips = new_clips
         
-        elif op_type == "split_by_position" or op_type == "split":
+        elif op_type == "split":
             # Split clip at specified time - ENHANCED: Support multiple sequential splits
             split_time = params.get("split_time")
-            pos = params.get("position")
             
             # ENHANCED: Find the clip that contains this split time (for sequential splits)
             clip_to_split = None
             
-            if op_type == "split_by_position" and pos is not None:
-                resolved_id = _clip_id_at_position(pos)
-                if resolved_id:
-                    for clip in current_clips:
-                        if clip.get("id") == resolved_id:
-                            clip_to_split = clip
-                            clip_id = resolved_id
-                            break
-
             # First try to find by exact clip_id
-            if not clip_to_split and clip_id:
-                for clip in current_clips:
-                    if clip.get("id") == clip_id:
-                        clip_to_split = clip
-                        break
+            for clip in current_clips:
+                if clip.get("id") == clip_id:
+                    clip_to_split = clip
+                    break
             
             # If not found by ID, find the clip that contains this timestamp
             if not clip_to_split and split_time is not None:
-                print(f"[split] Clip not found by ID/pos, searching by timestamp {split_time}")
+                print(f"[split] Clip {clip_id} not found, searching by timestamp {split_time}")
                 for clip in current_clips:
                     source_start = clip.get("sourceStart", clip.get("start", 0))
                     source_end = clip.get("sourceEnd", clip.get("end", 0))
@@ -3001,10 +2592,8 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
     """
     Export endpoint: concatenates all timeline clips (original video + assets) using FFmpeg.
     Each clip is extracted/downloaded separately then concatenated in order.
-    Runs extraction in parallel using asyncio to dramatically speed up export.
-    Supports audio-only overlay clips by mixing them into the final video.
     """
-    import tempfile, httpx, asyncio
+    import tempfile, httpx
     from datetime import datetime
     timestamp = datetime.now().isoformat()
 
@@ -3012,8 +2601,6 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
 
     if not body.clips:
         raise HTTPException(status_code=400, detail="No clips provided.")
-
-    final_duration = max(float(clip.get("end", clip.get("start", 0))) for clip in body.clips)
 
     # Resolve original video path
     video_path = None
@@ -3032,175 +2619,130 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
 
     temp_files = []
     concat_list_path = UPLOAD_DIR / f"{session_id}_export_concat.txt"
-    audio_overlay_files = []
-    sem = asyncio.Semaphore(4)  # Limit concurrent ffmpeg jobs
 
-    def _resolve_proxy_url(asset_url: str) -> str:
-        if "/api/proxy-image?url=" in asset_url or "/api/proxy-video?url=" in asset_url:
-            from urllib.parse import unquote, urlparse, parse_qs
-            qs = parse_qs(urlparse(asset_url).query)
-            return unquote(qs.get("url", [asset_url])[0])
-        return asset_url
+    try:
+        # Flatten clips that contain 'segments'
+        flattened_clips = []
+        for clip in body.clips:
+            if clip.get("segments"):
+                for seg in clip["segments"]:
+                    flat = dict(clip)
+                    flat["sourceStart"] = seg.get("sourceStart", seg.get("start", 0))
+                    flat["sourceEnd"] = seg.get("sourceEnd", seg.get("end", 0))
+                    flat.pop("segments", None)
+                    flattened_clips.append(flat)
+            else:
+                flattened_clips.append(clip)
 
-    def _find_local_asset(actual_url: str):
-        if "ai-image" in actual_url:
-            img_id = actual_url.split("/")[-1]
-            return UPLOAD_DIR / f"ai_img_{img_id}.jpg"
-        if "assets" in actual_url and "stream" in actual_url:
-            asset_id = actual_url.split("/")[-2]
-            for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp", ".mp3", ".wav", ".m4a", ".ogg"]:
-                candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
-                if candidate.exists():
-                    return candidate
-        return None
-
-    async def _run_ffmpeg(command: list[str], i: int, context: str):
-        result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[export-with-clips] ffmpeg error {context} {i+1}: {result.stderr[-300:]}")
-            raise HTTPException(status_code=500, detail=f"Failed to process clip {i+1}: {result.stderr[-200:]}")
-        return result
-
-    async def _download_external_asset(url: str, path: Path) -> bool:
-        try:
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as hc:
-                r = await hc.get(url)
-                r.raise_for_status()
-                path.write_bytes(r.content)
-            temp_files.append(path)
-            return True
-        except Exception as e:
-            print(f"[export-with-clips] Failed to download asset {url[:80]}: {e}")
-            return False
-
-    async def process_clip(i, clip):
-        async with sem:
+        for i, clip in enumerate(flattened_clips):
             asset_url = clip.get("assetUrl")
-            asset_kind = clip.get("assetKind")
-            src_start = float(clip.get("sourceStart", clip.get("start", 0)))
-            src_end = float(clip.get("sourceEnd", clip.get("end", 0)))
-            duration = src_end - src_start
+            src_start  = float(clip.get("sourceStart", clip.get("start", 0)))
+            src_end    = float(clip.get("sourceEnd",   clip.get("end",   0)))
+            duration   = src_end - src_start
 
             if duration <= 0:
                 print(f"[export-with-clips] Skipping clip {i+1} with zero duration")
-                return None
+                continue
 
             out_path = UPLOAD_DIR / f"{session_id}_export_clip_{i+1}.mp4"
             temp_files.append(out_path)
 
             if asset_url:
-                actual_url = _resolve_proxy_url(asset_url)
-                if actual_url.startswith("/api/"):
-                    local_asset = _find_local_asset(actual_url)
-                    if not local_asset or not local_asset.exists():
-                        print(f"[export-with-clips] Cannot find local asset for {actual_url}, skipping")
-                        return None
+                # Asset clip — download if external, or use local path
+                if asset_url.startswith("/api/"):
+                    # Local asset — serve directly via ffmpeg
+                    local_asset = None
+                    # Try to find the file
+                    if "ai-image" in asset_url:
+                        img_id = asset_url.split("/")[-1]
+                        local_asset = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
+                    elif "assets" in asset_url and "stream" in asset_url:
+                        asset_id = asset_url.split("/")[-2]
+                        for ext in [".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp"]:
+                            candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
+                            if candidate.exists():
+                                local_asset = candidate
+                                break
 
-                    if asset_kind == 'audio':
-                        out_audio = UPLOAD_DIR / f"{session_id}_export_audio_{i+1}.wav"
-                        temp_files.append(out_audio)
-                        audio_overlay_files.append((out_audio, int(float(clip.get("start", 0)) * 1000)))
-                        await _run_ffmpeg([
-                            "ffmpeg", "-i", str(local_asset), "-ss", str(src_start), "-t", str(duration),
-                            "-vn", "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y", str(out_audio)
-                        ], i, "audio extract")
-                        return None
-
-                    if local_asset.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
-                        await _run_ffmpeg([
-                            "ffmpeg", "-loop", "1", "-i", str(local_asset),
-                            "-t", str(duration), "-r", "30",
-                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
-                        ], i, "image clip")
+                    if local_asset and local_asset.exists():
+                        # Photo: create a video from the image (must re-encode)
+                        if local_asset.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]:
+                            result = subprocess.run([
+                                "ffmpeg", "-loop", "1", "-i", str(local_asset),
+                                "-t", str(duration), "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                        else:
+                            # Video asset — use stream copy for speed
+                            result = subprocess.run([
+                                "ffmpeg", "-i", str(local_asset), "-t", str(duration),
+                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
+                            ], capture_output=True, text=True)
                     else:
-                        cmd = [
-                            "ffmpeg", "-ss", str(src_start), "-i", str(local_asset), "-t", str(duration),
-                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", str(out_path)
-                        ]
-                        await _run_ffmpeg(cmd, i, "local asset clip")
+                        # Skip unknown local asset
+                        print(f"[export-with-clips] Cannot find local asset for {asset_url}, skipping")
+                        temp_files.pop()
+                        continue
                 else:
-                    print(f"[export-with-clips] Downloading external asset: {actual_url[:100]}")
-                    url_lower = actual_url.lower()
-                    is_image = (
-                        any(url_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]) 
-                        or url_lower.startswith("data:image/")
-                    )
-                    is_audio = any(url_lower.endswith(ext) for ext in [".mp3", ".ogg", ".wav", ".m4a"])
-                    dl_ext = ".jpg" if is_image else (".mp3" if is_audio else ".mp4")
-                    dl_path = UPLOAD_DIR / f"{session_id}_asset_dl_{i+1}{dl_ext}"
-
-                    if not await _download_external_asset(actual_url, dl_path):
-                        return None
-
-                    if asset_kind == 'audio' or is_audio:
-                        out_audio = UPLOAD_DIR / f"{session_id}_export_audio_{i+1}.wav"
-                        temp_files.append(out_audio)
-                        audio_overlay_files.append((out_audio, int(float(clip.get("start", 0)) * 1000)))
-                        await _run_ffmpeg([
-                            "ffmpeg", "-i", str(dl_path), "-ss", str(src_start), "-t", str(duration),
-                            "-vn", "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y", str(out_audio)
-                        ], i, "audio extract")
-                        return None
-
-                    if is_image:
-                        await _run_ffmpeg([
-                            "ffmpeg", "-loop", "1", "-i", str(dl_path),
-                            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                            "-t", str(duration),
-                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                            "-c:a", "aac", "-b:a", "128k", "-shortest", "-y", str(out_path)
-                        ], i, "image clip")
-                    else:
-                        await _run_ffmpeg([
-                            "ffmpeg", "-ss", str(src_start), "-i", str(dl_path), "-t", str(duration),
-                            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", str(out_path)
-                        ], i, "external asset clip")
-                
+                    # External URL — download first
+                    print(f"[export-with-clips] Downloading asset: {asset_url[:80]}")
+                    try:
+                        async with httpx.AsyncClient(timeout=30.0) as hc:
+                            r = await hc.get(asset_url)
+                            r.raise_for_status()
+                            content = r.content
+                        dl_path = UPLOAD_DIR / f"{session_id}_asset_dl_{i+1}.tmp"
+                        dl_path.write_bytes(content)
+                        temp_files.append(dl_path)
+                        
+                        # Detect if it's an image or video by checking content
+                        is_image = dl_path.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"] or content[:8] == b'\xff\xd8\xff' or content[:4] == b'\x89PNG'
+                        
+                        if is_image:
+                            # Image: create video with ultrafast encoding
+                            result = subprocess.run([
+                                "ffmpeg", "-loop", "1", "-i", str(dl_path), "-t", str(duration),
+                                "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                        else:
+                            # Video: use stream copy for speed
+                            result = subprocess.run([
+                                "ffmpeg", "-i", str(dl_path), "-t", str(duration),
+                                "-c:v", "copy", "-c:a", "copy", "-y", str(out_path)
+                            ], capture_output=True, text=True)
+                    except Exception as e:
+                        print(f"[export-with-clips] Failed to download asset: {e}, skipping")
+                        temp_files.pop()
+                        continue
             else:
-                await _run_ffmpeg([
+                # Original video clip — use stream copy for speed (no re-encoding)
+                result = subprocess.run([
                     "ffmpeg",
-                    "-ss", str(src_start), "-i", str(video_path), "-t", str(duration),
-                    "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
+                    "-ss", str(src_start), "-t", str(duration),
+                    "-i", str(video_path),
+                    "-c:v", "copy", "-c:a", "copy",
                     "-avoid_negative_ts", "make_zero",
-                    "-movflags", "+faststart",
                     "-y", str(out_path)
-                ], i, "original clip")
+                ], capture_output=True, text=True)
+
+            if result.returncode != 0:
+                print(f"[export-with-clips] ffmpeg error clip {i+1}: {result.stderr[-300:]}")
+                raise HTTPException(status_code=500, detail=f"Failed to process clip {i+1}: {result.stderr[-200:]}")
 
             print(f"[export-with-clips] Clip {i+1} ready: {out_path}")
-            return out_path
 
-    try:
-        tasks = [process_clip(i, clip) for i, clip in enumerate(body.clips)]
-        await asyncio.gather(*tasks)
-
-        valid_clips = []
-        for i in range(len(body.clips)):
-            candidate = UPLOAD_DIR / f"{session_id}_export_clip_{i+1}.mp4"
-            if candidate.exists():
-                valid_clips.append(candidate)
-
-        output_path = None
-        if not valid_clips and not audio_overlay_files:
-            raise HTTPException(status_code=400, detail="No clips could be processed for export.")
+        # Filter to only files that exist
+        valid_clips = [f for f in temp_files if f.exists() and str(f).endswith(".mp4")]
 
         if not valid_clips:
-            output_path = UPLOAD_DIR / f"{session_id}_export_silent_video.mp4"
-            temp_files.append(output_path)
-            await _run_ffmpeg([
-                "ffmpeg", "-f", "lavfi", "-i", f"color=c=black:s=1920x1080:d={final_duration}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", str(output_path)
-            ], 0, "silent video")
-        elif len(valid_clips) == 1:
+            raise HTTPException(status_code=400, detail="No clips could be processed for export.")
+
+        if len(valid_clips) == 1:
+            # Single clip — return directly
             output_path = valid_clips[0]
         else:
+            # Multiple clips — concatenate
             with open(concat_list_path, 'w') as f:
                 for clip_file in valid_clips:
                     escaped = str(clip_file.absolute()).replace('\\', '/')
@@ -3209,52 +2751,15 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
             output_path = UPLOAD_DIR / f"{session_id}_export_final.mp4"
             temp_files.append(output_path)
 
-            await _run_ffmpeg([
+            result = subprocess.run([
                 "ffmpeg", "-f", "concat", "-safe", "0",
                 "-i", str(concat_list_path),
                 "-c", "copy", "-y", str(output_path)
-            ], 0, "concat final video")
+            ], capture_output=True, text=True)
 
-        if audio_overlay_files:
-            overlay_audio_path = UPLOAD_DIR / f"{session_id}_export_audio_overlay.wav"
-            temp_files.append(overlay_audio_path)
-
-            if len(audio_overlay_files) == 1:
-                file_path, delay_ms = audio_overlay_files[0]
-                await _run_ffmpeg([
-                    "ffmpeg", "-i", str(file_path),
-                    "-af", f"adelay={delay_ms}|{delay_ms}",
-                    "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", "-y", str(overlay_audio_path)
-                ], 0, "audio delay")
-            else:
-                cmd = ["ffmpeg", "-y"]
-                for file_path, _ in audio_overlay_files:
-                    cmd.extend(["-i", str(file_path)])
-
-                filter_complex = ""
-                for idx, (_, delay_ms) in enumerate(audio_overlay_files):
-                    filter_complex += f"[{idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}];"
-                filter_complex += ''.join(f"[a{idx}]" for idx in range(len(audio_overlay_files)))
-                filter_complex += f"amix=inputs={len(audio_overlay_files)}:duration=longest:dropout_transition=2[aout]"
-                cmd.extend(["-filter_complex", filter_complex, "-map", "[aout]", "-ac", "2", "-ar", "44100", "-acodec", "pcm_s16le", str(overlay_audio_path)])
-                await _run_ffmpeg(cmd, 0, "audio mix")
-
-            mixed_path = UPLOAD_DIR / f"{session_id}_export_mixed.mp4"
-            temp_files.append(mixed_path)
-
-            if valid_clips:
-                await _run_ffmpeg([
-                    "ffmpeg", "-i", str(output_path), "-i", str(overlay_audio_path),
-                    "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
-                    "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-y", str(mixed_path)
-                ], 0, "mix overlay audio")
-            else:
-                await _run_ffmpeg([
-                    "ffmpeg", "-i", str(output_path), "-i", str(overlay_audio_path),
-                    "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-y", str(mixed_path)
-                ], 0, "attach overlay audio")
-
-            output_path = mixed_path
+            if result.returncode != 0:
+                print(f"[export-with-clips] concat error: {result.stderr[-300:]}")
+                raise HTTPException(status_code=500, detail=f"Failed to concatenate clips: {result.stderr[-200:]}")
 
         print(f"[export-with-clips] Export complete: {output_path}")
         return FileResponse(
@@ -3264,6 +2769,7 @@ async def export_with_clips(session_id: str, body: BuildCompositionRequest):
         )
 
     finally:
+        # Clean up temp files (except the final output which FileResponse will serve)
         output_path_local = locals().get('output_path')
         for f in temp_files:
             try:
@@ -3532,15 +3038,9 @@ async def _export_video_ffmpeg_fallback(session_id: str, composition: dict):
                 source_start = clip.get("sourceStart", 0)
                 source_end = clip.get("sourceEnd", 0)
                 
-                src = str(clip.get("src", ""))
-                is_asset = "proxy" in src or "asset" in src
-                
                 clips.append({
-                    "sourceStart": source_start,
-                    "sourceEnd": source_end,
                     "start": source_start,
-                    "end": source_end,
-                    "assetUrl": src if is_asset else None
+                    "end": source_end
                 })
                 print(f"[ffmpeg-fallback] Regular clip: {source_start}-{source_end}")
             else:
@@ -3551,217 +3051,9 @@ async def _export_video_ffmpeg_fallback(session_id: str, composition: dict):
     
     print(f"[ffmpeg-fallback] Converted {len(clips)} clips, calling FFmpeg export")
     
-    # Use fallback export with clips to properly handle assets
-    export_request = BuildCompositionRequest(clips=clips)
-    return await export_with_clips(session_id, export_request)
-
-
-# ------------------------------
-# FAST EXPORT (cached)
-# ------------------------------
-
-class FastExportRequest(BaseModel):
-    timeline: list
-
-
-async def _payload_from_download_form(request: Request) -> dict:
-    import json as _json
-
-    form = await request.form()
-    payload = form.get("payload")
-    if not payload:
-        raise HTTPException(status_code=400, detail="Missing export payload")
-
-    try:
-        return _json.loads(str(payload))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid export payload: {e}")
-
-
-@app.post("/api/videos/{session_id}/export-fast-download")
-async def export_fast_download(session_id: str, request: Request):
-    payload = await _payload_from_download_form(request)
-    return await export_fast(session_id, FastExportRequest(**payload))
-
-
-@app.post("/api/videos/{session_id}/export-with-clips-download")
-async def export_with_clips_download(session_id: str, request: Request):
-    payload = await _payload_from_download_form(request)
-    return await export_with_clips(session_id, BuildCompositionRequest(**payload))
-
-
-@app.post("/api/videos/{session_id}/export-fast")
-async def export_fast(session_id: str, body: FastExportRequest):
-    """Fast cached export endpoint.
-
-    - Uses an ultrafast ffmpeg encode per segment, then concatenates.
-    - Caches the resulting mp4 keyed by session_id + ordered timeline.
-    - On cache hit, returns the mp4 immediately.
-
-    NOTE: First export after edits may take longer; subsequent exports for the same timeline are instant.
-    """
-    from pathlib import Path as _Path
-    import hashlib as _hashlib
-    import json as _json
-    import uuid as _uuid
-    import subprocess as _subprocess
-    import concurrent.futures as _futures
-
-    # Resolve session -> original video file
-    if session_id not in session_store:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    video_path = _Path(session_store[session_id])
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found")
-
-    timeline = getattr(body, "timeline", None) or []
-
-    def _export_signature(_session_id: str, _timeline: list[dict]) -> str:
-        normalized: list[dict] = []
-        for i, clip in enumerate(_timeline or []):
-            if clip.get("assetUrl"):
-                normalized.append({"i": i, "assetUrl": clip.get("assetUrl"), "duration": round(float(clip.get("duration", 0) or 0), 3)})
-                continue
-            source_segments = clip.get("segments") or [clip]
-            for j, segment in enumerate(source_segments):
-                start = float(segment.get("sourceStart", segment.get("start", 0)) or 0)
-                end = segment.get("sourceEnd", segment.get("end"))
-                duration = segment.get("duration")
-                if duration is None and end is not None:
-                    duration = float(end) - start
-                if duration is None:
-                    duration = float(clip.get("duration", 0) or 0)
-                normalized.append({"i": i, "j": j, "start": round(start, 3), "duration": round(float(duration), 3)})
-        material = {"session_id": _session_id, "timeline": normalized}
-        return _hashlib.md5(_json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()[:12]
-
-    signature = _export_signature(session_id, timeline)
-
-    export_dir = UPLOAD_DIR / "export_cache"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    output_path = export_dir / f"{session_id}_{signature}.mp4"
-
-    if output_path.exists() and output_path.stat().st_size > 1024:
-        return FileResponse(
-            path=str(output_path),
-            filename=f"edited-{session_id[:8]}.mp4",
-            media_type="video/mp4",
-        )
-
-    export_id = str(_uuid.uuid4())[:8]
-    temp_dir = UPLOAD_DIR / f"export_{export_id}"
-    temp_dir.mkdir(exist_ok=True)
-
-    concat_file = temp_dir / "concat.txt"
-    clip_files: list[_Path] = []
-
-    try:
-        if not timeline:
-            return FileResponse(
-                path=str(video_path),
-                filename=f"edited-{session_id[:8]}.mp4",
-                media_type="video/mp4",
-            )
-
-        if any(clip.get("assetUrl") or clip.get("assetKind") for clip in timeline):
-            raise HTTPException(
-                status_code=400,
-                detail="Fast export only supports original video timeline clips. Use full export for asset timelines."
-            )
-
-        source_segments: list[dict] = []
-        for clip in timeline:
-            if clip.get("segments"):
-                source_segments.extend(clip.get("segments") or [])
-            else:
-                source_segments.append(clip)
-
-        def _copy_segment(item):
-            i, clip = item
-            start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
-
-            duration = clip.get("duration")
-            end = clip.get("sourceEnd", clip.get("end"))
-            if duration is None and end is not None:
-                duration = float(end) - start
-            if duration is None:
-                duration = float(clip.get("duration", 0) or 0)
-
-            duration = float(duration or 0)
-            if duration <= 0.05:
-                return None
-
-            clip_path = temp_dir / f"clip_{i}.mp4"
-
-            # Stream-copy each segment instead of re-encoding. This is much faster
-            # and keeps export close to "download speed" for original-video timelines.
-            cmd = [
-                "ffmpeg",
-                "-ss", str(start),
-                "-t", str(duration),
-                "-i", str(video_path),
-                "-map", "0:v:0?",
-                "-map", "0:a:0?",
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart",
-                "-y",
-                str(clip_path),
-            ]
-            _subprocess.run(cmd, check=True, capture_output=True, text=True)
-            return clip_path
-
-        with _futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(source_segments)))) as executor:
-            copied = list(executor.map(_copy_segment, enumerate(source_segments)))
-
-        clip_files = [clip_path for clip_path in copied if clip_path is not None]
-
-        if not clip_files:
-            raise HTTPException(status_code=400, detail="No valid clips to export")
-
-        with open(concat_file, "w", encoding="utf-8") as f:
-            for c in clip_files:
-                f.write(f"file '{c.absolute().as_posix()}'\n")
-
-        tmp_final = temp_dir / "final.mp4"
-        _subprocess.run(
-            [
-                "ffmpeg",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_file),
-                "-c", "copy",
-                "-movflags", "+faststart",
-                "-y",
-                str(tmp_final),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        tmp_final.replace(output_path)
-
-        return FileResponse(
-            path=str(output_path),
-            filename=f"edited-{session_id[:8]}.mp4",
-            media_type="video/mp4",
-        )
-
-    except _subprocess.CalledProcessError as e:
-        err = e.stderr[-300:] if e.stderr else str(e)
-        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {err}")
-
-    finally:
-        # best-effort cleanup
-        try:
-            for p in temp_dir.glob("*.mp4"):
-                p.unlink(missing_ok=True)
-            for p in temp_dir.glob("*.txt"):
-                p.unlink(missing_ok=True)
-        except Exception:
-            pass
+    # Use existing FFmpeg export logic
+    export_request = ExportRequest(clips=clips)
+    return await export_video(session_id, export_request)
 
 
 @app.post("/api/videos/{session_id}/export")
@@ -3809,7 +3101,18 @@ async def export_video(session_id: str, body: ExportRequest):
     print(f"[export] session_id={session_id}, clips={len(body.clips)}, source={video_path}")
 
     # DO NOT SORT - preserve array order for user-defined sequencing (e.g., swaps)
-    clips = body.clips
+    # Flatten merged clips
+    clips = []
+    for clip in body.clips:
+        if clip.get("segments"):
+            for seg in clip["segments"]:
+                flat = dict(clip)
+                flat["sourceStart"] = seg.get("sourceStart", seg.get("start", 0))
+                flat["sourceEnd"] = seg.get("sourceEnd", seg.get("end", 0))
+                flat.pop("segments", None)
+                clips.append(flat)
+        else:
+            clips.append(clip)
     
     # Debug: Log clip order before export
     print(f"[export] Clip order before export:")

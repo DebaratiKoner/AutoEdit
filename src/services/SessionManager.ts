@@ -84,14 +84,15 @@ export class SessionManager {
     try {
       // Try IndexedDB first
       const db = await this.initDB();
-      const transaction = db.transaction([STORE_NAME], 'readonly');
-      const store = transaction.objectStore(STORE_NAME);
-      
-      const data = await new Promise<SessionData | null>((resolve, reject) => {
-        const request = store.get(sessionId);
-        request.onsuccess = () => resolve(request.result || null);
-        request.onerror = () => reject(request.error);
-      });
+        const transaction = db.transaction([STORE_NAME], 'readonly');
+        const store = transaction.objectStore(STORE_NAME);
+
+        const data = await new Promise<SessionData | null>((resolve, reject) => {
+          const request = store.get(sessionId);
+          request.onsuccess = () => resolve((request as any).result || null);
+          request.onerror = () => reject((request as any).error);
+        });
+
       
       if (data) {
         return data;
@@ -104,9 +105,10 @@ export class SessionManager {
       // Fallback to localStorage
       const key = `${STORAGE_PREFIX}${sessionId}`;
       const stored = localStorage.getItem(key);
-      if (stored) {
+      if (stored != null) {
         return JSON.parse(stored);
       }
+
     } catch (error) {
       console.warn('localStorage load failed, checking in-memory storage:', error);
     }

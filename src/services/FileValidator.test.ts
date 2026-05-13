@@ -6,6 +6,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import * as fc from 'fast-check';
 import { FileValidator } from './FileValidator';
 
+// Store the real document.createElement to avoid nested mocking
+const realCreateElement = document.createElement.bind(document);
+
 describe('FileValidator', () => {
   let validator: FileValidator;
 
@@ -336,9 +339,6 @@ function createMockVideoFile(width: number, height: number): File {
   const file = new File([], 'video.mp4', { type: 'video/mp4' });
   
   // Mock URL.createObjectURL to return a predictable URL
-  const originalCreateObjectURL = URL.createObjectURL;
-  const originalRevokeObjectURL = URL.revokeObjectURL;
-  
   URL.createObjectURL = () => `blob:mock-${width}x${height}`;
   URL.revokeObjectURL = () => {};
   
@@ -346,20 +346,18 @@ function createMockVideoFile(width: number, height: number): File {
   const originalCreateElement = document.createElement.bind(document);
   document.createElement = ((tagName: string) => {
     if (tagName === 'video') {
-      const video = originalCreateElement('video') as HTMLVideoElement;
+      const video = realCreateElement('video') as HTMLVideoElement;
       
       // Override the src setter to trigger metadata loading
       Object.defineProperty(video, 'src', {
         set: function (_value: string) {
-          // Simulate async metadata loading
-          setTimeout(() => {
-            Object.defineProperty(video, 'videoWidth', { value: width, writable: false });
-            Object.defineProperty(video, 'videoHeight', { value: height, writable: false });
-            
-            if (video.onloadedmetadata) {
-              video.onloadedmetadata(new Event('loadedmetadata'));
-            }
-          }, 0);
+          // Simulate synchronous metadata loading
+          Object.defineProperty(video, 'videoWidth', { value: width, writable: true, configurable: true });
+          Object.defineProperty(video, 'videoHeight', { value: height, writable: true, configurable: true });
+          
+          if (video.onloadedmetadata) {
+            video.onloadedmetadata(new Event('loadedmetadata'));
+          }
         },
         get: function () {
           return `blob:mock-${width}x${height}`;
@@ -372,11 +370,7 @@ function createMockVideoFile(width: number, height: number): File {
   }) as typeof document.createElement;
   
   // Restore original functions after test
-  setTimeout(() => {
-    URL.createObjectURL = originalCreateObjectURL;
-    URL.revokeObjectURL = originalRevokeObjectURL;
-    document.createElement = originalCreateElement;
-  }, 100);
+  // Removed setTimeout restoration to keep mock active for all tests
   
   return file;
 }

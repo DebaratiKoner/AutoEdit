@@ -75,11 +75,13 @@ export class CompositionBuilder {
         const seg = session.transcriptSegments[i];
         const customStyle = session.remotionSettings?.subtitleStyle ?? options.subtitleStyle;
 
+        // transcript seg.start/end are already in seconds on the ORIGINAL timeline.
+        // Map them to the composition timeline directly.
         subtitles.push({
           id: `subtitle-${i}`,
           text: seg.text,
           startFrame: Math.floor(seg.start * fps),
-          endFrame: Math.floor(seg.end * fps),
+          endFrame: Math.max(Math.floor(seg.end * fps), Math.floor(seg.start * fps) + 1),
           style: customStyle ? { ...DEFAULT_SUBTITLE_STYLE, ...customStyle } : DEFAULT_SUBTITLE_STYLE,
         });
       }

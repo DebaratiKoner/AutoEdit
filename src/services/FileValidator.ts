@@ -67,8 +67,30 @@ export class FileValidator {
    */
   private formatSupportedFormats(): string {
     return FileValidator.SUPPORTED_FORMATS
-      .map(format => format.toUpperCase())
+      .map(format => format === 'webm' ? 'WebM' : format.toUpperCase())
       .join(', ');
+  }
+
+  /**
+   * Validate video resolution by loading it in a video element
+   * @param file - Video file to validate
+   * @returns ValidationResult indicating if resolution is valid
+   */
+  async validateResolution(file: File): Promise<ValidationResult> {
+    try {
+      const resolution = await this.getVideoResolution(file);
+      return {
+        valid: true,
+        details: {
+          resolution,
+        },
+      };
+    } catch (error) {
+      return {
+        valid: false,
+        error: 'Unable to read video resolution. Please ensure the file is a valid video.',
+      };
+    }
   }
 
   /**

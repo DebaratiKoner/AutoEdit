@@ -123,19 +123,80 @@ export class APIClient {
    * @param clips - Optional: array of edited clips to transcribe (if omitted, transcribes full video)
    * @returns Promise resolving to transcript response
    */
+  async getTranscriptionJobStatus(
+    sessionId: string,
+    jobId: string
+  ): Promise<{
+    jobId: string;
+    status: string;
+    transcript?: string;
+    segments?: Array<{ start: number; end: number; text: string }>;
+    error?: string;
+  }> {
+    return this.requestWithRetry(
+      `${this.baseUrl}/videos/${sessionId}/transcribe/jobs/${jobId}`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+
   async transcribeVideo(
     sessionId: string,
-    clips?: Array<{ start: number; end: number; title?: string }>,
-    quick?: boolean
+    // NOTE: currently unused by this client; server transcribe endpoint is called without explicit clip data.
+    // Kept to avoid breaking callers.
+    clips?: Array<{ start: number; end: number; title?: string }>
   ): Promise<TranscriptResponse> {
-    return this.requestWithRetry<TranscriptResponse>(
+
+    type JobStatusResponse = {
+      jobId: string;
+      status: string;
+      transcript?: string;
+      segments?: Array<{ start: number; end: number; text: string }>;
+      error?: string;
+    };
+
+    const response = await this.requestWithRetry<TranscriptResponse | JobStatusResponse>(
       `${this.baseUrl}/videos/${sessionId}/transcribe`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clips: clips || null, quick: quick || false }),
       }
     );
+
+    if ('transcript' in response && response.transcript != null) {
+      return response as TranscriptResponse;
+    }
+
+    if ('jobId' in response && response.status) {
+      const start = Date.now();
+      const timeoutMs = 600_000; // Allow 10 minutes max to poll job status
+      const pollInterval = 1200;
+
+      let job: JobStatusResponse = response;
+      while (job.status === 'pending' || job.status === 'running') {
+        if (Date.now() - start > timeoutMs) {
+          throw new Error('Transcription timed out. Please try again later.');
+        }
+
+        await this.delay(pollInterval);
+        job = await this.getTranscriptionJobStatus(sessionId, response.jobId);
+      }
+
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'Transcription failed');
+      }
+
+      if (!job.transcript) {
+        throw new Error('Transcription finished without returning text');
+      }
+
+      return {
+        transcript: job.transcript,
+        segments: job.segments || [],
+      };
+    }
+
+    throw new Error('Unexpected transcription response from server');
   }
 
   /**
@@ -301,9 +362,10 @@ export class APIClient {
       if (error instanceof APIError) {
         throw error;
       }
-      throw new NetworkError('Connection failed — is the backend running on port 8000?', error);
+    throw new NetworkError('Connection failed', error);
     }
   }
+
 
   /**
    * Delay execution for specified milliseconds
