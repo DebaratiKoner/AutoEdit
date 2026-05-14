@@ -63,7 +63,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [currentTime, setCurrentTime] = useState(0);
   const [activeAssetClip, setActiveAssetClip] = useState<TimelineSegment | null>(null);
   const [activeOverlayClip, setActiveOverlayClip] = useState<TimelineSegment | null>(null);
-  const [photoOverlay, setPhotoOverlay] = useState<{ url: string; name: string } | null>(null);
+  const [photoOpacity, setPhotoOpacity] = useState(0);
+  const [photoName, setPhotoName] = useState<string>('');
   const [isPlaying, setIsPlaying] = useState(false);
   const [activeTab, setActiveTab] = useState<'clips' | 'ai-edit' | 'assets'>('clips');
   const [showResetDialog, setShowResetDialog] = useState(false);
@@ -248,6 +249,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const isJumpingRef = useRef<boolean>(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetVideoRef = useRef<HTMLVideoElement>(null);  // dedicated element for asset clips
+  const assetPhotoRef = useRef<HTMLImageElement>(null);  // dedicated element for asset photos
   const audioRef = useRef<HTMLAudioElement>(null);       // dedicated element for track-1 audio
   const audioSrcRef = useRef<string>('');                // tracks current audio src
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -265,6 +267,19 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const photoStartTimeRef = useRef<number>(0); // performance.now() when photo started playing
 
   const snapshotImgRef = useRef<HTMLImageElement>(null);
+
+  const pausePhotoIfActive = useCallback(() => {
+    if (!sessionRef.current) return;
+    const sortedClips = [...(sessionRef.current.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+    const clip = sortedClips[currentClipIndexRef.current];
+    if (clip?.assetKind === 'photo' && photoTimerRef.current) {
+      setIsPlaying(false);
+      isPlayingRef.current = false;
+      photoElapsedRef.current += (performance.now() - photoStartTimeRef.current) / 1000;
+      clearTimeout(photoTimerRef.current);
+      photoTimerRef.current = null;
+    }
+  }, []);
 
   const handleLocalFileInsert = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -328,7 +343,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         assetUrl, assetKind: data.assetType === 'video' ? 'video' : 'photo',
         duration: assetDuration, timelineStart: 0,
         sourceStart: 0, sourceEnd: assetDuration,
-        order: 0, track: 0, color: getAssetColor(data.assetType || 'video'),
+        order: 0, track: 0, color: getClipColor(0),
       };
 
       if (insertAfterClipIdRef.current) {
@@ -398,7 +413,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         order: i, 
         timelineStart: t,
         // ✅ FIXED: Preserve custom names (no "Clip N" override)
-        name: preserveClipName(s) 
+        name: preserveClipName(s),
+        color: getClipColor(i)
       }; 
       t += s.duration; 
       return r; 
@@ -439,12 +455,13 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       // Send the actual edited timeline clips so Whisper transcribes only kept segments
       // Timestamps are mapped back to timeline positions after transcription
       const track0Clips = session.timeline
-        .filter(s => s.track === 0 && !s.assetUrl) // only original video segments
+        .filter(s => s.track === 0) 
         .sort((a, b) => a.order - b.order)
         .map(s => ({
           start: s.sourceStart ?? 0,
           end: s.sourceEnd ?? s.duration,
           timelineStart: s.timelineStart ?? 0,
+          assetUrl: s.assetUrl,
         }));
 
       const response = await fetchWithTranscribeRetry(`/api/videos/${sessionId}/transcribe`, {
@@ -627,7 +644,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           duration,
           order: i,
           track: 0,
-          color: clip.color ?? (assetUrl ? getAssetColor(assetKind || 'video') : getClipColor(i)),
+          color: getClipColor(i),
           name,
           assetUrl,
           assetKind,
@@ -859,8 +876,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       
     } else {
       // No active audio clip in this time window.
-      // Do NOT clear au.src while playing—this can cause audible dropouts/buffering.
-      if (!isPlaying && au && !au.paused) au.pause();
+      if (au && !au.paused) au.pause();
     }
 
     if (video) video.volume = Math.min(1, duckedVolume * videoVolume * activeVideoVol);
@@ -885,30 +901,40 @@ function getShortName(name: string | undefined | null, fallback: string) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.timeline]);
 
+  // Pre-load all photo assets to ensure smooth transitions
+  useEffect(() => {
+    if (!session) return;
+    session.timeline.forEach(clip => {
+      if (clip.assetKind === 'photo' && clip.assetUrl) {
+        const img = new Image();
+        img.src = getAssetPreviewUrl(clip.assetUrl, clip.assetKind);
+      }
+    });
+  }, [session?.timeline]);
+
   // Track which asset clip is currently active — based on clip index, not raw video time
   // This fires whenever currentTime changes (every RAF frame during playback)
   useEffect(() => {
-    if (!session) { setActiveAssetClip(null); setPhotoOverlay(null); return; }
+    if (!session) { setActiveAssetClip(null); setPhotoOpacity(0); return; }
     const sorted = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
     const idx = currentClipIndexRef.current;
     const activeSeg = sorted[idx] ?? null;
 
     if (activeSeg?.assetUrl) {
       setActiveAssetClip(activeSeg);
-      // Fallback: If legacy session had a photo on Track 0, display it
       if (activeSeg.assetKind === 'photo') {
-        setPhotoOverlay(prev => {
-          const newUrl = getAssetPreviewUrl(activeSeg.assetUrl);
-          const newName = activeSeg.name ?? 'Photo';
-          if (prev?.url === newUrl && prev?.name === newName) return prev;
-          return { url: newUrl, name: newName };
-        });
+        const newUrl = getAssetPreviewUrl(activeSeg.assetUrl, activeSeg.assetKind);
+        if (assetPhotoRef.current && assetPhotoRef.current.src !== newUrl) {
+          assetPhotoRef.current.src = newUrl;
+        }
+        setPhotoName(activeSeg.name ?? 'Photo');
+        setPhotoOpacity(1);
       } else {
-        setPhotoOverlay(null);
+        setPhotoOpacity(0);
       }
     } else {
       setActiveAssetClip(null);
-      setPhotoOverlay(null);
+      setPhotoOpacity(0);
     }
 
     // Evaluate active free-positioned overlays on Track 1
@@ -961,12 +987,20 @@ function getShortName(name: string | undefined | null, fallback: string) {
       isJumpingRef.current = true;
 
       // Pause all
-      if (video) video.pause();
+      if (video && !video.paused) {
+        systemActionRef.current = true;
+        video.pause();
+      }
       if (av && !av.paused) av.pause();
 
       // PHOTO
       if (clip.assetKind === 'photo' && clip.assetUrl) {
-        setPhotoOverlay({ url: getAssetPreviewUrl(clip.assetUrl, clip.assetKind), name: clip.name ?? 'Photo' });
+        const photoUrl = getAssetPreviewUrl(clip.assetUrl, clip.assetKind);
+        if (assetPhotoRef.current && assetPhotoRef.current.src !== photoUrl) {
+          assetPhotoRef.current.src = photoUrl;
+        }
+        setPhotoName(clip.name ?? 'Photo');
+        setPhotoOpacity(1);
         setActiveAssetClip(clip);
         setAssetVideoOpacity(0);
         photoElapsedRef.current = offset;
@@ -978,10 +1012,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
           isPlayingRef.current = true;
           const remaining = clip.duration - offset;
           photoTimerRef.current = setTimeout(() => {
-            // Stop playing instead of advancing to next clip
-            setIsPlaying(false);
-            isPlayingRef.current = false;
-            clearPhotoTimer();
+            advanceToNextClip(isPlayingRef.current);
           }, remaining * 1000);
         }
         return;
@@ -989,13 +1020,14 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
       // ASSET VIDEO
       if (clip.assetUrl && clip.assetKind === 'video' && av) {
-        setPhotoOverlay(null);
+        setPhotoOpacity(0);
         setActiveAssetClip(clip);
         if (assetSrcRef.current !== clip.assetUrl) {
           av.src = clip.assetUrl;
           assetSrcRef.current = clip.assetUrl;
+          av.load();
         }
-        av.currentTime = offset;
+        try { av.currentTime = offset; } catch(e) {}
         av.volume = Math.min(1, (clip.volume ?? 1) * videoVolume);
         setAssetVideoOpacity(1);
         isSwitchingRef.current = false;
@@ -1009,13 +1041,13 @@ function getShortName(name: string | undefined | null, fallback: string) {
       }
 
       // ORIGINAL
-      setPhotoOverlay(null);
+      setPhotoOpacity(0);
       setActiveAssetClip(null);
       setAssetVideoOpacity(0);
       if (av && !av.paused) av.pause();
 
       const targetTime = (clip.sourceStart ?? 0) + offset;
-      if (video) video.currentTime = targetTime;
+      try { if (video) video.currentTime = targetTime; } catch(e) {}
 
       isSwitchingRef.current = false;
       isJumpingRef.current = false;
@@ -1036,12 +1068,18 @@ function getShortName(name: string | undefined | null, fallback: string) {
         setIsPlaying(false);
         isPlayingRef.current = false;
         clearPhotoTimer();
-        setPhotoOverlay(null);
+        setPhotoOpacity(0);
         setActiveAssetClip(null);
         setAssetVideoOpacity(0);
         setCurrentTime(0);
         rafRunning = false;
-        if (video) video.currentTime = sortedClips[0]?.sourceStart ?? 0;
+        if (video) {
+          video.pause();
+          try { video.currentTime = sortedClips[0]?.sourceStart ?? 0; } catch(e) {}
+        }
+        if (av) av.pause();
+        const au = audioRef.current;
+        if (au) au.pause();
       }
     };
 
@@ -1118,14 +1156,15 @@ function getShortName(name: string | undefined | null, fallback: string) {
       if (clip?.assetKind === 'video' && clip.assetUrl && av) {
         av.play().catch(() => {});
       } else if (clip?.assetKind === 'photo') {
+        if (video && !video.paused) {
+          systemActionRef.current = true;
+          video.pause();
+        }
         const offset = photoElapsedRef.current;
         const remaining = clip.duration - offset;
         photoStartTimeRef.current = performance.now(); // reset wall-clock start
         photoTimerRef.current = setTimeout(() => {
-          // Stop playing instead of advancing to next clip
-          setIsPlaying(false);
-          isPlayingRef.current = false;
-          clearPhotoTimer();
+          advanceToNextClip(isPlayingRef.current);
         }, remaining * 1000);
       } else if (video) {
         video.play().catch(() => {});
@@ -1144,12 +1183,13 @@ function getShortName(name: string | undefined | null, fallback: string) {
       isPlayingRef.current = false;
       rafRunning = false;
       cancelAnimationFrame(rafId);
-      clearPhotoTimer();
-      // Save elapsed time for photo so resume works correctly
+      
       const clip = sortedClips[currentClipIndexRef.current];
-      if (clip?.assetKind === 'photo') {
+      if (clip?.assetKind === 'photo' && photoTimerRef.current) {
         photoElapsedRef.current += (performance.now() - photoStartTimeRef.current) / 1000;
       }
+      clearPhotoTimer();
+
       if (video && !video.paused) video.pause();
       if (av && !av.paused) av.pause();
       const au = audioRef.current;
@@ -1201,7 +1241,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       // Migrate: assign colors and tracks to clips that don't have them
       const migratedTimeline = data.timeline.map((seg, index) => ({
         ...seg,
-        color: seg.color || getClipColor(index),
+        color: (seg.track === 0 || seg.track === undefined) ? getClipColor(seg.order ?? index) : (seg.color || getClipColor(index)),
         track: seg.track !== undefined ? seg.track : 0, // Default to track 0
       }));
       
@@ -1266,6 +1306,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     e.stopPropagation();
     setIsDraggingPlayhead(true);
     if (isPlaying) {
+      pausePhotoIfActive();
       setIsPlaying(false);
       if (videoRef.current) videoRef.current.pause();
       if (assetVideoRef.current) assetVideoRef.current.pause();
@@ -1411,31 +1452,54 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
     if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
 
+    const wasPlaying = !isScrubbing && isPlayingRef.current;
+
     // Photo
     if (segment.assetKind === 'photo' && segment.assetUrl) {
+      if (video && !video.paused) {
+        systemActionRef.current = true;
+      }
       video.pause();
       if (av && !av.paused) av.pause();
       // Mute video to silence any audio when showing photo
       video.muted = true;
       setAssetVideoOpacity(0);
-      setPhotoOverlay({ url: getAssetPreviewUrl(segment.assetUrl, segment.assetKind), name: segment.name ?? 'Photo' });
+      const photoUrl = getAssetPreviewUrl(segment.assetUrl, segment.assetKind);
+      if (assetPhotoRef.current && assetPhotoRef.current.src !== photoUrl) {
+        assetPhotoRef.current.src = photoUrl;
+      }
+      setPhotoName(segment.name ?? 'Photo');
+      setPhotoOpacity(1);
       setActiveAssetClip(segment);
+      photoElapsedRef.current = offset;
       isJumpingRef.current = false;
+      if (wasPlaying) {
+        setIsPlaying(true);
+        isPlayingRef.current = true;
+        const remaining = segment.duration - offset;
+        photoStartTimeRef.current = performance.now();
+        photoTimerRef.current = setTimeout(() => {
+          advanceToNextClip(true);
+        }, remaining * 1000);
+      }
       return;
     }
 
     // Asset video
     if (segment.assetKind === 'video' && segment.assetUrl && av) {
-      const wasPlaying = !isScrubbing && (!video.paused || (av && !av.paused));
+      if (video && !video.paused) {
+        systemActionRef.current = true;
+      }
       video.pause();
       video.muted = false; // Unmute when showing video
-      setPhotoOverlay(null);
+      setPhotoOpacity(0);
       setActiveAssetClip(segment);
       if (assetSrcRef.current !== segment.assetUrl) {
         av.src = segment.assetUrl;
         assetSrcRef.current = segment.assetUrl;
+        av.load();
       }
-      av.currentTime = offset;
+      try { av.currentTime = offset; } catch(e) {}
       setAssetVideoOpacity(1);
       isJumpingRef.current = false;
       if (wasPlaying) { av.play().catch(() => {}); setIsPlaying(true); isPlayingRef.current = true; }
@@ -1443,14 +1507,13 @@ function getShortName(name: string | undefined | null, fallback: string) {
     }
 
     // Original video clip
-    setPhotoOverlay(null);
+    setPhotoOpacity(0);
     setActiveAssetClip(null);
     setAssetVideoOpacity(0);
     if (av && !av.paused) av.pause();
     video.muted = false; // Unmute when showing original video
 
     const targetTime = (segment.sourceStart ?? 0) + offset;
-    const wasPlaying = !isScrubbing && !video.paused;
     try { video.currentTime = targetTime; } catch(e) { /* ignore */ }
     isJumpingRef.current = false;
 
@@ -1515,6 +1578,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         const av = assetVideoRef.current;
         const au = audioRef.current;
         if (isPlayingRef.current) {
+          pausePhotoIfActive();
           video?.pause();
           av?.pause();
           au?.pause();
@@ -1579,11 +1643,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
       return;
     }
     
-    // Colors - original for part1, next for part2
-    const availableColors = ['#2ecc71', '#e74c3c', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22', '#16a085', '#27ae60'];
-    const color1 = segmentToCut.color || availableColors[0];
-    const color2 = availableColors[(availableColors.indexOf(color1) + 1) % availableColors.length];
-    
     const baseName = segmentToCut.name || `Clip ${segmentToCut.order + 1}`;
     
     const segment1Name = `${baseName}-1`;
@@ -1596,7 +1655,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
       sourceEnd: sourceCutTime,
       duration: cutOffset,
       name: segment1Name,
-      color: color1,
     };
     
     const segment2: TimelineSegment = {
@@ -1606,7 +1664,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
       timelineStart: (segmentToCut.timelineStart ?? 0) + cutOffset,
       duration: segmentToCut.duration - cutOffset,
       name: segment2Name,
-      color: color2,
     };
 
     // Correctly replace the single segment with two parts in the timeline
@@ -1624,7 +1681,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     // Recalculate positions/names
     let t = 0;
     const adjusted = newTrack0.map((seg, i) => {
-      const adj = { ...seg, order: i, timelineStart: t };
+      const adj = { ...seg, order: i, timelineStart: t, color: getClipColor(i) };
       t += seg.duration;
       return adj;
     });
@@ -1685,7 +1742,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
         ...seg, 
         order: index, 
         timelineStart: cumulativeTime,
-        name: preserveClipName(seg)
+        name: preserveClipName(seg),
+        color: seg.track === 0 ? getClipColor(index) : seg.color
       };
       cumulativeTime += seg.duration;
       return adjusted;
@@ -1877,7 +1935,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
         order: idx, 
         timelineStart: t,
         // ✅ FIXED: Preserve custom names on reorder/drop
-        name: preserveClipName(seg)
+        name: preserveClipName(seg),
+        color: getClipColor(idx)
       };
       t += seg.duration;
       return s;
@@ -2045,7 +2104,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
     // Recalculate timeline positions for track 0
     let cumulativeTime = 0;
     const adjustedTrack0 = reorderedTrack0.map(seg => {
-      const adjusted = { ...seg, timelineStart: cumulativeTime };
+      const adjusted = { 
+        ...seg, 
+        timelineStart: cumulativeTime,
+        color: getClipColor(seg.order)
+      };
       cumulativeTime += seg.duration;
       return adjusted;
     });
@@ -2324,14 +2387,14 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   objectFit: 'contain',
                   zIndex: 4,
                   opacity: assetVideoOpacity,
-transition: 'opacity 0.02s linear',
+                  transition: 'opacity 0.15s ease-out',
                   pointerEvents: 'none',
                   backgroundColor: '#000',
                 }}
                 crossOrigin="anonymous"
                 preload="auto"
                 playsInline
-                muted
+                muted={false}
                 onPlay={() => { setIsPlaying(true); isPlayingRef.current = true; }}
                 onPause={() => { setIsPlaying(false); isPlayingRef.current = false; }}
               />
@@ -2378,44 +2441,61 @@ transition: 'opacity 0.02s linear',
               </div>
             )}
             
-            {/* Photo overlay — click to pause/resume */}
-            {!activeOverlayClip && photoOverlay && (
+            {/* Photo overlay (Track 0) — click to pause/resume */}
               <div
-                className="video-photo-preview"
-                style={{ cursor: 'pointer' }}
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  zIndex: 3,
+                  backgroundColor: '#000',
+                  opacity: photoOpacity,
+                  pointerEvents: photoOpacity > 0 ? 'auto' : 'none',
+                  transition: 'opacity 0.15s ease-out',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                }}
                 onClick={() => {
+                  const video = videoRef.current;
+                  const av = assetVideoRef.current;
+                  const au = audioRef.current;
                   if (isPlaying) {
-                    if (photoTimerRef.current) { clearTimeout(photoTimerRef.current); photoTimerRef.current = null; }
-                    setIsPlaying(false);
-                    isPlayingRef.current = false;
+                    pausePhotoIfActive();
+                    video?.pause();
+                    av?.pause();
+                    au?.pause();
                   } else {
-                    setIsPlaying(true);
-                    isPlayingRef.current = true;
-                    // Resume with remaining duration (use full duration as safe fallback)
-                    const clips = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
-                    const clip = clips[currentClipIndexRef.current];
-                    const remaining = clip ? Math.max(500, (clip.duration - photoElapsedRef.current) * 1000) : 3000;
-                    photoTimerRef.current = setTimeout(() => {
-                      // advance — trigger by seeking past end
-                      const nextIdx = currentClipIndexRef.current + 1;
-                      if (nextIdx < clips.length) {
-                        currentClipIndexRef.current = nextIdx;
-                        // loadClip is inside the useEffect closure, so we trigger via video play
-                        // Simplest: just clear photo and let the rAF loop handle it
-                        setPhotoOverlay(null);
-                        setActiveAssetClip(null);
+                    if (au) au.play().catch(() => {});
+                    const clip = (session.timeline || []).filter(s => s.track === 0).sort((a, b) => a.order - b.order)[currentClipIndexRef.current];
+                    if (clip?.assetKind === 'video' && clip.assetUrl && av) {
+                      av.volume = 1;
+                      av.play().catch(() => {});
+                    } else {
+                      if (video) video.volume = 1;
+                      video?.play().catch(() => {});
+                    }
+                    const audioClips = session.timeline?.filter(s => s.track >= 1 && s.assetKind === 'audio') || [];
+                    const activeAudio = audioClips.find(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0));
+                    if (activeAudio && au) {
+                      if (audioSrcRef.current !== activeAudio.assetUrl) {
+                        au.src = activeAudio.assetUrl || '';
+                        audioSrcRef.current = activeAudio.assetUrl || '';
+                        au.load();
+                        try { au.currentTime = Math.max(0, currentTime - (activeAudio.timelineStart ?? 0)); } catch(e) {}
                       }
-                    }, remaining);
+                      au.volume = Math.max(0, Math.min(1, (activeAudio.volume ?? 1) * globalVolume));
+                      au.play().catch(() => {});
+                    }
                   }
                 }}
               >
-                <img src={photoOverlay.url} alt={photoOverlay.name} className="video-photo-img" />
-                <div className="video-photo-label">{getShortName(photoOverlay.name, 'Photo')}</div>
+                <img ref={assetPhotoRef} className="video-photo-img" alt={photoName} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                {!activeOverlayClip && photoName && <div className="video-photo-label">{getShortName(photoName, 'Photo')}</div>}
               </div>
-            )}
 
             {/* Video asset name label */}
-            {!activeOverlayClip && !photoOverlay && activeAssetClip?.assetKind === 'video' && (
+            {!activeOverlayClip && photoOpacity === 0 && activeAssetClip?.assetKind === 'video' && (
               <div className="asset-overlay-label" style={{ zIndex: 3 }}>
                 Video: {getShortName(activeAssetClip?.name, 'Video')}
               </div>
@@ -2438,6 +2518,7 @@ transition: 'opacity 0.02s linear',
                     const av = assetVideoRef.current;
                     const au = audioRef.current;
                     if (isPlaying) {
+                      pausePhotoIfActive();
                       video?.pause();
                       av?.pause();
                       au?.pause();
@@ -2674,9 +2755,7 @@ transition: 'opacity 0.02s linear',
                                     height: '100%',
                                     flex: `0 0 ${clipPx}px`,
                                     width: `${clipPx}px`,
-                                    backgroundColor: segment.assetKind
-                                      ? getAssetColor(segment.assetKind)
-                                      : (segment.color || getClipColor(segment.order)),
+                            backgroundColor: segment.color || getClipColor(segment.order),
                                     boxSizing: 'border-box',
                                     borderRight: '1px solid #000',
                                     borderTop: selectedSegmentId === segment.id ? '2px solid #fff' : '1px solid rgba(255,255,255,0.2)',
@@ -2966,7 +3045,7 @@ transition: 'opacity 0.02s linear',
                           reordered.splice(toIdx, 0, moved);
                           let t = 0;
                           const adjusted = reordered.map((s, idx) => {
-                            const r = { ...s, order: idx, timelineStart: t };
+                            const r = { ...s, order: idx, timelineStart: t, color: getClipColor(idx) };
                             t += s.duration;
                             return r;
                           });
@@ -2988,7 +3067,7 @@ transition: 'opacity 0.02s linear',
                         style={{
                           display: 'flex', alignItems: 'center', gap: '0.6rem',
                           padding: '0.6rem 0.75rem', background: selectedSegmentId === clip.id ? '#1e2a3a' : '#2a2a2a', borderRadius: '8px',
-                          borderLeft: `4px solid ${clip.assetKind ? getAssetColor(clip.assetKind) : (clip.color || getClipColor(clip.order))}`,
+                  borderLeft: `4px solid ${clip.color || getClipColor(clip.order)}`,
                           cursor: 'grab', userSelect: 'none',
                           transition: 'background 0.15s',
                           outline: selectedSegmentId === clip.id ? '1px solid #4a9eff' : 'none',
@@ -3016,7 +3095,7 @@ transition: 'opacity 0.02s linear',
                           <circle cx="4" cy="13" r="1.5"/><circle cx="8" cy="13" r="1.5"/>
                         </svg>
                         {/* Color dot */}
-                        <div style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: clip.assetKind ? getAssetColor(clip.assetKind) : (clip.color || getClipColor(clip.order)), flexShrink: 0 }} />
+                <div style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: clip.color || getClipColor(clip.order), flexShrink: 0 }} />
                         {/* Info */}
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontWeight: 600, color: '#fff', fontSize: '0.82rem', lineHeight: 1.35, whiteSpace: 'normal', overflowWrap: 'anywhere' }}>
@@ -3148,7 +3227,7 @@ transition: 'opacity 0.02s linear',
                 sourceEnd: assetDuration,
                 order: 0,
                 track: 0,
-                color: getAssetColor(asset._kind),
+        color: getClipColor(0),
               };
 
               const track0Segments = session.timeline.filter(s => s.track === 0).sort((a, b) => a.order - b.order);
@@ -3201,7 +3280,7 @@ transition: 'opacity 0.02s linear',
               // Recalculate timelineStart
               let cumulativeTime = 0;
               const adjustedTrack0 = newTrack0.map((seg, idx) => {
-                const s = { ...seg, order: idx, timelineStart: cumulativeTime };
+                const s = { ...seg, order: idx, timelineStart: cumulativeTime, color: getClipColor(idx) };
                 cumulativeTime += seg.duration;
                 return s;
               });

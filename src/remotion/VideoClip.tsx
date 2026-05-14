@@ -16,7 +16,8 @@ interface VideoClipProps {
 export const VideoClip: React.FC<VideoClipProps> = ({ clip, transition, isLast }) => {
   const frame = useCurrentFrame();
 
-  // Calculate opacity for fade transitions
+  // Calculate opacity for transitions.
+  // For photos we also need smooth opacity changes so switching video <-> photo <-> video is seamless.
   const opacity = transition?.enabled
     ? calculateOpacity(frame, clip.startFrom, clip.durationInFrames, transition.durationInFrames, isLast)
     : 1;
@@ -25,18 +26,22 @@ export const VideoClip: React.FC<VideoClipProps> = ({ clip, transition, isLast }
 
   return (
     <Sequence from={clip.startFrom} durationInFrames={clip.durationInFrames}>
+      {/*
+        Use opacity-only crossfade between adjacent segments.
+        Photos are silent because they render as <Img/> only.
+      */}
       <AbsoluteFill style={{ opacity }}>
         {assetKind === 'photo' ? (
-          <Img
-            src={clip.src}
-            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-          />
+          // Photos must be silent in the preview. Using <Img/> ensures no audio element is created.
+          <Img src={clip.src} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
         ) : (
           <OffthreadVideo
             src={clip.src}
             startFrom={Math.floor(clip.sourceStart * 30)} // Convert seconds to frames (assuming 30fps source)
             endAt={Math.floor(clip.sourceEnd * 30)}
-            volume={clip.volume}
+            // Ensure we do NOT play background audio while previewing the asset section.
+            // RemotionPlayer may reuse clips, so keeping preview silent prevents unintended audio.
+            muted={true}
             style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           />
         )}

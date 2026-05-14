@@ -111,6 +111,10 @@ class PlanEditRequest(BaseModel):
     clips: list  # [{id, start, end, label?}]
     transcript: list = []  # Optional transcript segments
 
+class TranscribeRequest(BaseModel):
+    clips: Optional[list] = None
+    quick: Optional[bool] = False
+
 # --- ADD THIS AFTER LINE 217 ---
 
 def _ensure_clip_ids(clips: list) -> list:
@@ -281,10 +285,10 @@ async def test_connection():
     return JSONResponse(results)
 
 @app.post("/api/videos/{session_id}/transcribe")
-async def transcribe_video(session_id: str):
+async def transcribe_video(session_id: str, request_body: Optional[TranscribeRequest] = None):
     """
     Transcribe video audio using OpenAI Whisper API.
-    Simple implementation that transcribes the entire video.
+    Supports extracting audio directly from the assembled timeline if clips are provided.
     """
     print(f"[transcribe] Starting transcription for session_id={session_id}")
     
@@ -295,116 +299,220 @@ async def transcribe_video(session_id: str):
             detail="OpenAI API key not configured. Set OPENAI_API_KEY environment variable."
         )
     
-    # Find the video file
-    video_path = None
-    if session_id in session_store:
-        stored = Path(session_store[session_id])
-        if stored.exists():
-            video_path = stored
-    
-    if video_path is None:
-        for fname in os.listdir(str(UPLOAD_DIR)):
-            if fname.startswith(session_id) and not fname.endswith("_audio.mp3"):
-                video_path = UPLOAD_DIR / fname
-                break
-    
-    if video_path is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Video file not found for session {session_id}"
-        )
-    
-    print(f"[transcribe] Found video: {video_path}")
-    
-    # Extract audio from video
-    audio_path = UPLOAD_DIR / f"{session_id}_audio.mp3"
+    clips = request_body.clips if request_body else None
     
     try:
-        print(f"[transcribe] Extracting audio...")
-        result = subprocess.run([
-            "ffmpeg",
-            "-i", str(video_path),
-            "-vn",  # No video
-            "-acodec", "libmp3lame",
-            "-ar", "16000",  # 16kHz sample rate
-            "-ac", "1",  # Mono
-            "-b:a", "32k",  # 32kbps bitrate
-            "-y",  # Overwrite
-            str(audio_path)
-        ], capture_output=True, text=True)
+        import tempfile, shutil
+        import concurrent.futures
         
-        if result.returncode != 0:
-            print(f"[transcribe] ffmpeg error: {result.stderr[-500:]}")
-            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+        temp_transcribe_dir = Path(tempfile.mkdtemp(prefix=f"transcribe_{session_id}_"))
         
-        print(f"[transcribe] Audio extracted successfully")
+        if clips:
+            print(f"[transcribe] Extracting audio for {len(clips)} timeline clips...")
+            temp_dir = temp_transcribe_dir / "extraction"
+            temp_dir.mkdir()
+            valid_clips = []
+            
+            for i, clip in enumerate(clips):
+                asset_url = clip.get("assetUrl")
+                src_start = float(clip.get("start", 0))
+                src_end = float(clip.get("end", 0))
+                duration = src_end - src_start
+                if duration <= 0:
+                    continue
+                
+                src_file = None
+                
+                if asset_url:
+                    if asset_url.startswith("/api/"):
+                        if "assets" in asset_url and "stream" in asset_url:
+                            asset_id = asset_url.split("/")[-2]
+                            for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv", ".jpg", ".jpeg", ".png", ".webp"]:
+                                candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
+                                if candidate.exists():
+                                    src_file = candidate
+                                    break
+                else:
+                    if session_id in session_store:
+                        stored = Path(session_store[session_id])
+                        if stored.exists():
+                            src_file = stored
+                    if not src_file:
+                        for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv"]:
+                            candidate = UPLOAD_DIR / f"{session_id}{ext}"
+                            if candidate.exists():
+                                src_file = candidate
+                                break
+                
+                chunk_path = temp_dir / f"chunk_{i}.pcm"
+                is_image = False
+                if src_file and src_file.exists():
+                    is_image = src_file.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+                else:
+                    is_image = True # Fallback to silence if missing
+                    
+                if is_image:
+                    cmd = [
+                        "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                        "-t", str(duration), "-f", "s16le", "-acodec", "pcm_s16le",
+                        str(chunk_path)
+                    ]
+                else:
+                    cmd = [
+                        "ffmpeg", "-y", "-ss", str(src_start), "-t", str(duration),
+                        "-i", str(src_file), "-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "16000",
+                        "-ac", "1", str(chunk_path)
+                    ]
+                
+                subprocess.run(cmd, capture_output=True, check=False)
+                
+                if not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                    cmd = [
+                        "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                        "-t", str(duration), "-f", "s16le", "-acodec", "pcm_s16le",
+                        str(chunk_path)
+                    ]
+                    subprocess.run(cmd, capture_output=True, check=True)
+                    
+                if chunk_path.exists():
+                    valid_clips.append(chunk_path)
+            
+            if valid_clips:
+                concat_pcm = temp_dir / "concat.pcm"
+                with open(concat_pcm, "wb") as outfile:
+                    for chunk in valid_clips:
+                        with open(chunk, "rb") as infile:
+                            outfile.write(infile.read())
+
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "s16le", "-ar", "16000", "-ac", "1",
+                    "-i", str(concat_pcm),
+                    "-c:a", "pcm_s16le", "-f", "segment", "-segment_time", "120",
+                    str(temp_transcribe_dir / "out_%03d.wav")
+                ], capture_output=True, check=True)
+                print(f"[transcribe] Audio segmented successfully from timeline clips")
+            else:
+                raise Exception("No valid audio clips could be generated")
+            
+        else:
+            video_path = None
+            if session_id in session_store:
+                stored = Path(session_store[session_id])
+                if stored.exists():
+                    video_path = stored
+            
+            if video_path is None:
+                for fname in os.listdir(str(UPLOAD_DIR)):
+                    if fname.startswith(session_id) and not fname.endswith("_audio.mp3") and not fname.endswith("_export.mp4"):
+                        video_path = UPLOAD_DIR / fname
+                        break
+            
+            if video_path is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Video file not found for session {session_id}"
+                )
+            
+            print(f"[transcribe] Found video: {video_path}")
+            print(f"[transcribe] Extracting and segmenting audio...")
+            
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-vn", 
+                "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                "-f", "segment", "-segment_time", "120",
+                str(temp_transcribe_dir / "out_%03d.wav")
+            ], capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                print(f"[transcribe] ffmpeg error: {result.stderr[-500:]}")
+                raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+            
+            print(f"[transcribe] Audio extracted and segmented successfully")
+            
+        # Parallel Transcription step
+        chunk_files = sorted(list(temp_transcribe_dir.glob("out_*.wav")))
+        if not chunk_files:
+            raise Exception("No audio chunks were generated by FFmpeg.")
+            
+        print(f"[transcribe] Calling Whisper API in parallel for {len(chunk_files)} chunks...")
         
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="ffmpeg not found. Please install ffmpeg and ensure it is on your PATH."
-        )
-    except subprocess.CalledProcessError as e:
-        error_output = e.stderr if isinstance(e.stderr, str) else str(e)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to extract audio: {error_output}"
-        )
-    
-    # Transcribe using OpenAI Whisper API
-    try:
-        print(f"[transcribe] Calling Whisper API...")
-        with open(audio_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json"
-            )
-        
-        print(f"[transcribe] Transcription complete")
-        
-        # Clean up audio file
-        if audio_path.exists():
-            audio_path.unlink()
-        
-        # Extract transcript and segments
-        transcript = response.text
+        def _transcribe_chunk(cf, offset_time):
+            with open(cf, "rb") as af:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=af,
+                    response_format="verbose_json",
+                    language="en"
+                )
+            
+            segs = []
+            if hasattr(resp, 'segments') and resp.segments:
+                for seg in resp.segments:
+                    if isinstance(seg, dict):
+                        segs.append({
+                            "start": round(float(seg["start"]) + offset_time, 2),
+                            "end": round(float(seg["end"]) + offset_time, 2),
+                            "text": seg["text"].strip()
+                        })
+                    else:
+                        segs.append({
+                            "start": round(float(seg.start) + offset_time, 2),
+                            "end": round(float(seg.end) + offset_time, 2),
+                            "text": seg.text.strip()
+                        })
+            t_text = resp.text if hasattr(resp, 'text') else ""
+            return t_text, segs
+
+        transcript = ""
         segments = []
         
-        if hasattr(response, 'segments') and response.segments:
-            for seg in response.segments:
-                if isinstance(seg, dict):
-                    segments.append({
-                        "start": round(float(seg["start"]), 2),
-                        "end": round(float(seg["end"]), 2),
-                        "text": seg["text"].strip()
-                    })
-                else:
-                    segments.append({
-                        "start": round(float(seg.start), 2),
-                        "end": round(float(seg.end), 2),
-                        "text": seg.text.strip()
-                    })
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            for i, cf in enumerate(chunk_files):
+                offset = i * 120.0
+                futures.append(executor.submit(_transcribe_chunk, cf, offset))
+            
+            for future in futures:
+                t_text, t_segs = future.result()
+                transcript += t_text + " "
+                segments.extend(t_segs)
+        
+        transcript = transcript.strip()
+        print(f"[transcribe] Transcription complete")
         
         return JSONResponse({
             "transcript": transcript,
             "segments": segments
         })
         
+    except FileNotFoundError as e:
+        if "ffmpeg" in str(e):
+            raise HTTPException(
+                status_code=500,
+                detail="ffmpeg not found. Please install ffmpeg and ensure it is on your PATH."
+            )
+        raise e
+    except subprocess.CalledProcessError as e:
+        error_output = e.stderr if isinstance(e.stderr, str) else str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract audio: {error_output}"
+        )
     except Exception as e:
-        # Clean up audio file on error
-        if audio_path.exists():
-            audio_path.unlink()
-        
         error_message = str(e)
         print(f"[transcribe] Error: {error_message}")
-        
         if "Connection error" in error_message or "getaddrinfo failed" in error_message:
             raise HTTPException(status_code=503, detail="Unable to connect to OpenAI API.")
         elif "API key" in error_message or "authentication" in error_message.lower():
             raise HTTPException(status_code=401, detail="OpenAI API authentication failed.")
         else:
             raise HTTPException(status_code=500, detail=f"Transcription failed: {error_message}")
+            
+    finally:
+        if 'temp_transcribe_dir' in locals() and temp_transcribe_dir.exists():
+            shutil.rmtree(temp_transcribe_dir, ignore_errors=True)
 
 @app.post("/api/videos/upload")
 async def upload_video(file: UploadFile = File(...), session_id: Optional[str] = None):
@@ -1112,16 +1220,26 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 {"role": "user", "content": user_message_final},
             ],
             temperature=0.1,
+            response_format={"type": "json_object"}
         )
         raw = response.choices[0].message.content.strip()
         print(f"[edit-with-ai] raw response: {raw}")
 
-        # Strip markdown code fences if model wraps in ```json ... ```
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
+        # Strip markdown code fences or extract JSON block if there's text around it
+        import re as _re_json
+        json_match = _re_json.search(r'```(?:json)?\s*(.*?)\s*```', raw, _re_json.DOTALL)
+        if json_match:
+            raw = json_match.group(1).strip()
+        else:
+            # Fallback: find the first { or [ and the last } or ]
+            start_obj = raw.find('{')
+            start_arr = raw.find('[')
+            first_idx = min(start_obj, start_arr) if start_obj != -1 and start_arr != -1 else max(start_obj, start_arr)
+            
+            if first_idx != -1:
+                last_idx = raw.rfind('}') if raw[first_idx] == '{' else raw.rfind(']')
+                if last_idx != -1 and last_idx >= first_idx:
+                    raw = raw[first_idx:last_idx+1]
 
         # Robust JSON parsing — handle all malformed cases from the AI
         try:
@@ -1438,16 +1556,25 @@ User instruction: {body.instruction.strip()}"""
                 {"role": "user", "content": user_message},
             ],
             temperature=0.1,  # Low temperature for deterministic planning
+            response_format={"type": "json_object"}
         )
         raw = response.choices[0].message.content.strip()
         print(f"[plan-edit] raw response: {raw}")
 
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
+        # Strip markdown code fences or extract JSON block if there's text around it
+        import re as _re_json
+        json_match = _re_json.search(r'```(?:json)?\s*(.*?)\s*```', raw, _re_json.DOTALL)
+        if json_match:
+            raw = json_match.group(1).strip()
+        else:
+            start_obj = raw.find('{')
+            start_arr = raw.find('[')
+            first_idx = min(start_obj, start_arr) if start_obj != -1 and start_arr != -1 else max(start_obj, start_arr)
+            
+            if first_idx != -1:
+                last_idx = raw.rfind('}') if raw[first_idx] == '{' else raw.rfind(']')
+                if last_idx != -1 and last_idx >= first_idx:
+                    raw = raw[first_idx:last_idx+1]
 
         result = _json.loads(raw)
 
@@ -3485,14 +3612,6 @@ async def proxy_video(url: str, request: Request):
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to proxy video: {str(e)}")
-
-
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-    tail=f"Failed to proxy video: {str(e)}"
 
 
 
