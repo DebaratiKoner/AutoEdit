@@ -89,7 +89,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [showTranscript, setShowTranscript] = useState(true);
   const [isAiEditing, setIsAiEditing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [globalVolume, setGlobalVolume] = useState(1); // Global audio volume control (0-1) - only affects audio tracks
+  const [globalVolume] = useState(1); // Global audio volume control (0-1) - only affects audio tracks
+
   const [videoVolume, setVideoVolume] = useState(1); // Video playback volume (0-1)
   const [aiPrompt, setAiPrompt] = useState('');
   const [chatHistory, setChatHistory] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
@@ -546,9 +547,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
 
     setIsAiEditing(true);
-    // Append an instruction to prevent OpenAI from returning ```json markdown blocks
-    // which commonly causes the "line 1 column 1 (char 0" JSON parsing error on the backend.
-    const promptToSend = `${userInput}\n\nIMPORTANT: Return ONLY raw JSON. Do NOT wrap your response in \`\`\`json or any other markdown blocks, and do not include any conversational text.`;
+    const promptToSend = userInput;
 
     try {
       const response = await fetch(`/api/videos/${sessionId}/edit-with-ai`, {
@@ -600,11 +599,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       
       // Map backend clips back to TimelineSegment format
       const track0 = (data.clips || []).map((clip: any, i: number) => {
-        const origSeg = session.timeline.find(s => s.id === clip.id);
+        // Try to find the original segment by exact ID, or if the AI appended a suffix for a split
+        const origSeg = session.timeline.find(s => 
+          s.id === clip.id || 
+          clip.originalId === s.id || 
+          (typeof clip.id === 'string' && clip.id.startsWith(s.id + '-')) ||
+          (typeof clip.id === 'string' && clip.id.startsWith(s.id + '_'))
+        );
         const assetUrl = clip.assetUrl ?? origSeg?.assetUrl;
         const assetKind = clip.assetKind ?? origSeg?.assetKind;
-        const srcStart = clip.sourceStart ?? (origSeg?.sourceStart ?? 0);
-        const srcEnd = clip.sourceEnd ?? (origSeg?.sourceEnd ?? 0);
+        const srcStart = clip.sourceStart ?? clip.start ?? (origSeg?.sourceStart ?? 0);
+        const srcEnd = clip.sourceEnd ?? clip.end ?? (origSeg?.sourceEnd ?? 0);
         const mergedSegments = clip.segments ?? (origSeg as any)?.segments;
         const mergedDuration = Array.isArray(mergedSegments)
           ? mergedSegments.reduce((sum: number, segment: any) => (
@@ -622,7 +627,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           duration,
           order: i,
           track: 0,
-          color: assetUrl ? getAssetColor(assetKind || 'video') : getClipColor(i),
+          color: clip.color ?? (assetUrl ? getAssetColor(assetKind || 'video') : getClipColor(i)),
           name,
           assetUrl,
           assetKind,
@@ -842,14 +847,20 @@ function getShortName(name: string | undefined | null, fallback: string) {
           try { au.currentTime = Math.max(0, offsetInClip); } catch(e) {}
         }
       }
-      if (isPlaying && au.paused) {
-        au.play().catch(() => {});
-      } else if (!isPlaying && !au.paused) {
-        au.pause();
+      // Ensure audio is audible whenever the editor is playing.
+      if (isPlaying) {
+        if (au.paused) {
+          au.play().catch(() => {});
+        }
+      } else {
+        // Only pause when editor is explicitly paused.
+        if (!au.paused) au.pause();
       }
+      
     } else {
-      if (au && !au.paused) au.pause();
-      if (audioSrcRef.current && au) { au.src = ''; audioSrcRef.current = ''; }
+      // No active audio clip in this time window.
+      // Do NOT clear au.src while playing—this can cause audible dropouts/buffering.
+      if (!isPlaying && au && !au.paused) au.pause();
     }
 
     if (video) video.volume = Math.min(1, duckedVolume * videoVolume * activeVideoVol);
@@ -2103,38 +2114,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     void sessionManager.saveSession(sessionId, updatedSession);
   };
 
-  const handleWavelengthChange = (segmentId: string, wavelength: number) => {
-    if (!sessionRef.current) return;
-    const session = sessionRef.current;
-    const updatedTimeline = session.timeline.map(seg => {
-      if (seg.id !== segmentId) return seg;
-      const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0) || 1;
-      const maxDuration = (seg.originalDuration && seg.originalDuration > 0) 
-        ? seg.originalDuration 
-        : (seg.assetKind === 'audio' ? (seg.duration || 1) : track0Dur);
-      const safeDuration = Math.max(0.5, Math.min(maxDuration, wavelength));
-      const sourceStart = seg.sourceStart ?? 0;
-      const sourceEnd = sourceStart + safeDuration;
-      return {
-        ...seg,
-        duration: safeDuration,
-        sourceEnd,
-      };
-    });
-    const previousSnapshot = saveFullSessionSnapshot(session);
-    const updatedSession = {
-      ...session,
-      timeline: updatedTimeline,
-      undoStack: [...session.undoStack, {
-        type: 'FULL_SNAPSHOT' as const,
-        previousSnapshot,
-        actionType: 'RESIZE' as const
-      }],
-      redoStack: []
-    };
-    setSession(updatedSession);
-    void sessionManager.saveSession(sessionId, updatedSession);
-  };
+
 
   const handleFrequencyChange = (segmentId: string, frequency: number) => {
     if (!sessionRef.current) return;
@@ -2162,10 +2142,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     void sessionManager.saveSession(sessionId, updatedSession);
   };
 
-  const handleGlobalVolumeChange = (volume: number) => {
-    const safeVolume = Math.max(0, Math.min(1, volume));
-    setGlobalVolume(safeVolume);
-  };
+
 
   const handleVideoVolumeChange = (volume: number) => {
     const safeVolume = Math.max(0, Math.min(1, volume));
@@ -2376,7 +2353,15 @@ transition: 'opacity 0.02s linear',
               />
 
               {/* Hidden audio element for track-1 audio clips */}
-              <audio ref={audioRef} preload="auto" style={{ display: 'none' }} />
+              <audio
+                ref={audioRef}
+                preload="auto"
+                style={{ display: 'none' }}
+                // Ensure volume changes are not blocked by browser policies
+                muted={false}
+                playsInline
+
+              />
 
               </>
             )}
@@ -2441,8 +2426,8 @@ transition: 'opacity 0.02s linear',
           {(() => {
             const { totalDur } = getTimePxMapping(session.timeline || []);
             const pct = totalDur > 0 ? Math.min(100, (currentTime / totalDur) * 100) : 0;
-            const hasAudioClip = (session.timeline || []).some(s => s.track === 1 && s.assetKind === 'audio');
             return (
+
               <div style={{ background: '#111', borderTop: '1px solid #222', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '10px', flexShrink: 0 }}>
                 {/* Play/Pause */}
                 <button

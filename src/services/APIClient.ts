@@ -142,11 +142,9 @@ export class APIClient {
   }
 
   async transcribeVideo(
-    sessionId: string,
-    // NOTE: currently unused by this client; server transcribe endpoint is called without explicit clip data.
-    // Kept to avoid breaking callers.
-    clips?: Array<{ start: number; end: number; title?: string }>
+    sessionId: string
   ): Promise<TranscriptResponse> {
+
 
     type JobStatusResponse = {
       jobId: string;

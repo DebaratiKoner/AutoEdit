@@ -46,7 +46,9 @@ export interface AssetsTabProps {
 }
 
 const PER_PAGE = 8;
+const MIN_AUDIO_SECONDS = 120; // 2 minutes
 const TOPICS: Record<string, string[]> = {
+
   all:   ['nature', 'city', 'technology', 'travel', 'food', 'sports', 'music', 'animals'],
   video: ['nature', 'city', 'technology', 'travel', 'food', 'sports', 'music', 'animals'],
   photo: ['nature', 'architecture', 'people', 'travel', 'food', 'fashion', 'abstract', 'flowers'],
@@ -123,7 +125,13 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
       const [v, ph, au] = await Promise.all([fetchVideos(q, 1), fetchPhotos(q, 1), fetchAudio(q, 1)]);
       setVideoSec({ items: v.items, page: 1, total: v.total, loading: false });
       setPhotoSec({ items: ph.items, page: 1, total: ph.total, loading: false });
-      setAudioSec({ items: au.items, page: 1, total: au.total, loading: false });
+      // Front-load only long audio (>= 2 minutes). Load More will append everything.
+      const longAudio = au.items.filter(a => {
+        const dur = (a as FreesoundAudio).duration;
+        return typeof dur === 'number' && dur >= MIN_AUDIO_SECONDS;
+      });
+      setAudioSec({ items: longAudio, page: 1, total: au.total, loading: false });
+
     } catch (e) {
       setAllError(e instanceof Error ? e.message : 'Failed to fetch');
       setVideoSec(s => ({ ...s, loading: false }));

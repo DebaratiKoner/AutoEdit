@@ -964,11 +964,16 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "- Source = timestamps in the ORIGINAL video file\n"
         "- split_time MUST be a Source timestamp (absolute seconds from original video start)\n"
         "- Timeline = position in the edited video (use for cut_time)\n\n"
-        "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n\n"
+        "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n"
+        "IMPORTANT: If renaming parts of a split clip, ALWAYS append the part number to the title (e.g., 'Intro (Part 1)', 'Main Content (Part 2)').\n\n"
         "SPLIT — CRITICAL EXAMPLES:\n"
         "Clip 1: Source 0-60s\n"
         "  'split at 10s' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
         "  'first 10s and rest' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
+        "  'split first 20s as first half and rest as second half' → [\n"
+        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
+        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"First Half (Part 1)\"},{\"index\":2,\"title\":\"Second Half (Part 2)\"}]}\n"
+        "  ]\n"
         "  'split into 3 equal parts' → [\n"
         "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
         "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":40}\n"
@@ -984,6 +989,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "  'delete first 10s of clip 1' → {\"type\":\"cut_time\",\"start\":clip1_tl_start,\"end\":clip1_tl_start+10}\n"
         "  'delete last 20s of clip 2' → {\"type\":\"cut_time\",\"start\":clip2_tl_end-20,\"end\":clip2_tl_end}\n\n"
         "DELETE CLIP: {\"type\":\"delete\",\"clip_index\":N}\n"
+        "DUPLICATE CLIP: {\"type\":\"duplicate\",\"clip_index\":N}\n"
         "RENAME CLIP: {\"type\":\"rename\",\"clip_index\":N,\"title\":\"New Name\"}\n"
         "RENAME MULTIPLE (after split): {\"type\":\"name_clips\",\"clips\":[{\"index\":N,\"title\":\"Name\"}]}\n"
         "MERGE (combine multiple clips): {\"type\":\"merge\",\"clip_indexes\":[N,M]}\n"
@@ -1062,13 +1068,14 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         import re as _re3
         enhanced_prompt = body.prompt.strip()
 
-        # Pattern: "split clip N at Xs" or "split clip N into first Xs and rest"
+        # Pattern: "split clip N at Xs", "split clip N into first Xs", "split first Xs"
         split_at_match = _re3.search(
-            r'(?:split|divide|cut)\s+(?:clip|part|video)?\s*(\d+)\s+(?:at|into\s+first)\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?',
+            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s*(?:at|into\s+first|first)\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?',
             enhanced_prompt, _re3.IGNORECASE
         )
         if split_at_match:
-            clip_num = int(split_at_match.group(1))
+            clip_num_str = split_at_match.group(1)
+            clip_num = int(clip_num_str) if clip_num_str else 1
             offset_s = float(split_at_match.group(2))
             if clip_num <= len(clips_with_ids):
                 target = clips_with_ids[clip_num - 1]
@@ -1078,11 +1085,12 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
         # Pattern: "split clip N into M parts/equal parts"
         split_parts_match = _re3.search(
-            r'(?:split|divide|cut)\s+(?:clip|part|video)?\s*(\d+)\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
+            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
             enhanced_prompt, _re3.IGNORECASE
         )
         if split_parts_match and not split_at_match:
-            clip_num = int(split_parts_match.group(1))
+            clip_num_str = split_parts_match.group(1)
+            clip_num = int(clip_num_str) if clip_num_str else 1
             n_parts  = int(split_parts_match.group(2))
             if clip_num <= len(clips_with_ids) and n_parts >= 2:
                 target = clips_with_ids[clip_num - 1]
@@ -1147,7 +1155,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             raise ValueError("'actions' field is not a list")
 
         # Validate each action matches the supported types (added "delete")
-        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep"}
+        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep", "duplicate"}
         for action in result["actions"]:
             if action.get("type") not in valid_types:
                 raise ValueError(f"Invalid action type: {action.get('type')!r}")
@@ -2015,6 +2023,18 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
             else:
                 warnings.append(f"swap: expected 2 clip indexes, got {len(indexes)}, skipped")
         
+        elif action_type == "duplicate":
+            # Duplicate operation
+            idx = action.get("clip_index")
+            if idx in index_to_id:
+                operations.append({
+                    "type": "duplicate",
+                    "clipId": index_to_id[idx],
+                    "params": {}
+                })
+            else:
+                warnings.append(f"duplicate: clip index {idx} out of range, skipped")
+        
         elif action_type == "keep":
             # Keep operation (delete all others)
             indexes = action.get("clip_indexes", [])
@@ -2469,6 +2489,27 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
             else:
                 print(f"[swap] WARNING: Expected 2 clip IDs, got {len(swap_ids)}")
                 warnings.append(f"swap: expected 2 clip IDs, got {len(swap_ids)}, skipped")
+        
+        elif op_type == "duplicate":
+            # Duplicate clip by ID
+            clip_to_duplicate = None
+            insert_index = -1
+            
+            for i, clip in enumerate(current_clips):
+                if clip.get("id") == clip_id:
+                    clip_to_duplicate = clip
+                    insert_index = i
+                    break
+            
+            if clip_to_duplicate:
+                import uuid
+                duplicated_clip = dict(clip_to_duplicate)
+                duplicated_clip["id"] = f"{clip_to_duplicate.get('id', 'clip')}-copy-{str(uuid.uuid4())[:4]}"
+                current_clips.insert(insert_index + 1, duplicated_clip)
+                print(f"[duplicate] Duplicated clip {clip_id}")
+            else:
+                print(f"[duplicate] WARNING: Clip {clip_id} not found in current clips")
+                warnings.append(f"duplicate: clip {clip_id} not found, skipped")
         
         elif op_type == "keep":
             # Keep only specified clips
@@ -3221,7 +3262,33 @@ async def _export_video_ffmpeg_fallback(session_id: str, composition: dict):
     
     # Use existing FFmpeg export logic
     export_request = ExportRequest(clips=clips)
-    return await export_video(session_id, export_request)
+    result = await export_video(session_id, export_request)
+
+    # Post-process: make exported audio very loud for the whole duration.
+    # Aggressive but capped using ffmpeg's volume filter.
+    loud_gain = 2.5
+    try:
+        if hasattr(result, "path") and result.path:
+            in_path = Path(result.path)
+            if in_path.exists():
+                tmp_path = in_path.with_suffix(".loud.tmp.mp4")
+                subprocess.run([
+                    "ffmpeg",
+                    "-y",
+                    "-i", str(in_path),
+                    "-af", f"volume={loud_gain}",
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    str(tmp_path)
+                ], check=True, capture_output=True, text=True)
+                tmp_path.replace(in_path)
+    except Exception as e:
+        print(f"[ffmpeg-fallback] loudness post-process failed (non-fatal): {e}")
+
+    return result
+
 
 
 @app.post("/api/videos/{session_id}/export")
@@ -3418,6 +3485,14 @@ async def proxy_video(url: str, request: Request):
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to proxy video: {str(e)}")
+
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    tail=f"Failed to proxy video: {str(e)}"
 
 
 
