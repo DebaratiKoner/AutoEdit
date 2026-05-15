@@ -183,8 +183,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     let t0Dur = 0;
     let t0Px = 0;
     for (const s of track0Segments) {
-      t0Dur += s.duration || 0;
-      t0Px += Math.max(TIMELINE_MIN_CLIP_PX, (s.duration || 0) * TIMELINE_MIN_PX_PER_SEC);
+      t0Dur += Number(s.duration) || 0;
+      t0Px += Math.max(TIMELINE_MIN_CLIP_PX, (Number(s.duration) || 0) * TIMELINE_MIN_PX_PER_SEC);
     }
     const pxPerSec = t0Dur > 0 ? t0Px / t0Dur : TIMELINE_MIN_PX_PER_SEC;
     
@@ -192,7 +192,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       let currentPx = 0;
       let currentTime = 0;
       for (const s of track0Segments) {
-        const segDur = s.duration || 0;
+        const segDur = Number(s.duration) || 0;
         const segPx = Math.max(TIMELINE_MIN_CLIP_PX, segDur * TIMELINE_MIN_PX_PER_SEC);
         if (time <= currentTime + segDur) {
           const pct = segDur > 0 ? (time - currentTime) / segDur : 0;
@@ -209,7 +209,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       let currentPx = 0;
       let currentTime = 0;
       for (const s of track0Segments) {
-        const segDur = s.duration || 0;
+        const segDur = Number(s.duration) || 0;
         const segPx = Math.max(TIMELINE_MIN_CLIP_PX, segDur * TIMELINE_MIN_PX_PER_SEC);
         if (px <= currentPx + segPx) {
           const pct = segPx > 0 ? (px - currentPx) / segPx : 0;
@@ -222,7 +222,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return currentTime;
     };
 
-    const maxEndTime = allSegments.reduce((max, s) => Math.max(max, (s.timelineStart ?? 0) + (s.duration || 0)), t0Dur);
+    const maxEndTime = allSegments.reduce((max, s) => Math.max(max, Number(s.timelineStart ?? 0) + Number(s.duration || 0)), t0Dur);
     const totalDur = Math.max(maxEndTime, 0.1);
     const totalPx = Math.max(timeToPx(totalDur), TIMELINE_MIN_WIDTH_PX);
 
@@ -303,7 +303,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
       if (isAudio) {
         const track0Segs = session.timeline.filter(s => s.track === 0);
-        const totalDur = track0Segs.reduce((sum, s) => sum + s.duration, 0);
+        const totalDur = track0Segs.reduce((sum, s) => sum + Number(s.duration), 0);
         const insertAt = Math.min(currentTime, totalDur);
 
         const newSeg: TimelineSegment = {
@@ -369,14 +369,15 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         for (let i = 0; i < track0Segs.length; i++) {
           const seg = track0Segs[i];
           const start = seg.timelineStart ?? 0;
-          const end = start + seg.duration;
+          const end = start + Number(seg.duration);
           
           if (currentTime > start + 0.05 && currentTime < end - 0.05) {
             const cutOffset = currentTime - start;
             const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
             
-            const segment1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
-            const segment2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: seg.duration - cutOffset };
+            const { segments: _segments, ...segBase } = seg;
+            const segment1: TimelineSegment = { ...segBase, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
+            const segment2: TimelineSegment = { ...segBase, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: Number(seg.duration) - cutOffset };
             
             newTrack0 = [
               ...track0Segs.slice(0, i),
@@ -416,7 +417,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         name: preserveClipName(s),
         color: getClipColor(i)
       }; 
-      t += s.duration; 
+      t += Number(s.duration); 
       return r; 
     });
       const others = session.timeline.filter(s => s.track !== 0);
@@ -579,14 +580,20 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             .map((s, i) => {
               // Extract transcript text for this specific segment based on timeline overlap
               let text = '';
+              let detailedTranscript = '';
               if (session.transcriptSegments) {
                 const segStart = s.timelineStart ?? 0;
                 const segEnd = segStart + s.duration;
-                text = session.transcriptSegments
-                  .filter(ts => ts.start < segEnd && ts.end > segStart)
-                  .map(ts => ts.text)
-                  .join(' ')
-                  .trim();
+                const overlappingSegs = session.transcriptSegments
+                  .filter(ts => ts.start < segEnd && ts.end > segStart);
+                text = overlappingSegs.map(ts => ts.text).join(' ').trim();
+                
+                // Build a detailed transcript with exact source timestamps for the AI to pick split_time from
+                detailedTranscript = overlappingSegs.map(ts => {
+                  const offset = Math.max(0, ts.start - segStart);
+                  const sourceTs = (s.sourceStart ?? 0) + offset;
+                  return `[${sourceTs.toFixed(1)}s] ${ts.text.trim()}`;
+                }).join(' ');
               }
               return {
                 id: s.id,
@@ -597,6 +604,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 duration: s.duration,
                 title: s.name || `Clip ${i + 1}`,
                 text,
+                detailedTranscript,
                 order: s.order,
                 track: s.track,
                 color: s.color,
@@ -656,7 +664,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       let t = 0;
       const adjustedTrack0 = track0.map((seg: any) => {
         const s = { ...seg, timelineStart: t };
-        t += seg.duration;
+        t += Number(seg.duration);
         return s;
       });
       const otherTracks = session.timeline.filter(s => s.track !== 0);
@@ -706,8 +714,11 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
  * Returns seg.name if set (never overwrite with "Clip N").
  */
 function preserveClipName(seg: TimelineSegment): string {
-  return seg.name ?? `Clip`;
+  // Never force-generate generic names here; if AI/backend produced a title it should win.
+  // We only fall back to a short placeholder if absolutely missing.
+  return (typeof seg.name === 'string' && seg.name.trim().length > 0) ? seg.name : 'Clip';
 }
+
 
 
 function getShortName(name: string | undefined | null, fallback: string) {
@@ -885,21 +896,50 @@ function getShortName(name: string | undefined | null, fallback: string) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentTime, isPlaying, session?.timeline, globalVolume, videoVolume]);
 
-  // Pre-load the next asset video clip so transitions are instant
-  useEffect(() => {
-    if (!session || !assetVideoRef.current) return;
+  const preloadNextMedia = useCallback((currentIndex: number) => {
+    if (!sessionRef.current) return;
+    const sorted = [...(sessionRef.current.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
+    const currentClip = sorted[currentIndex];
+    if (!currentClip) return;
+
+    const video = videoRef.current;
     const av = assetVideoRef.current;
-    const sorted = [...(session.timeline || [])].filter(s => s.track === 0).sort((a, b) => a.order - b.order);
-    // Find the next asset video clip after the current position
-    const nextAsset = sorted.find((s, i) => i >= currentClipIndexRef.current && s.assetKind === 'video' && s.assetUrl);
-    if (nextAsset?.assetUrl && assetSrcRef.current !== nextAsset.assetUrl && assetVideoOpacity === 0) {
-      // Pre-load silently in background
-      av.src = nextAsset.assetUrl;
-      assetSrcRef.current = nextAsset.assetUrl;
-      av.load();
+
+    // 1. Pre-seek main video if we are currently showing an asset
+    if (currentClip.assetUrl && video) {
+       const nextOriginal = sorted.find((s, i) => i > currentIndex && !s.assetUrl);
+       if (nextOriginal) {
+          setTimeout(() => {
+              if (videoRef.current && videoRef.current.paused) {
+                  try {
+                      const target = nextOriginal.sourceStart ?? 0;
+                      if (Math.abs(videoRef.current.currentTime - target) > 0.2) {
+                          videoRef.current.currentTime = target;
+                      }
+                  } catch(e) {}
+              }
+          }, 100);
+       }
     }
+
+    // 2. Pre-load next asset video if we are currently showing Original or Photo
+    if (currentClip.assetKind !== 'video' && av) {
+       const nextAssetVid = sorted.find((s, i) => i > currentIndex && s.assetKind === 'video' && s.assetUrl);
+       if (nextAssetVid && nextAssetVid.assetUrl) {
+           if (assetSrcRef.current !== nextAssetVid.assetUrl) {
+               av.src = nextAssetVid.assetUrl;
+               assetSrcRef.current = nextAssetVid.assetUrl;
+               av.load();
+           }
+       }
+    }
+  }, []);
+
+  // Pre-load the next media after timeline edits
+  useEffect(() => {
+    preloadNextMedia(currentClipIndexRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.timeline]);
+  }, [session?.timeline, preloadNextMedia]);
 
   // Pre-load all photo assets to ensure smooth transitions
   useEffect(() => {
@@ -995,6 +1035,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
       // PHOTO
       if (clip.assetKind === 'photo' && clip.assetUrl) {
+        if (video) video.muted = true;
         const photoUrl = getAssetPreviewUrl(clip.assetUrl, clip.assetKind);
         if (assetPhotoRef.current && assetPhotoRef.current.src !== photoUrl) {
           assetPhotoRef.current.src = photoUrl;
@@ -1007,6 +1048,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
         photoStartTimeRef.current = performance.now();
         isSwitchingRef.current = false;
         isJumpingRef.current = false;
+        
+        preloadNextMedia(currentClipIndexRef.current);
+        
         if (shouldPlay) {
           setIsPlaying(true);
           isPlayingRef.current = true;
@@ -1020,6 +1064,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
       // ASSET VIDEO
       if (clip.assetUrl && clip.assetKind === 'video' && av) {
+        if (video) video.muted = true;
         setPhotoOpacity(0);
         setActiveAssetClip(clip);
         if (assetSrcRef.current !== clip.assetUrl) {
@@ -1032,6 +1077,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
         setAssetVideoOpacity(1);
         isSwitchingRef.current = false;
         isJumpingRef.current = false;
+        
+        preloadNextMedia(currentClipIndexRef.current);
+        
         if (shouldPlay) {
           av.play().catch(() => {});
           setIsPlaying(true);
@@ -1045,12 +1093,16 @@ function getShortName(name: string | undefined | null, fallback: string) {
       setActiveAssetClip(null);
       setAssetVideoOpacity(0);
       if (av && !av.paused) av.pause();
+      if (video) video.muted = false;
 
       const targetTime = (clip.sourceStart ?? 0) + offset;
       try { if (video) video.currentTime = targetTime; } catch(e) {}
 
       isSwitchingRef.current = false;
       isJumpingRef.current = false;
+      
+      preloadNextMedia(currentClipIndexRef.current);
+      
       if (shouldPlay && video) {
         video.play().catch(() => {});
         setIsPlaying(true);
@@ -1059,6 +1111,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
     };
 
     const advanceToNextClip = (shouldPlay = false) => {
+      if (isSwitchingRef.current || isJumpingRef.current) return;
+      
       const next = currentClipIndexRef.current + 1;
       if (next < sortedClips.length) {
         currentClipIndexRef.current = next;
@@ -1098,7 +1152,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         if (isPlayingRef.current) {
           const wallElapsed = (performance.now() - photoStartTimeRef.current) / 1000;
           const elapsed = photoElapsedRef.current + wallElapsed;
-          const photoTime = Math.min(elapsed, clip.duration);
+          const photoTime = Math.min(elapsed, Number(clip.duration));
           setCurrentTime((clip.timelineStart ?? 0) + photoTime);
         }
         rafId = requestAnimationFrame(rafLoop);
@@ -1109,7 +1163,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         // Always update currentTime from asset video position (even if briefly paused during buffering)
         const t = av.currentTime;
         setCurrentTime((clip.timelineStart ?? 0) + t);
-        if (!av.paused && t >= clip.duration - EPS) advanceToNextClip(isPlayingRef.current);
+        if (!av.paused && t >= Number(clip.duration) - EPS) advanceToNextClip(isPlayingRef.current);
         // Always keep rAF running for asset video
         rafId = requestAnimationFrame(rafLoop);
         return;
@@ -1118,7 +1172,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       if (video && !video.paused) {
         const sourceOffset = video.currentTime - (clip.sourceStart ?? 0);
         setCurrentTime((clip.timelineStart ?? 0) + Math.max(0, sourceOffset));
-        const clipEnd = (clip.sourceStart ?? 0) + clip.duration;
+        const clipEnd = (clip.sourceStart ?? 0) + Number(clip.duration);
         if (video.currentTime >= clipEnd - EPS) advanceToNextClip(isPlayingRef.current);
       }
       // Always keep rAF running so red line stays in sync
@@ -1209,11 +1263,13 @@ function getShortName(name: string | undefined | null, fallback: string) {
       // Don't stop rAF on asset pause — it may be a brief buffer pause
     };
 
+    const handleAssetEnded = () => advanceToNextClip(isPlayingRef.current);
+
     video?.addEventListener('play', handleUnifiedPlay);
     video?.addEventListener('pause', handleUnifiedPause);
     av?.addEventListener('play', handleAssetPlay);
     av?.addEventListener('pause', handleAssetPause);
-    av?.addEventListener('ended', () => advanceToNextClip(isPlayingRef.current));
+    av?.addEventListener('ended', handleAssetEnded);
 
     // Always start rAF loop — it self-throttles when paused
     rafRunning = true;
@@ -1227,7 +1283,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       video?.removeEventListener('pause', handleUnifiedPause);
       av?.removeEventListener('play', handleAssetPlay);
       av?.removeEventListener('pause', handleAssetPause);
-      av?.removeEventListener('ended', () => advanceToNextClip(isPlayingRef.current));
+      av?.removeEventListener('ended', handleAssetEnded);
     };
   }, [session?.timeline]);
 
@@ -1437,14 +1493,14 @@ function getShortName(name: string | undefined | null, fallback: string) {
       .sort((a, b) => a.order - b.order);
     if (sorted.length === 0) return;
 
-    const clampedTime = Math.max(0, Math.min(timelineTime, sorted.reduce((sum, seg) => sum + seg.duration, 0)));
+    const clampedTime = Math.max(0, Math.min(timelineTime, sorted.reduce((sum, seg) => sum + Number(seg.duration), 0)));
     // Prefer the clip that STARTS at or after clampedTime over one that ends exactly at clampedTime
     const segmentIndex = sorted.findIndex(
-      seg => clampedTime >= (seg.timelineStart ?? 0) && clampedTime < (seg.timelineStart ?? 0) + seg.duration
+      seg => clampedTime >= (seg.timelineStart ?? 0) && clampedTime < (seg.timelineStart ?? 0) + Number(seg.duration)
     );
     const targetIndex = segmentIndex >= 0 ? segmentIndex : sorted.length - 1;
     const segment = sorted[targetIndex];
-    const offset = Math.max(0, Math.min(segment.duration, clampedTime - (segment.timelineStart ?? 0)));
+    const offset = Math.max(0, Math.min(Number(segment.duration), clampedTime - (segment.timelineStart ?? 0)));
 
     currentClipIndexRef.current = targetIndex;
     setCurrentTime((segment.timelineStart ?? 0) + offset);
@@ -1473,6 +1529,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
       setActiveAssetClip(segment);
       photoElapsedRef.current = offset;
       isJumpingRef.current = false;
+      
+      preloadNextMedia(targetIndex);
+      
       if (wasPlaying) {
         setIsPlaying(true);
         isPlayingRef.current = true;
@@ -1491,7 +1550,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         systemActionRef.current = true;
       }
       video.pause();
-      video.muted = false; // Unmute when showing video
+      video.muted = true; // Mute original video when showing asset video
       setPhotoOpacity(0);
       setActiveAssetClip(segment);
       if (assetSrcRef.current !== segment.assetUrl) {
@@ -1502,6 +1561,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
       try { av.currentTime = offset; } catch(e) {}
       setAssetVideoOpacity(1);
       isJumpingRef.current = false;
+      
+      preloadNextMedia(targetIndex);
+      
       if (wasPlaying) { av.play().catch(() => {}); setIsPlaying(true); isPlayingRef.current = true; }
       return;
     }
@@ -1516,6 +1578,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
     const targetTime = (segment.sourceStart ?? 0) + offset;
     try { video.currentTime = targetTime; } catch(e) { /* ignore */ }
     isJumpingRef.current = false;
+    
+    preloadNextMedia(targetIndex);
 
     if (wasPlaying) {
       try { video.play().catch(() => {}); setIsPlaying(true); } catch {}
@@ -1613,7 +1677,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       } else if (e.code === 'ArrowRight' || e.code === 'KeyL') {
         e.preventDefault();
         const step = e.code === 'KeyL' ? 10 : 5;
-        const totalDur = (sessionRef.current?.timeline || []).filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0);
+        const totalDur = (sessionRef.current?.timeline || []).filter(s => s.track === 0).reduce((sum, s) => sum + Number(s.duration), 0);
         void jumpToTimelineTime(Math.min(totalDur, currentTime + step));
       }
     };
@@ -1631,14 +1695,14 @@ function getShortName(name: string | undefined | null, fallback: string) {
     
     const segmentToCut = session.timeline
       .filter(seg => seg.track === 0)
-      .find(seg => currentTime >= (seg.timelineStart ?? 0) && currentTime < (seg.timelineStart ?? 0) + seg.duration);
+      .find(seg => currentTime >= (seg.timelineStart ?? 0) && currentTime < (seg.timelineStart ?? 0) + Number(seg.duration));
 
     if (!segmentToCut) return;
 
     const cutOffset = currentTime - (segmentToCut.timelineStart ?? 0);
     const sourceCutTime = (segmentToCut.sourceStart ?? 0) + cutOffset;
 
-    if (cutOffset <= 0.1 || cutOffset >= segmentToCut.duration - 0.1) {
+    if (cutOffset <= 0.1 || cutOffset >= Number(segmentToCut.duration) - 0.1) {
       alert('Playhead must be inside segment (not at edges)');
       return;
     }
@@ -1648,9 +1712,10 @@ function getShortName(name: string | undefined | null, fallback: string) {
     const segment1Name = `${baseName}-1`;
     const segment2Name = `${baseName}-2`;
 
+    const { segments: _segments, ...segmentBase } = segmentToCut;
     
     const segment1: TimelineSegment = {
-      ...segmentToCut,
+      ...segmentBase,
       id: `${segmentToCut.id}-1`,
       sourceEnd: sourceCutTime,
       duration: cutOffset,
@@ -1658,11 +1723,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
     };
     
     const segment2: TimelineSegment = {
-      ...segmentToCut,
+      ...segmentBase,
       id: `${segmentToCut.id}-2`,
       sourceStart: sourceCutTime,
       timelineStart: (segmentToCut.timelineStart ?? 0) + cutOffset,
-      duration: segmentToCut.duration - cutOffset,
+      duration: Number(segmentToCut.duration) - cutOffset,
       name: segment2Name,
     };
 
@@ -1682,7 +1747,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     let t = 0;
     const adjusted = newTrack0.map((seg, i) => {
       const adj = { ...seg, order: i, timelineStart: t, color: getClipColor(i) };
-      t += seg.duration;
+      t += Number(seg.duration);
       return adj;
     });
 
@@ -1745,7 +1810,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         name: preserveClipName(seg),
         color: seg.track === 0 ? getClipColor(index) : seg.color
       };
-      cumulativeTime += seg.duration;
+      cumulativeTime += Number(seg.duration);
       return adjusted;
     });
     
@@ -1938,7 +2003,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         name: preserveClipName(seg),
         color: getClipColor(idx)
       };
-      t += seg.duration;
+      t += Number(seg.duration);
       return s;
     });
 
@@ -2051,8 +2116,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
     
     if (draggedSegment.track >= 1) {
       // Audio segment: absolute positioning with bounds validation
-      const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + s.duration, 0);
-      const newStart = Math.max(0, Math.min(track0Dur - draggedSegment.duration + 0.1, dragOverPosition - dragOffset));
+      const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + Number(s.duration), 0);
+      const newStart = Math.max(0, Math.min(track0Dur - Number(draggedSegment.duration) + 0.1, dragOverPosition - dragOffset));
       const updatedTimeline = session.timeline.map(seg => {
         if (seg.id === draggedSegmentId) {
           return { ...seg, timelineStart: newStart };
@@ -2087,7 +2152,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     
     let newOrder = 0;
     for (let i = 0; i < track0Segments.length; i++) {
-      if (dragOverPosition < (track0Segments[i].timelineStart ?? 0) + (track0Segments[i].duration / 2)) {
+      if (dragOverPosition < (track0Segments[i].timelineStart ?? 0) + (Number(track0Segments[i].duration) / 2)) {
         newOrder = i;
         break;
       }
@@ -2109,7 +2174,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         timelineStart: cumulativeTime,
         color: getClipColor(seg.order)
       };
-      cumulativeTime += seg.duration;
+      cumulativeTime += Number(seg.duration);
       return adjusted;
     });
 
@@ -2387,7 +2452,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   objectFit: 'contain',
                   zIndex: 4,
                   opacity: assetVideoOpacity,
-                  transition: 'opacity 0.15s ease-out',
                   pointerEvents: 'none',
                   backgroundColor: '#000',
                 }}
@@ -2410,7 +2474,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   zIndex: 2,
                   pointerEvents: 'none',
                   opacity: 0,
-                  transition: 'opacity 0.15s ease-out',
                   backgroundColor: 'transparent'
                 }}
               />
@@ -2450,7 +2513,6 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   backgroundColor: '#000',
                   opacity: photoOpacity,
                   pointerEvents: photoOpacity > 0 ? 'auto' : 'none',
-                  transition: 'opacity 0.15s ease-out',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
@@ -3046,7 +3108,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
                           let t = 0;
                           const adjusted = reordered.map((s, idx) => {
                             const r = { ...s, order: idx, timelineStart: t, color: getClipColor(idx) };
-                            t += s.duration;
+                          t += Number(s.duration);
                             return r;
                           });
                           const others = session.timeline.filter(s => s.track !== 0);
@@ -3177,7 +3239,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
               if (isAudio) {
                 // Audio is inserted at the playhead on the single audio track
                 const track0Segments = session.timeline.filter(s => s.track === 0);
-                const totalDur = track0Segments.reduce((sum, s) => sum + s.duration, 0);
+                const totalDur = track0Segments.reduce((sum, s) => sum + Number(s.duration), 0);
                 const insertAt = Math.min(currentTime, totalDur);
 
                 const newSegment: TimelineSegment = {
@@ -3249,12 +3311,13 @@ function getShortName(name: string | undefined | null, fallback: string) {
                 for (let i = 0; i < track0Segments.length; i++) {
                   const seg = track0Segments[i];
                   const start = seg.timelineStart ?? 0;
-                  const end = start + seg.duration;
+                  const end = start + Number(seg.duration);
                   if (currentTime > start + 0.05 && currentTime < end - 0.05) {
                     const cutOffset = currentTime - start;
                     const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
-                    const segment1: TimelineSegment = { ...seg, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
-                    const segment2: TimelineSegment = { ...seg, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: seg.duration - cutOffset };
+                    const { segments: _segments, ...segBase } = seg;
+                    const segment1: TimelineSegment = { ...segBase, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
+                    const segment2: TimelineSegment = { ...segBase, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: Number(seg.duration) - cutOffset };
                     newTrack0 = [...track0Segments.slice(0, i), segment1, newSegment, segment2, ...track0Segments.slice(i + 1)];
                     cutMade = true;
                     break;
@@ -3281,7 +3344,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
               let cumulativeTime = 0;
               const adjustedTrack0 = newTrack0.map((seg, idx) => {
                 const s = { ...seg, order: idx, timelineStart: cumulativeTime, color: getClipColor(idx) };
-                cumulativeTime += seg.duration;
+                cumulativeTime += Number(seg.duration);
                 return s;
               });
 
