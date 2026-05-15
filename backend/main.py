@@ -980,7 +980,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             f"Timeline:{seg.get('timelineStart', 0):.2f}s-{seg.get('timelineStart', 0) + seg.get('duration', 0):.2f}s | "
             f"Source:{seg.get('start', 0):.2f}s-{seg.get('end', 0):.2f}s | "
             f"Duration:{seg.get('duration', seg.get('end', 0) - seg.get('start', 0)):.2f}s | "
-            f"Transcript:{seg.get('text', '').strip()[:120]}"
+            f"Transcript:{seg.get('detailedTranscript', seg.get('text', '')).strip()}"
         )
         for i, seg in enumerate(clips_with_ids)
     )
@@ -1002,28 +1002,35 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     # Check if user explicitly asked for RENAMING (descriptive names from transcript)
     # "chapter" alone in a divide/split context means count, not rename
     is_rename_requested = any(word in body.prompt.lower() for word in [
-        'rename', 'give names', 'name the clips', 'chapter names', 'descriptive',
-        'name from transcript', 'name according', 'title the clips', 'label the clips'
+        'rename', 'give names', 'name the clips', 'chapter names', 'descriptive', 'name them',
+        'name from transcript', 'name according', 'title the clips', 'label the clips', 'name clips'
     ])
-    is_content_based_split = any(word in body.prompt.lower() for word in ['transcript', 'topic', 'content', 'subject', 'say'])
+    is_content_based_split = any(word in body.prompt.lower() for word in ['transcript', 'topic', 'content', 'subject', 'say', 'theme'])
 
     # Only apply chapter instruction for whole-video division, NOT for specific clip splits
     is_specific_clip_split = bool(_re.search(r'clip\s*\d+', body.prompt.lower()))
 
+    # NEW logic for dynamic splitting without a specific count
+    is_dynamic_split = not requested_chapters and any(phrase in body.prompt.lower() for phrase in [
+        'divide', 'split', 'create chapters', 'separate'
+    ]) and not is_specific_clip_split
+
     # Build chapter-specific instruction
     chapter_instruction = ""
-    if requested_chapters and splits_needed and not is_specific_clip_split:
+    if (requested_chapters and splits_needed and not is_specific_clip_split) or is_dynamic_split:
         total_duration = max((seg.get('end', 0) for seg in clips_with_ids), default=0)
         if total_duration > 0:
-            if is_rename_requested:
-                name_directive = "followed by a 'name_clips' action giving each part a descriptive title based on the transcript."
+            if is_rename_requested or is_content_based_split:
+                name_directive = "followed by a 'name_clips' action giving each part a short, descriptive title based on the transcript."
             else:
-                name_directive = f"followed by a 'name_clips' action naming each part 'Clip 1', 'Clip 2', ... 'Clip {requested_chapters}'."
+                name_directive = f"followed by a 'name_clips' action naming each part sequentially."
 
-            if is_content_based_split:
+            if is_content_based_split or is_dynamic_split:
+                count_text = f"EXACTLY {requested_chapters} parts" if requested_chapters else "logical parts"
+                split_text = f"EXACTLY {splits_needed} split action(s)" if requested_chapters else "the appropriate number of split actions"
                 chapter_instruction = (
-                    f"\n\nCRITICAL: User wants EXACTLY {requested_chapters} parts based on the transcript content. "
-                    f"You MUST output EXACTLY {splits_needed} split action(s). "
+                    f"\n\nCRITICAL: User wants {count_text} based on the transcript content. "
+                    f"You MUST output {split_text}. "
                     f"Video is {total_duration}s. "
                     f"Analyze the transcript to find logical topic transitions and use those timestamps for split_time. "
                     f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
@@ -1071,13 +1078,15 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "CLIP DATA: Each line shows Index. Title | Timeline:START-END | Source:START-END | Duration:Ds\n"
         "- Source = timestamps in the ORIGINAL video file\n"
         "- split_time MUST be a Source timestamp (absolute seconds from original video start)\n"
-        "- Timeline = position in the edited video (use for cut_time)\n\n"
+        "- Timeline = position in the edited video (use for cut_time)\n"
+        "- Transcript timestamps like [10.5s] indicate the Source time of that text.\n\n"
         "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n"
         "IMPORTANT: If renaming parts of a split clip, ALWAYS append the part number to the title (e.g., 'Intro (Part 1)', 'Main Content (Part 2)').\n\n"
         "SPLIT — CRITICAL EXAMPLES:\n"
         "Clip 1: Source 0-60s\n"
         "  'split at 10s' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
         "  'first 10s and rest' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
+        "  'split into 2 parts where 10 sec as first half' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
         "  'split first 20s as first half and rest as second half' → [\n"
         "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
         "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"First Half (Part 1)\"},{\"index\":2,\"title\":\"Second Half (Part 2)\"}]}\n"
@@ -1095,7 +1104,8 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "  'split clip 2 into first 20s and rest' → split_time = 30+20 = 50\n\n"
         "DELETE TIME RANGE (timeline seconds):\n"
         "  'delete first 10s of clip 1' → {\"type\":\"cut_time\",\"start\":clip1_tl_start,\"end\":clip1_tl_start+10}\n"
-        "  'delete last 20s of clip 2' → {\"type\":\"cut_time\",\"start\":clip2_tl_end-20,\"end\":clip2_tl_end}\n\n"
+        "  'delete last 20s of clip 2' → {\"type\":\"cut_time\",\"start\":clip2_tl_end-20,\"end\":clip2_tl_end}\n"
+        "  'delete 10 sec of last clip' → {\"type\":\"cut_time\",\"start\":last_clip_tl_end-10,\"end\":last_clip_tl_end}\n\n"
         "DELETE CLIP: {\"type\":\"delete\",\"clip_index\":N}\n"
         "DUPLICATE CLIP: {\"type\":\"duplicate\",\"clip_index\":N}\n"
         "RENAME CLIP: {\"type\":\"rename\",\"clip_index\":N,\"title\":\"New Name\"}\n"
@@ -1166,6 +1176,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         f"Instruction: {body.prompt.strip()}\n\n"
         f"State: {len(clips_with_ids)} clip(s). Total duration: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
         + (f"\nREMINDER: produce EXACTLY {requested_chapters} parts using {splits_needed} split action(s)." if requested_chapters else "")
+        + (f"\nREMINDER: divide the video based on logical transcript breaks." if is_dynamic_split else "")
     )
 
     try:
@@ -1176,20 +1187,63 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         import re as _re3
         enhanced_prompt = body.prompt.strip()
 
-        # Pattern: "split clip N at Xs", "split clip N into first Xs", "split first Xs"
+        # Pattern: "split clip N at Xs", "split first Xs as...", etc.
         split_at_match = _re3.search(
-            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s*(?:at|into\s+first|first)\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?',
+            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(?P<clip>\d+))?.*?(?:at|into\s+first|first|where|with)\s+(?:the\s+)?(?:first\s+half\s+(?:is|as)\s+)?(?P<time>\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?',
             enhanced_prompt, _re3.IGNORECASE
         )
+        if not split_at_match:
+            split_at_match = _re3.search(
+                r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(?P<clip>\d+))?.*?(?P<time>\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\s+(?:as\s+(?:the\s+)?first|for\s+(?:the\s+)?first)',
+                enhanced_prompt, _re3.IGNORECASE
+            )
+
         if split_at_match:
-            clip_num_str = split_at_match.group(1)
+            clip_num_str = split_at_match.group('clip')
             clip_num = int(clip_num_str) if clip_num_str else 1
-            offset_s = float(split_at_match.group(2))
+            offset_s = float(split_at_match.group('time'))
             if clip_num <= len(clips_with_ids):
                 target = clips_with_ids[clip_num - 1]
                 src_start = float(target.get('start', 0))
                 computed_split = round(src_start + offset_s, 2)
                 enhanced_prompt += f"\n[COMPUTED: split_time for clip {clip_num} at {offset_s}s from start = {computed_split}]"
+
+        # Pattern: "delete Xs of clip N", "delete Xs of last clip", or "delete first/last Xs"
+        delete_match = _re3.search(
+            r'(?:delete|remove|cut)\s+(?:the\s+)?(?P<mod1>first|last)?\s*(?P<time>\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\s*(?:(?:of|from)\s+(?:the\s+)?(?:(?P<mod2>last|first)\s+clip|clip\s+(?P<clip>\d+)))?',
+            enhanced_prompt, _re3.IGNORECASE
+        )
+        if delete_match:
+            time_val = float(delete_match.group('time'))
+            mod1 = delete_match.group('mod1')
+            mod2 = delete_match.group('mod2')
+            clip_num_str = delete_match.group('clip')
+            
+            if clip_num_str:
+                target_idx = int(clip_num_str) - 1
+            elif mod2 == 'last' or mod1 == 'last': 
+                target_idx = -1
+            else:
+                target_idx = 0
+                
+            if clips_with_ids and (0 <= target_idx < len(clips_with_ids) or target_idx == -1):
+                target = clips_with_ids[target_idx]
+                tl_start = float(target.get('timelineStart', 0))
+                tl_end = tl_start + float(target.get('duration', 0))
+                
+                # Default "delete Xs" is treated as deleting from the start unless "last" is specified
+                if mod1 == 'last' or mod2 == 'last':
+                    c_start = max(tl_start, tl_end - time_val)
+                    c_end = tl_end
+                else:
+                    c_start = tl_start
+                    c_end = min(tl_end, tl_start + time_val)
+                
+                c_start = round(c_start, 2)
+                c_end = round(c_end, 2)
+                
+                clip_label = f"clip {target_idx+1}" if target_idx != -1 else "last clip"
+                enhanced_prompt += f"\n[COMPUTED: delete {time_val}s of {clip_label} = cut_time start: {c_start}, end: {c_end}]"
 
         # Pattern: "split clip N into M parts/equal parts"
         split_parts_match = _re3.search(
@@ -1212,6 +1266,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             f"Instruction: {enhanced_prompt}\n\n"
             f"State: {len(clips_with_ids)} clip(s). Total: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
             + (f"\nREMINDER: produce EXACTLY {requested_chapters} parts using {splits_needed} split action(s)." if requested_chapters else "")
+            + (f"\nREMINDER: divide the video based on logical transcript breaks." if is_dynamic_split else "")
         )
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1332,6 +1387,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                             if seg_idx < len(all_source_segs):
                                 seg_pos = all_source_segs[seg_idx]["sourceStart"]
                     if chapter_segs:
+                        dur = sum(float(s["sourceEnd"]) - float(s["sourceStart"]) for s in chapter_segs)
                         new_clips.append({
                             "id": f"chapter-{chapter_i + 1}",
                             "title": f"Clip {chapter_i + 1}",
@@ -1340,6 +1396,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                             "end":   chapter_segs[-1]["sourceEnd"],
                             "sourceStart": chapter_segs[0]["sourceStart"],
                             "sourceEnd":   chapter_segs[-1]["sourceEnd"],
+                            "duration": dur
                         })
                 if len(new_clips) == requested_chapters:
                     final_clips = new_clips
@@ -1364,19 +1421,21 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             for name in original_names.values()
         )
 
-        if clips_were_split or requested_chapters is not None:
+        if clips_were_split or requested_chapters is not None or is_dynamic_split:
             if has_custom_names:
                 # Preserve existing custom names; only fill in blanks with "Clip N"
                 for i, clip in enumerate(normalized_clips):
                     existing = clip.get('title') or clip.get('name') or ''
                     if not existing or _re2.match(r'^clip\s*\d+$', existing.strip(), _re2.IGNORECASE):
-                        clip['title'] = f'Clip {i + 1}'
-                        clip['name']  = f'Clip {i + 1}'
+                        if not is_rename_requested:
+                            clip['title'] = f'Clip {i + 1}'
+                            clip['name']  = f'Clip {i + 1}'
             else:
                 # No custom names — force sequential Clip 1, 2, 3...
-                for i, clip in enumerate(normalized_clips):
-                    clip['title'] = f'Clip {i + 1}'
-                    clip['name']  = f'Clip {i + 1}'
+                if not is_rename_requested:
+                    for i, clip in enumerate(normalized_clips):
+                        clip['title'] = f'Clip {i + 1}'
+                        clip['name']  = f'Clip {i + 1}'
             print(f"[edit-with-ai] Names after enforcement: {[c['name'] for c in normalized_clips]}")
         
         # PRESERVE TRANSCRIPT: Ensure transcript data is maintained in final clips
@@ -2282,6 +2341,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                     left["end"] = clip_source_start + keep_start_duration
                     left["sourceStart"] = clip_source_start
                     left["sourceEnd"] = clip_source_start + keep_start_duration
+                    left["duration"] = keep_start_duration
+                    if "segments" in left:
+                        del left["segments"]
 
                     right = dict(clip)
                     right["id"] = f"{clip.get('id', 'clip')}b"
@@ -2289,6 +2351,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                     right["end"] = clip_source_end
                     right["sourceStart"] = clip_source_end - keep_end_duration
                     right["sourceEnd"] = clip_source_end
+                    right["duration"] = keep_end_duration
+                    if "segments" in right:
+                        del right["segments"]
 
                     if keep_start_duration >= 0.5:
                         print(f"[cut_time]     → Keep left: {left['sourceStart']:.2f}-{left['sourceEnd']:.2f} ({keep_start_duration:.2f}s)")
@@ -2314,6 +2379,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                     trimmed["end"] = clip_source_start + keep_duration
                     trimmed["sourceStart"] = clip_source_start
                     trimmed["sourceEnd"] = clip_source_start + keep_duration
+                    trimmed["duration"] = keep_duration
+                    if "segments" in trimmed:
+                        del trimmed["segments"]
 
                     if keep_duration >= 0.5:
                         print(f"[cut_time]     → Keep: {trimmed['sourceStart']:.2f}-{trimmed['sourceEnd']:.2f} ({keep_duration:.2f}s)")
@@ -2332,6 +2400,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                     trimmed["end"] = clip_source_end
                     trimmed["sourceStart"] = clip_source_start + delete_duration
                     trimmed["sourceEnd"] = clip_source_end
+                    trimmed["duration"] = keep_duration
+                    if "segments" in trimmed:
+                        del trimmed["segments"]
 
                     if keep_duration >= 0.5:
                         print(f"[cut_time]     → Keep: {trimmed['sourceStart']:.2f}-{trimmed['sourceEnd']:.2f} ({keep_duration:.2f}s, deleted {delete_duration:.2f}s from start)")
@@ -2359,6 +2430,11 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
             # If not found by ID, find the clip that contains this timestamp
             if not clip_to_split and split_time is not None:
                 print(f"[split] Clip {clip_id} not found, searching by timestamp {split_time}")
+                
+                # Convert to float to avoid string comparison issues
+                try:
+                    split_time = float(split_time)
+                except Exception: pass
                 for clip in current_clips:
                     source_start = clip.get("sourceStart", clip.get("start", 0))
                     source_end = clip.get("sourceEnd", clip.get("end", 0))
@@ -2421,6 +2497,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                         clip_a["end"] = start + duration_a
                         clip_a["sourceStart"] = source_start
                         clip_a["sourceEnd"] = source_split_time
+                        clip_a["duration"] = duration_a
+                        if "segments" in clip_a:
+                            del clip_a["segments"]
                         # Inherit parent name — preserves custom names through splits
                         clip_a["title"] = original_title
                         clip_a["name"]  = original_title
@@ -2431,6 +2510,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
                         clip_b["end"] = start + duration_a + duration_b
                         clip_b["sourceStart"] = source_split_time
                         clip_b["sourceEnd"] = source_end
+                        clip_b["duration"] = duration_b
+                        if "segments" in clip_b:
+                            del clip_b["segments"]
                         clip_b["title"] = original_title
                         clip_b["name"]  = original_title
                         
