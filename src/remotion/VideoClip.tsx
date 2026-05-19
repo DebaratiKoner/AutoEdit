@@ -37,8 +37,8 @@ export const VideoClip: React.FC<VideoClipProps> = ({ clip, transition, isLast }
         ) : (
           <OffthreadVideo
             src={clip.src}
-            startFrom={Math.floor(clip.sourceStart * 30)} // Convert seconds to frames (assuming 30fps source)
-            endAt={Math.floor(clip.sourceEnd * 30)}
+            startFrom={0}
+            endAt={Math.floor((clip.sourceEnd - clip.sourceStart) * 30)}
             // Ensure we do NOT play background audio while previewing the asset section.
             // RemotionPlayer may reuse clips, so keeping preview silent prevents unintended audio.
             muted={true}

@@ -4,12 +4,12 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { SessionManager, CompositionBuilder } from '../services';
 import { formatTime, logger } from '../utils';
 import LZString from 'lz-string';
 import type { SessionData, TimelineSegment, CompositionSchema } from '../types';
 import { RemotionPreview } from './RemotionPreview';
 import { AssetsTab } from './AssetsTab';
+import { SessionManager, CompositionBuilder } from '../services';
 import './EditorPage.css';
 
 const TRANSCRIBE_MAX_ATTEMPTS = 2;
@@ -81,7 +81,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [resizeInitialX, setResizeInitialX] = useState<number>(0);
   const [resizeInitialStart, setResizeInitialStart] = useState<number>(0);
   const [resizeInitialDuration, setResizeInitialDuration] = useState<number>(0);
-  const [dragOffset, setDragOffset] = useState<number>(0);
+  const [, setDragOffset] = useState<number>(0);
   const [isUploadingAsset, setIsUploadingAsset] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const insertAfterClipIdRef = useRef<string | null>(null);
@@ -89,7 +89,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [transcribeTimer, setTranscribeTimer] = useState(0);
   const [showTranscript, setShowTranscript] = useState(true);
   const [isAiEditing, setIsAiEditing] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
+  const [isExporting, setIsExporting] = useState<'whole' | 'clips' | null>(null);
+  const [showExportMenu, setShowExportMenu] = useState(false);
   const [globalVolume] = useState(1); // Global audio volume control (0-1) - only affects audio tracks
 
   const [videoVolume, setVideoVolume] = useState(1); // Video playback volume (0-1)
@@ -243,6 +244,49 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
   };
 
+  // NOTE: audio lane-pinning helpers are currently unused.
+  // const AUDIO_TRACKS = [1, 2, 3, 4] as const;
+  // 
+  // const rangesOverlap = (aStart: number, aEnd: number, bStart: number, bEnd: number) => {
+  //   // Treat touching edges as non-overlapping: [start,end)
+  //   return aStart < bEnd && bStart < aEnd;
+  // };
+  // 
+  // const isAudioRangeFreeInLane = (timeline: TimelineSegment[], laneTrack: number, segId: string, start: number, duration: number) => {
+  //   const end = start + duration;
+  //   const audioInLane = timeline.filter(s => s.assetKind === 'audio' && s.track === laneTrack && s.id !== segId);
+  //   return !audioInLane.some(s => {
+  //     const sStart = s.timelineStart ?? 0;
+  //     const sEnd = sStart + (s.duration ?? 0);
+  //     return rangesOverlap(start, end, sStart, sEnd);
+  //   });
+  // };
+
+
+  // NOTE: kept for potential future use; currently unused.
+  // const findFirstFreeAudioLane = (timeline: TimelineSegment[], segId: string, start: number, duration: number, preferredLanes: readonly number[] = AUDIO_TRACKS) => {
+  //   for (const lane of preferredLanes) {
+  //     if (isAudioRangeFreeInLane(timeline, lane, segId, start, duration)) return lane;
+  //   }
+  //   return preferredLanes[0];
+  // };
+
+
+  const pinAudioToTimelineStart = useCallback((timeline: TimelineSegment[]) => (
+    timeline.map(seg => seg.assetKind === 'audio'
+      ? {
+          ...seg,
+          track: 1,
+          timelineStart: 0,
+          sourceStart: 0,
+          sourceEnd: seg.duration,
+        }
+      : seg
+    )
+  ), []);
+
+
+
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const currentClipIndexRef = useRef<number>(0);
@@ -250,7 +294,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const assetVideoRef = useRef<HTMLVideoElement>(null);  // dedicated element for asset clips
   const assetPhotoRef = useRef<HTMLImageElement>(null);  // dedicated element for asset photos
-  const audioRef = useRef<HTMLAudioElement>(null);       // dedicated element for track-1 audio
+  const audioRef = useRef<HTMLAudioElement>(null);       // dedicated element for active audio (lowest-numbered active lane)
+
   const audioSrcRef = useRef<string>('');                // tracks current audio src
   const timelineRef = useRef<HTMLDivElement>(null);
   const editPanelRef = useRef<HTMLDivElement>(null);
@@ -302,16 +347,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       const assetUrl = data.assetUrl || `/api/assets/${data.assetId}/stream`;
 
       if (isAudio) {
-        const track0Segs = session.timeline.filter(s => s.track === 0);
-        const totalDur = track0Segs.reduce((sum, s) => sum + Number(s.duration), 0);
-        const insertAt = Math.min(currentTime, totalDur);
+        const insertAt = 0;
 
         const newSeg: TimelineSegment = {
           id: `local-${Date.now()}`, name: file.name,
           assetUrl, assetKind: 'audio',
           duration: assetDuration, timelineStart: insertAt,
           sourceStart: 0, sourceEnd: assetDuration,
-          order: 0,
+          order: session.timeline.filter(s => s.assetKind === 'audio').length,
           track: 1, color: getAssetColor('audio'), volume: 1, originalDuration: assetDuration,
         };
         // Phase 4.14: Capture FULL session snapshot BEFORE mutation
@@ -841,12 +884,11 @@ function getShortName(name: string | undefined | null, fallback: string) {
     if (!session) return;
 
     const audioClips = session.timeline
-      .filter(s => s.track === 1 && s.assetKind === 'audio' && s.assetUrl)
-      .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0));
+      .filter(s => s.track >= 1 && s.assetKind === 'audio' && s.assetUrl);
 
-    const activeAudio = audioClips.find(
-      s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + s.duration
-    );
+    const activeAudio = audioClips
+      .filter(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + s.duration)
+      .sort((a, b) => a.track - b.track)[0];
 
     const activeVideo = session.timeline.find(s => s.track === 0 && currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + s.duration);
     const activeVideoVol = activeVideo?.volume ?? 1;
@@ -933,6 +975,12 @@ function getShortName(name: string | undefined | null, fallback: string) {
            }
        }
     }
+  }, []);
+
+  const advanceToNextClipRef = useRef<(shouldPlay?: boolean) => void>(() => {});
+
+  const advanceToNextClip = useCallback((shouldPlay = false) => {
+    advanceToNextClipRef.current(shouldPlay);
   }, []);
 
   // Pre-load the next media after timeline edits
@@ -1137,6 +1185,8 @@ function getShortName(name: string | undefined | null, fallback: string) {
       }
     };
 
+    advanceToNextClipRef.current = advanceToNextClip;
+
     const rafLoop = () => {
       if (isSwitchingRef.current || isJumpingRef.current) {
         rafId = requestAnimationFrame(rafLoop);
@@ -1194,7 +1244,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
         au.play().catch(() => {});
 
         const audioClips = sessionRef.current?.timeline.filter(s => s.track >= 1 && s.assetKind === 'audio') || [];
-        const activeAudio = audioClips.find(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0));
+        const activeAudio = audioClips.filter(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0)).sort((a, b) => a.track - b.track)[0];
         if (activeAudio) {
           if (audioSrcRef.current !== activeAudio.assetUrl) {
             au.src = activeAudio.assetUrl || '';
@@ -1295,18 +1345,23 @@ function getShortName(name: string | undefined | null, fallback: string) {
       const streamUrl = `/api/videos/${sessionId}/stream`;
       
       // Migrate: assign colors and tracks to clips that don't have them
-      const migratedTimeline = data.timeline.map((seg, index) => ({
+      const migratedTimeline = pinAudioToTimelineStart(data.timeline.map((seg, index) => ({
         ...seg,
         color: (seg.track === 0 || seg.track === undefined) ? getClipColor(seg.order ?? index) : (seg.color || getClipColor(index)),
         track: seg.track !== undefined ? seg.track : 0, // Default to track 0
-      }));
+      })));
       
       const restoredSession = { ...data, videoUrl: streamUrl, timeline: migratedTimeline };
       logger.debug('Restored session from storage, videoUrl:', streamUrl);
       setSession(restoredSession);
       
       // Save migrated session
-      if (migratedTimeline.some((seg, i) => seg.color !== data.timeline[i].color)) {
+      if (migratedTimeline.some((seg, i) => (
+        seg.color !== data.timeline[i].color ||
+        seg.timelineStart !== data.timeline[i].timelineStart ||
+        seg.sourceStart !== data.timeline[i].sourceStart ||
+        seg.sourceEnd !== data.timeline[i].sourceEnd
+      ))) {
         void sessionManager.saveSession(sessionId, restoredSession);
       }
       return;
@@ -1426,19 +1481,17 @@ function getShortName(name: string | undefined | null, fallback: string) {
       const updatedTimeline = session.timeline.map(s => {
         if (s.id !== resizingSegmentId) return s;
 
-        const updated: typeof s = { ...s, timelineStart: newStart, duration: newDuration };
+        const updated: typeof s = { ...s, timelineStart: s.assetKind === 'audio' ? 0 : newStart, duration: newDuration };
 
         if (s.assetKind === 'audio') {
+          newStart = 0;
+          updated.timelineStart = 0;
           updated.duration = newDuration;
 
-          if (resizeType === 'left') {
-            updated.sourceStart = Math.max(0, (s.sourceStart ?? 0) + (resizeInitialDuration - newDuration));
-            updated.sourceEnd = updated.sourceStart + newDuration;
-          } else {
-            const currentSourceStart = s.sourceStart ?? 0;
-            updated.sourceStart = currentSourceStart;
-            updated.sourceEnd = currentSourceStart + newDuration;
-          }
+          updated.sourceStart = 0;
+          updated.sourceEnd = newDuration;
+
+          updated.track = 1;
         } else {
           updated.sourceEnd = (s.sourceStart ?? 0) + newDuration;
         }
@@ -1485,6 +1538,17 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
   async function jumpToTimelineTime(timelineTime: number, sourceSession: SessionData = session!, isScrubbing: boolean = false) {
     if (!videoRef.current || !sourceSession) return;
+
+    // Keep all timeline lanes (including the audio lane) horizontally aligned.
+    // Because the audio lane is rendered inside the same scroll container,
+    // we ensure scrollLeft is moved to the playhead position.
+    // (This is intentionally done early, so UI updates feel immediate.)
+    try {
+      scrollTimelineToTime(timelineTime, sourceSession.timeline, false);
+    } catch {
+      // ignore
+    }
+
 
     const video = videoRef.current;
     const av = assetVideoRef.current;
@@ -1585,7 +1649,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       try { video.play().catch(() => {}); setIsPlaying(true); } catch {}
       const au = audioRef.current;
       const audioClips = sourceSession.timeline.filter(s => s.track >= 1 && s.assetKind === 'audio');
-      const activeAudio = audioClips.find(s => timelineTime >= (s.timelineStart ?? 0) && timelineTime < (s.timelineStart ?? 0) + (s.duration || 0));
+      const activeAudio = audioClips.filter(s => timelineTime >= (s.timelineStart ?? 0) && timelineTime < (s.timelineStart ?? 0) + (s.duration || 0)).sort((a, b) => a.track - b.track)[0];
       if (activeAudio && au) {
         if (audioSrcRef.current !== activeAudio.assetUrl) {
           au.src = activeAudio.assetUrl || '';
@@ -1603,7 +1667,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       if (au) {
         au.pause();
         const audioClips = sourceSession.timeline.filter(s => s.track >= 1 && s.assetKind === 'audio');
-        const activeAudio = audioClips.find(s => timelineTime >= (s.timelineStart ?? 0) && timelineTime < (s.timelineStart ?? 0) + (s.duration || 0));
+        const activeAudio = audioClips.filter(s => timelineTime >= (s.timelineStart ?? 0) && timelineTime < (s.timelineStart ?? 0) + (s.duration || 0)).sort((a, b) => a.track - b.track)[0];
         if (activeAudio && audioSrcRef.current !== activeAudio.assetUrl) {
           au.src = activeAudio.assetUrl || '';
           audioSrcRef.current = activeAudio.assetUrl || '';
@@ -1658,7 +1722,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
             video?.play().catch(() => {});
           }
           const audioClips = sessionRef.current?.timeline.filter(s => s.track >= 1 && s.assetKind === 'audio') || [];
-          const activeAudio = audioClips.find(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0));
+          const activeAudio = audioClips.filter(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0)).sort((a, b) => a.track - b.track)[0];
           if (activeAudio && au) {
             if (audioSrcRef.current !== activeAudio.assetUrl) {
               au.src = activeAudio.assetUrl || '';
@@ -1926,7 +1990,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
       
       const timeAtCursor = pxToTime(Math.max(0, Math.min(totalPx, mouseX)));
       const segment = session.timeline.find(s => s.id === segmentId);
-      if (segment && segment.track === 1) {
+      if (segment && segment.track >= 1) {
         setDragOffset(timeAtCursor - (segment.timelineStart ?? 0));
       } else {
         setDragOffset(0);
@@ -2043,15 +2107,18 @@ function getShortName(name: string | undefined | null, fallback: string) {
       return;
     }
     
-    // Only allow audio on track >= 1, and no audio on track 0
+    // Only allow audio on the single audio track, and no audio on track 0
     if (trackNum >= 1 && draggedSegment.assetKind !== 'audio') return;
     if (trackNum === 0 && draggedSegment.assetKind === 'audio') return;
     
     e.stopPropagation();
+
+    const finalTrack = draggedSegment.assetKind === 'audio' ? 1 : trackNum;
+
     // Move segment to new track
     const newTimeline = session.timeline.map(seg => {
       if (seg.id === draggedSegmentId) {
-        return { ...seg, track: trackNum };
+        return { ...seg, track: finalTrack, timelineStart: seg.assetKind === 'audio' ? 0 : seg.timelineStart };
       }
       return seg;
     });
@@ -2115,12 +2182,14 @@ function getShortName(name: string | undefined | null, fallback: string) {
     if (!draggedSegment) return;
     
     if (draggedSegment.track >= 1) {
-      // Audio segment: absolute positioning with bounds validation
-      const track0Dur = session.timeline.filter(s => s.track === 0).reduce((sum, s) => sum + Number(s.duration), 0);
-      const newStart = Math.max(0, Math.min(track0Dur - Number(draggedSegment.duration) + 0.1, dragOverPosition - dragOffset));
+      // Audio segments are pinned to 0.00; timeline drops only change the lane.
+      const newStart = 0;
+
+      const finalTrack = 1;
+
       const updatedTimeline = session.timeline.map(seg => {
         if (seg.id === draggedSegmentId) {
-          return { ...seg, timelineStart: newStart };
+          return { ...seg, timelineStart: newStart, track: finalTrack };
         }
         return seg;
       });
@@ -2298,6 +2367,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
     
     const segment = session?.timeline.find(s => s.id === segmentId);
     if (!segment) return;
+    if (segment.assetKind === 'audio' && type === 'left') return;
     
     setResizingSegmentId(segmentId);
     setResizeType(type);
@@ -2308,78 +2378,59 @@ function getShortName(name: string | undefined | null, fallback: string) {
 
   // Asset management functions
 
-  const handleExport = async () => {
-  logger.operation("Export started");
+  const handleExport = async (mode: 'whole' | 'clips') => {
+    logger.operation(`Export started: ${mode}`);
+    setShowExportMenu(false);
 
-  if (!session || session.timeline.length === 0) {
-    alert("No clips to export");
-    return;
-  }
-
-  setIsExporting(true);
-
-  try {
-    const exportClips = [...session.timeline]
-      .sort((a, b) => (a.timelineStart ?? 0) - (b.timelineStart ?? 0))
-      .map(c => ({
-        id: c.id,
-        start: c.sourceStart ?? c.sourceStart ?? 0,
-        end: c.sourceEnd ?? c.sourceEnd ?? 0,
-        timelineStart: c.timelineStart ?? 0,
-        duration: c.duration,
-        assetUrl: c.assetUrl,
-        assetKind: c.assetKind,
-        volume: c.volume ?? 1,
-        track: c.track ?? 0,
-        name: c.name ?? "Clip"
-      }));
-
-    const response = await fetch(
-      `/api/videos/${sessionId}/export-with-clips`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          clips: exportClips,
-          options: {
-            fps: 30,
-            width: 1280,
-            height: 720
-          }
-        })
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error("Export failed");
+    if (!session || session.timeline.length === 0) {
+      alert("No clips to export");
+      return;
     }
 
-    // DIRECT DOWNLOAD
-    const blob = await response.blob();
+    setIsExporting(mode);
 
-    const downloadUrl = window.URL.createObjectURL(blob);
+    try {
+      const response = await fetch(
+        `/api/videos/${sessionId}/export-zip`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            timeline: session.timeline,
+            transcriptSegments: session.transcriptSegments || [],
+            mode
+          })
+        }
+      );
 
-    const a = document.createElement("a");
-    a.href = downloadUrl;
-    a.download = `edited-video-${Date.now()}.mp4`;
+      if (!response.ok) {
+        const text = await response.text();
+        console.error("Export failed:", response.status, text);
+        throw new Error("Export failed");
+      }
 
-    document.body.appendChild(a);
-    a.click();
+      const blob = await response.blob();
+      const isZip = mode === 'clips';
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = downloadUrl;
+      a.download = isZip ? `autoedit_clips_${sessionId.slice(0, 8)}.zip` : `autoedit_${sessionId.slice(0, 8)}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 5000);
 
-    // cleanup
-    a.remove();
-    window.URL.revokeObjectURL(downloadUrl);
-
-    logger.operation("Video downloaded instantly");
-  } catch (err) {
-    console.error(err);
-    alert("Export failed");
-  } finally {
-    setIsExporting(false);
-  }
-};
+      logger.operation(`${mode} export downloaded`);
+    } catch (err) {
+      console.error(err);
+      alert("Export failed");
+    } finally {
+      setIsExporting(null);
+    }
+  };
 
   const handleResetConfirm = async () => {
     if (session) {
@@ -2410,9 +2461,28 @@ function getShortName(name: string | undefined | null, fallback: string) {
             <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
               Reset
             </button>
-            <button className="btn btn-primary" onClick={handleExport} disabled={isExporting}>
-              {isExporting ? 'Exporting...' : 'Export'}
-            </button>
+            <div className="export-menu">
+              <button
+                className="btn btn-primary"
+                onClick={() => setShowExportMenu(open => !open)}
+                disabled={isExporting !== null}
+                aria-haspopup="menu"
+                aria-expanded={showExportMenu}
+              >
+                {isExporting ? 'Exporting...' : 'Export'}
+                <span className="export-menu-caret">v</span>
+              </button>
+              {showExportMenu && (
+                <div className="export-dropdown" role="menu">
+                  <button type="button" role="menuitem" onClick={() => handleExport('whole')}>
+                    Whole video
+                  </button>
+                  <button type="button" role="menuitem" onClick={() => handleExport('clips')}>
+                    Clips format
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </header>
 
@@ -2538,7 +2608,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
                       video?.play().catch(() => {});
                     }
                     const audioClips = session.timeline?.filter(s => s.track >= 1 && s.assetKind === 'audio') || [];
-                    const activeAudio = audioClips.find(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0));
+                    const activeAudio = audioClips.filter(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0)).sort((a, b) => a.track - b.track)[0];
                     if (activeAudio && au) {
                       if (audioSrcRef.current !== activeAudio.assetUrl) {
                         au.src = activeAudio.assetUrl || '';
@@ -2598,7 +2668,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
                       }
                       
                       const audioClips = session.timeline?.filter(s => s.track >= 1 && s.assetKind === 'audio') || [];
-                      const activeAudio = audioClips.find(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0));
+                      const activeAudio = audioClips.filter(s => currentTime >= (s.timelineStart ?? 0) && currentTime < (s.timelineStart ?? 0) + (s.duration || 0)).sort((a, b) => a.track - b.track)[0];
                       if (activeAudio && au) {
                         if (audioSrcRef.current !== activeAudio.assetUrl) {
                           au.src = activeAudio.assetUrl || '';
@@ -2888,29 +2958,32 @@ function getShortName(name: string | undefined | null, fallback: string) {
                         )}
                       </div>
 
-                      {/* Audio tracks — inside scroll so it aligns with video clips */}
+                      {/* Single scrollable audio track */}
                       {(() => {
-                        const audioSegs = (session.timeline || []).filter(s => s.track >= 1);
-                        const trackHeight = Math.max(48, audioSegs.length * 44 + 8);
+                        const audioSegs = (session.timeline || []).filter(s => s.assetKind === 'audio').sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+                        const audioRowHeight = 40;
+                        const audioGap = 22;
+                        const audioTrackHeight = Math.max(72, 44 + (audioSegs.length * (audioRowHeight + audioGap)));
 
                         return (
-                          <div
-                            key={`audio-track-1`}
-                            className="timeline-track audio-track"
-                            data-track={1}
-                            style={{ position: 'relative', background: 'rgba(26,188,156,0.06)', borderRadius: '6px', border: '1px solid rgba(26,188,156,0.18)', height: `${trackHeight}px`, minHeight: '48px', overflow: 'visible', marginTop: '4px', width: `${totalPx}px`, maxWidth: '100%', transition: 'height 0.2s ease' }}
-                            onDragOver={handleTrackDragOver}
-                            onDrop={(e) => handleTrackDrop(1, e)}
-                          >
-                            <div style={{ position: 'sticky', left: '0px', top: '4px', width: 'fit-content', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', paddingLeft: '10px', height: '40px', color: 'rgba(26,188,156,0.3)', fontSize: '0.75rem', fontWeight: 600, letterSpacing: '0.5px', gap: '6px', pointerEvents: 'none', zIndex: 1 }}>
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-                              AUDIO TRACK
-                            </div>
-                            
-                            {audioSegs.map((segment, index) => {
+                          <div className="audio-tracks-scroll" style={{ width: `${totalPx}px` }}>
+                            <div
+                              className="timeline-track audio-track"
+                              data-track={1}
+                              style={{ position: 'relative', background: 'rgba(255,255,255,0.035)', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.08)', minHeight: `${audioTrackHeight}px`, overflow: 'visible', marginTop: '4px', marginBottom: '8px', width: `${totalPx}px`, transition: 'height 0.2s ease' }}
+                              onDragOver={handleTrackDragOver}
+                              onDrop={(e) => handleTrackDrop(1, e)}
+                            >
+                              <div style={{ position: 'sticky', left: '0px', top: '4px', width: 'fit-content', display: 'flex', alignItems: 'center', justifyContent: 'flex-start', paddingLeft: '10px', height: '32px', color: 'rgba(26,188,156,0.34)', fontSize: '0.75rem', fontWeight: 600, letterSpacing: '0.5px', gap: '6px', pointerEvents: 'none', zIndex: 1 }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                                AUDIO
+                              </div>
+
+                              {audioSegs.map((segment, audioIndex) => {
                               const leftPx = ((segment.timelineStart ?? 0) / Math.max(totalDur, 1)) * totalPx;
                               const widthPx = Math.max(4, (Math.max(segment.duration || 0, 0) / Math.max(totalDur, 1)) * totalPx);
-                              const topPx = index * 44 + 4;
+                              const topPx = 36 + (audioIndex * (audioRowHeight + audioGap));
+
                               const vol = segment.volume ?? 1;
                               const isActive = currentTime >= (segment.timelineStart ?? 0) && currentTime < (segment.timelineStart ?? 0) + segment.duration;
                               const bgColor = '#1abc9c';
@@ -2920,16 +2993,16 @@ function getShortName(name: string | undefined | null, fallback: string) {
                                   className={`timeline-segment${selectedSegmentId === segment.id ? ' selected' : ''}${draggedSegmentId === segment.id ? ' dragging' : ''}`}
                                   title={`${segment.name || 'Audio'}`}
                                   style={{
-                                    position: 'absolute', top: `${topPx}px`, height: '40px',
+                                    position: 'absolute', top: `${topPx}px`, height: `${audioRowHeight}px`,
                                     left: `${leftPx}px`, width: `${widthPx}px`,
                                     backgroundColor: bgColor,
                                     boxSizing: 'border-box',
-                                    border: selectedSegmentId === segment.id ? '2px solid #fff' : isActive ? `2px solid ${bgColor}` : '1px solid rgba(26,188,156,0.5)',
+                                    border: selectedSegmentId === segment.id ? '2px solid #fff' : '1px solid rgba(255,255,255,0.22)',
                                     cursor: resizingSegmentId === segment.id ? 'ew-resize' : 'grab',
                                     borderRadius: '4px', display: 'flex', alignItems: 'center', overflow: selectedSegmentId === segment.id ? 'visible' : 'hidden',
                                     zIndex: selectedSegmentId === segment.id ? 10 : isActive ? 5 : 1,
                                     opacity: isActive ? 1 : 0.85,
-                                    boxShadow: isActive ? `0 0 8px ${bgColor}80` : 'none',
+                                    boxShadow: selectedSegmentId === segment.id ? '0 4px 10px rgba(0,0,0,0.25)' : 'none',
                                     transition: 'all 0.2s ease',
                                   }}
                                   onClick={(e) => handleSegmentClick(segment.id, e)}
@@ -2994,14 +3067,17 @@ function getShortName(name: string | undefined | null, fallback: string) {
                                       </div>
                                     </div>
                                   )}
-                                  <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '10px', cursor: 'ew-resize', zIndex: 12, background: 'linear-gradient(90deg, rgba(0,0,0,0.5) 0%, transparent 100%)' }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'left')} />
+                                  {segment.assetKind !== 'audio' && (
+                                    <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: '10px', cursor: 'ew-resize', zIndex: 12, background: 'linear-gradient(90deg, rgba(0,0,0,0.5) 0%, transparent 100%)' }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'left')} />
+                                  )}
                                   <span style={{ fontSize: '0.6rem', color: '#fff', padding: '0 6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', textShadow: '0 1px 2px rgba(0,0,0,0.8)', zIndex: 1, textAlign: 'center', fontWeight: '500', pointerEvents: 'none' }}>
                                     {segment.name || 'Audio'}
                                   </span>
                                   <div style={{ position: 'absolute', right: 0, top: 0, bottom: 0, width: '10px', cursor: 'ew-resize', zIndex: 12, background: 'linear-gradient(270deg, rgba(0,0,0,0.5) 0%, transparent 100%)' }} onMouseDown={(e) => handleResizeMouseDown(e, segment.id, 'right')} />
                                 </div>
                               );
-                            })}
+                              })}
+                            </div>
                           </div>
                         );
                       })()}
@@ -3051,8 +3127,9 @@ function getShortName(name: string | undefined | null, fallback: string) {
         </div>
         
         <div className="sidebar-content" style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
-{activeTab === 'clips' && (
+          {activeTab === 'clips' && (
             <div className="clips-tab">
+
               <div style={{ marginBottom: '0.75rem' }}>
                 <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fff' }}>Timeline Clips</h3>
               </div>
@@ -3237,10 +3314,7 @@ function getShortName(name: string | undefined | null, fallback: string) {
               }
 
               if (isAudio) {
-                // Audio is inserted at the playhead on the single audio track
-                const track0Segments = session.timeline.filter(s => s.track === 0);
-                const totalDur = track0Segments.reduce((sum, s) => sum + Number(s.duration), 0);
-                const insertAt = Math.min(currentTime, totalDur);
+                const insertAt = 0;
 
                 const newSegment: TimelineSegment = {
                   id: `asset-${Date.now()}`,
@@ -3251,32 +3325,40 @@ function getShortName(name: string | undefined | null, fallback: string) {
                   timelineStart: insertAt,
                   sourceStart: 0,
                   sourceEnd: assetDuration,
-                  order: 0,
+                  order: session.timeline.filter(s => s.assetKind === 'audio').length,
                   track: 1,
                   color: getAssetColor('audio'),
                   volume: 1,
                   originalDuration: assetDuration,
                 };
-              // Phase 4.14: Capture FULL session snapshot BEFORE mutation
-              const previousSnapshot = saveFullSessionSnapshot(session);
 
-              setSession({
-                ...session,
-                timeline: [...session.timeline, newSegment],
-                undoStack: [...session.undoStack, { 
-                  type: 'FULL_SNAPSHOT' as const,
-                  previousSnapshot,
-                  actionType: 'ADD_ASSET' as const
-                }],
-                redoStack: [],
-              });
+                // Phase 4.14: Capture FULL session snapshot BEFORE mutation
+                const previousSnapshot = saveFullSessionSnapshot(session);
 
-              setTimeout(() => {
-                scrollTimelineToTime(newSegment.timelineStart ?? 0, [...session.timeline, newSegment], true);
-              }, 100);
+                const updatedSession: SessionData = {
+                  ...session,
+                  timeline: [...session.timeline, newSegment],
+                  undoStack: [
+                    ...session.undoStack,
+                    {
+                      type: 'FULL_SNAPSHOT' as const,
+                      previousSnapshot,
+                      actionType: 'ADD_ASSET' as const,
+                    },
+                  ],
+                  redoStack: [],
+                };
 
-              return;
+                setSession(updatedSession);
+                void sessionManager.saveSession(sessionId, updatedSession);
+
+                setTimeout(() => {
+                  scrollTimelineToTime(newSegment.timelineStart ?? 0, updatedSession.timeline, true);
+                }, 100);
+
+                return;
               }
+
 
               const newSegment: TimelineSegment = {
                 id: `asset-${Date.now()}`,

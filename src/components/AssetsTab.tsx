@@ -9,6 +9,7 @@ const PIXABAY_PROXY = '/api/pixabay';
 const FREESOUND_PROXY = '/api/freesound';
 const imgProxy = (url: string) => url ? `/api/proxy-image?url=${encodeURIComponent(url)}` : '';
 const vidProxy = (url: string) => url ? `/api/proxy-video?url=${encodeURIComponent(url)}` : '';
+const audioProxy = (url: string) => url ? `/api/proxy-audio?url=${encodeURIComponent(url)}` : '';
 
 export type AssetFilter = 'all' | 'video' | 'photo' | 'audio';
 
@@ -71,8 +72,9 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [addedIds, setAddedIds]   = useState<Set<number>>(new Set());
   const [photoDurs, setPhotoDurs] = useState<Record<number, string>>({});
-  const [preview, setPreview]     = useState<(PixabayVideo & { _kind: 'video' }) | null>(null);
-  const previewRef                = useRef<HTMLVideoElement>(null);
+  const [preview, setPreview]     = useState<(PixabayVideo & { _kind: 'video' }) | (FreesoundAudio & { _kind: 'audio' }) | null>(null);
+  const videoPreviewRef           = useRef<HTMLVideoElement>(null);
+  const audioPreviewRef           = useRef<HTMLAudioElement>(null);
 
   // Single-filter state (video / photo / audio tabs)
   const [singleItems, setSingleItems] = useState<PixabayAsset[]>([]);
@@ -86,6 +88,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   const [photoSec, setPhotoSec] = useState<SectionState>(emptySec());
   const [audioSec, setAudioSec] = useState<SectionState>(emptySec());
   const [allError, setAllError] = useState<string | null>(null);
+  const [audioPreviewError, setAudioPreviewError] = useState<string | null>(null);
 
   const topics = TOPICS[filter] ?? [];
 
@@ -181,7 +184,105 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     setAddedIds(prev => new Set(prev).add(asset.id));
   };
 
-  const closePreview = () => { setPreview(null); previewRef.current?.pause(); };
+  const closePreview = () => {
+    setPreview(null);
+    videoPreviewRef.current?.pause();
+
+    const a = audioPreviewRef.current;
+    if (a) {
+      a.pause();
+      try { a.currentTime = 0; } catch {}
+      try { a.load(); } catch {}
+    }
+  };
+
+
+  useEffect(() => {
+    setAudioPreviewError(null);
+    if (preview?._kind !== 'audio') return;
+
+    const audio = audioPreviewRef.current;
+    if (!audio) return;
+
+    // For audio previews, we want the preview button to play with sound
+    // and stop at the specified duration.
+    const specifiedDuration = Number(preview.duration ?? 0);
+    const previewDuration = Number.isFinite(specifiedDuration) ? Math.max(0, specifiedDuration) : 0;
+
+    let didCancel = false;
+
+    const stopAtDuration = () => {
+      if (previewDuration > 0 && audio.currentTime >= previewDuration) {
+        audio.pause();
+      }
+    };
+
+    audio.pause();
+    try { audio.currentTime = 0; } catch {}
+
+    audio.muted = false;
+    audio.volume = 1;
+
+    try { audio.load(); } catch {}
+
+    audio.addEventListener('timeupdate', stopAtDuration);
+
+    // Also stop at the duration using a timeout to match the video preview's deterministic stop.
+    const timeoutId = previewDuration > 0 ? window.setTimeout(() => {
+      try { audio.pause(); } catch {}
+    }, previewDuration * 1000) : null;
+
+    audio.play().catch(() => {
+      // Autoplay may be blocked; user can press play via native controls.
+    });
+
+    return () => {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      didCancel = true;
+      audio.removeEventListener('timeupdate', stopAtDuration);
+      if (didCancel) {
+        try { audio.pause(); } catch {}
+      }
+    };
+  }, [preview]);
+
+
+  const playAudioPreview = () => {
+    const audio = audioPreviewRef.current;
+    if (!audio || preview?._kind !== 'audio') return;
+
+    const specifiedDuration = Number(preview.duration ?? 0);
+    const previewDuration = Number.isFinite(specifiedDuration) ? Math.max(0, specifiedDuration) : 0;
+
+    // Reset and play from start.
+    audio.pause();
+    try { audio.currentTime = 0; } catch {}
+
+    audio.muted = false;
+    audio.volume = 1;
+
+    // Stop exactly at the requested duration.
+    const onTimeUpdate = () => {
+      if (previewDuration > 0 && audio.currentTime >= previewDuration) {
+        audio.pause();
+        audio.removeEventListener('timeupdate', onTimeUpdate);
+      }
+    };
+
+    // Ensure we don't accumulate listeners across preview reopens.
+    audio.removeEventListener('timeupdate', onTimeUpdate);
+    audio.addEventListener('timeupdate', onTimeUpdate);
+
+    try {
+      audio.load();
+    } catch {}
+
+    audio.play().catch(() => {
+      audio.removeEventListener('timeupdate', onTimeUpdate);
+      // Native controls let the user start playback if autoplay is blocked.
+    });
+  };
+
 
   // ── Asset card renderer ────────────────────────────────────────────────────
   const renderCard = (asset: PixabayAsset) => {
@@ -195,7 +296,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const isAdded = addedIds.has(asset.id);
 
     return (
-      <div key={`${asset._kind}-${asset.id}`} className="asset-card">
+      <div key={`${asset._kind}-${asset.id}`} className="asset-card" style={isAudio ? { marginBottom: '1rem', marginLeft: '0.5rem', marginRight: '0.5rem' } : undefined}>
         <div className="asset-card-thumb">
           <img src={thumb || FALLBACK} alt={isAudio ? (asset as FreesoundAudio).name : asset.tags}
             loading="lazy" onError={e => { (e.target as HTMLImageElement).src = FALLBACK; }} />
@@ -217,9 +318,9 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
             </div>
           )}
           <div className="asset-card-actions">
-            {isVid && (
+            {(isVid || isAudio) && (
               <button className="asset-preview-btn" style={{ fontSize: '0.65rem', padding: '2px 6px' }}
-                onClick={e => { e.stopPropagation(); setPreview(asset as PixabayVideo & { _kind: 'video' }); }}>Preview</button>
+                onClick={e => { e.stopPropagation(); setPreview(asset as (PixabayVideo & { _kind: 'video' }) | (FreesoundAudio & { _kind: 'audio' })); }}>Preview</button>
             )}
             <button className={`asset-add-btn${isAdded ? ' added' : ''}`}
               style={{ fontSize: '0.65rem', padding: '2px 6px' }}
@@ -381,16 +482,43 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
 
       </div>
 
-      {/* Video preview modal */}
+      {/* Media preview modal */}
       {preview && (
         <div className="asset-preview-overlay" onClick={closePreview}>
           <div className="asset-preview-panel" onClick={e => e.stopPropagation()}>
             <div className="asset-preview-header">
-              <span className="asset-preview-title">{preview.tags.split(',')[0].trim()}</span>
+              <span className="asset-preview-title">{preview._kind === 'audio' ? preview.name : preview.tags.split(',')[0].trim()}</span>
               <button className="asset-preview-close" onClick={closePreview}>×</button>
             </div>
             <div className="asset-preview-video-wrap">
-              <video ref={previewRef} src={vidProxy(bestVideoUrl(preview))} className="asset-preview-video" controls autoPlay loop />
+              {preview._kind === 'video' ? (
+                <video ref={videoPreviewRef} src={vidProxy(bestVideoUrl(preview))} className="asset-preview-video" controls autoPlay loop />
+              ) : (
+                <div style={{ padding: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', background: '#1a1a2e' }}>
+                  <img src={imgProxy(preview.images.waveform_m) || FALLBACK} alt="waveform" style={{ width: '100%', maxHeight: '150px', objectFit: 'contain', marginBottom: '2rem' }} />
+                  <audio
+                    key={preview.id}
+                    ref={audioPreviewRef}
+                    src={audioProxy(preview.previews['preview-hq-mp3'] || preview.previews['preview-lq-mp3'] || preview.previews['preview-hq-ogg'] || preview.previews['preview-lq-ogg'])}
+                    controls
+                    autoPlay
+                    preload="auto"
+                    onCanPlay={playAudioPreview}
+                    onError={() => setAudioPreviewError('Audio preview could not be loaded.')}
+                    style={{ width: '100%', maxWidth: '400px' }}
+                  />
+                  <div style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: '#aaa', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+                    <span>Duration: {Number(photoDurs[preview.id] ?? preview.duration ?? 0).toFixed(1)}s</span>
+                    <span style={{ color: '#9fc5ff' }}>Sound: Preview</span>
+                  </div>
+                  {audioPreviewError && (
+
+                    <div style={{ marginTop: '0.5rem', fontSize: '0.72rem', color: '#ff7b7b' }}>
+                      {audioPreviewError}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             <div className="asset-preview-controls">
               <button className={`asset-preview-add${addedIds.has(preview.id) ? ' added' : ''}`}

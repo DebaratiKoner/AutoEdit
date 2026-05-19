@@ -1,17 +1,9 @@
-# TODO - Export timeline + chapters + assets
+# Autoedit AI TODO
 
-- [ ] Add backend endpoint that exports:
-  - [ ] main edited timeline mp4
-  - [ ] one mp4 per chapter/clip (based on track-0 segments)
-  - [ ] chapters metadata JSON (based on transcriptSegments / clip names)
-  - [ ] packaging as a single downloadable ZIP so browser can trigger instant download of local artifacts.
-- [ ] Implement asset fetching/resolution in backend export so clips include:
-  - [ ] original local session video
-  - [ ] local uploaded assets from /api/assets/{id}/stream
-  - [ ] external asset URLs (download to local temp files before ffmpeg)
-- [ ] Update frontend `EditorPage.tsx` export button:
-  - [ ] call new endpoint
-  - [ ] trigger download of ZIP (instant once backend finishes export)
-- [ ] Sanity check file naming, durations, and that chapter clips match timeline order.
-- [ ] Smoke test export end-to-end.
+- [x] Inspect how video preview works (player/composition) and how audio preview is currently implemented.
+- [x] Identify mismatch preventing audio preview from behaving like video preview.
+- [ ] Implement fix in `src/components/AssetsTab.tsx` (audio preview play/stop syncing to preview duration, autoplay policy handling).
+- [ ] Add minimal guards to ensure audio preview resets correctly on preview change.
+- [ ] Test: open Assets modal → preview audio → verify it plays with sound, stops at chosen duration, and resets on reopen.
+
 
