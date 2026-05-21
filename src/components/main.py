@@ -115,79 +115,6 @@ class TranscribeRequest(BaseModel):
     clips: Optional[list] = None
     quick: Optional[bool] = False
 
-
-def _build_concat_wav_from_clips_fast(
-    *,
-    src_video_path: Path,
-    clips: list,
-    out_wav_path: Path,
-) -> None:
-    """Fast path: create a single 16k mono wav containing only the selected clip regions.
-
-    Uses ffmpeg filtergraph with atrim+asetpts and concat, avoiding PCM intermediate files.
-    """
-    # Build per-clip trimmed streams
-    parts = []
-    for i, clip in enumerate(clips):
-        start = float(clip.get("start", 0) or 0)
-        end = float(clip.get("end", 0) or start)
-        if end <= start:
-            continue
-        # [0:a]atrim produces a stream; we rename it to a{i}
-        parts.append(
-            f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]"
-        )
-
-    if not parts:
-        raise Exception("No valid clip ranges for fast transcription")
-
-    # concat all trimmed audio streams into one
-    idxs = []
-    k = 0
-    # We need to match the a{i} indices we actually emitted; reconstruct by reading parts.
-    for p in parts:
-        # p ends with [a{i}] - extract i
-        import re
-        m = re.search(r"\[a(\d+)\]$", p)
-        if m:
-            idxs.append(int(m.group(1)))
-    max_i = max(idxs) if idxs else 0
-
-    # concat expects contiguous labels [a0][a1]...; if we skipped any, rebuild using actual order.
-    # Rebuild with actual order to be safe.
-    ordered_parts = []
-    ordered_idxs = sorted(idxs)
-    for j, i in enumerate(ordered_idxs):
-        ordered_parts.append(f"[a{i}]" )
-
-    concat_inputs = "".join(ordered_parts)
-    concat_count = len(ordered_idxs)
-
-    filter_complex = ";".join(parts) + ";" + f"{concat_inputs}concat=n={concat_count}:v=0:a=1[aout]"
-
-    # 16k mono wav
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(src_video_path),
-        "-vn",
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[aout]",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-f",
-        "wav",
-        str(out_wav_path),
-    ]
-
-    subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-
 # --- ADD THIS AFTER LINE 217 ---
 
 def _ensure_clip_ids(clips: list) -> list:
@@ -371,13 +298,10 @@ async def transcribe_video(session_id: str, request_body: Optional[TranscribeReq
             status_code=500,
             detail="OpenAI API key not configured. Set OPENAI_API_KEY environment variable."
         )
-
+    
     clips = request_body.clips if request_body else None
-    quick = bool(request_body.quick) if request_body else False
-
+    
     try:
-
-
         import tempfile, shutil
         import concurrent.futures
         
@@ -1016,8 +940,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     content_based_keywords = [
         'about', 'mention', 'discuss', 'talk', 'say', 'explain',
         'describe', 'topic', 'subject', 'content', 'word', 'phrase',
-        'name clips from transcript', 'based on transcript',
-        'chapter', 'chapters', 'semantic'
+        'name clips from transcript', 'based on transcript'
     ]
 
     is_content_based = any(
@@ -1028,8 +951,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     # Allow basic structural commands without transcript (including chapter division)
     basic_structural_keywords = [
         'delete', 'remove', 'merge', 'keep', 'reorder', 'move', 'swap',
-        'chapters', 'divide', 'split', 'cut', 'break', 'rename', 'title', 'name',
-        'trim', 'shorten', 'extend', 'increase'
+        'chapters', 'divide', 'split', 'cut', 'break', 'rename', 'title', 'name'
     ]
 
     is_basic_structural = any(
@@ -1096,45 +1018,19 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
     # Check if user explicitly asked for RENAMING (descriptive names from transcript)
     # "chapter" alone in a divide/split context means count, not rename
-    prompt_l = body.prompt.lower()
-    is_rename_requested = any(word in prompt_l for word in [
-        'rename',
-        'give names',
-        'name the clips',
-        'chapter names',
-        'chapter name',
-        'descriptive',
-        'name them',
-        'name from transcript',
-        'name according',
-        'title the clips',
-        'label the clips',
-        'name clips',
-        'name clips from transcript',
-        'generate chapter names',
-        'generate chapters',
-        'names',
-        'naming',
-        'generate names',
+    is_rename_requested = any(word in body.prompt.lower() for word in [
+        'rename', 'give names', 'name the clips', 'chapter names', 'descriptive', 'name them',
+        'name from transcript', 'name according', 'title the clips', 'label the clips', 'name clips'
     ])
-    is_content_based_split = any(word in prompt_l for word in ['transcript', 'topic', 'content', 'subject', 'say', 'theme', 'chapter', 'chapters', 'semantic'])
+    is_content_based_split = any(word in body.prompt.lower() for word in ['transcript', 'topic', 'content', 'subject', 'say', 'theme'])
 
     # Only apply chapter instruction for whole-video division, NOT for specific clip splits
-    is_specific_clip_split = bool(_re.search(r'clip\s*\d+', prompt_l))
+    is_specific_clip_split = bool(_re.search(r'clip\s*\d+', body.prompt.lower()))
 
     # NEW logic for dynamic splitting without a specific count
-    is_dynamic_split = (not requested_chapters) and any(phrase in prompt_l for phrase in [
-        'divide', 'split', 'create chapters', 'generate chapters', 'chapters', 'separate'
+    is_dynamic_split = not requested_chapters and any(phrase in body.prompt.lower() for phrase in [
+        'divide', 'split', 'create chapters', 'separate'
     ]) and not is_specific_clip_split
-
-    # Refine: If user asks for chapter names/naming specifically, treat it as a rename operation, not a split
-    if ('chapter' in prompt_l) and ('name' in prompt_l or 'naming' in prompt_l or 'title' in prompt_l) and not any(p in prompt_l for p in ['divide', 'split', 'separate']):
-        is_dynamic_split = False
-
-    # If the user only asks for chapter names, do NOT split.
-    # (This prevents generic Clip N enforcement from overwriting descriptive titles.)
-    is_chapter_names_only = is_rename_requested and (not requested_chapters) and (not is_dynamic_split)
-
 
     # Build chapter-specific instruction
     chapter_instruction = ""
@@ -1154,9 +1050,6 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                     f"You MUST output {split_text}. "
                     f"Video is {total_duration}s. "
                     f"Analyze the transcript to find logical topic transitions and use those timestamps for split_time. "
-                    f"You MUST output {split_text}. DO NOT use equal time intervals. "
-                    f"Analyze the transcript segments to find logical topic shifts or shifts in discussion based on the text contents. "
-                    f"Use the [XX.Xs] timestamps in the transcript to pick precise split_time values where these topic changes occur. "
                     f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
                 )
             else:
@@ -1204,10 +1097,6 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "- split_time MUST be a Source timestamp (absolute seconds from original video start)\n"
         "- Timeline = position in the edited video (use for cut_time)\n"
         "- Transcript timestamps like [10.5s] indicate the Source time of that text.\n\n"
-        "TRIM CLIP (source seconds): {\"type\":\"trim\",\"clip_index\":N,\"start\":new_src_start,\"end\":new_src_end}\n"
-        "  'trim first 2s of clip 1' → new_src_start = old_src_start + 2\n"
-        "  'extend start of clip 2 by 5s' → new_src_start = old_src_start - 5\n"
-        "  'trim last 3s of clip 1' → new_src_end = old_src_end - 3\n\n"
         "If the user asks to 'generate chapter names' or 'name these clips', you MUST use the 'name_clips' action with descriptive titles.\n"
         "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n"
         "IMPORTANT: If renaming parts of a split clip, ALWAYS append the part number to the title (e.g., 'Intro (Part 1)', 'Main Content (Part 2)').\n\n"
@@ -1374,43 +1263,6 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 clip_label = f"clip {target_idx+1}" if target_idx != -1 else "last clip"
                 enhanced_prompt += f"\n[COMPUTED: delete {time_val}s of {clip_label} = cut_time start: {c_start}, end: {c_end}]"
 
-        # Pattern: "trim/shorten [side] of clip N by Xs"
-        trim_adj_match = _re3.search(
-            r'(?:trim|shorten|reduce|cut)\s+(?:the\s+)?(?P<side>first|start|left|last|end|right)\s*(?P<time>\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\s+(?:of|from)\s+(?:the\s+)?(?:clip\s+(?P<clip>\d+)|(?P<last>last\s+clip))',
-            enhanced_prompt, _re3.IGNORECASE
-        )
-        if trim_adj_match:
-            side = trim_adj_match.group('side').lower()
-            time_val = float(trim_adj_match.group('time'))
-            clip_num_str = trim_adj_match.group('clip')
-            is_last = trim_adj_match.group('last')
-            target_idx = -1 if is_last else (int(clip_num_str) - 1 if clip_num_str else 0)
-            if clips_with_ids and (0 <= target_idx < len(clips_with_ids) or target_idx == -1):
-                target = clips_with_ids[target_idx]
-                s_start, s_end = float(target.get('sourceStart', 0)), float(target.get('sourceEnd', 0))
-                new_start, new_end = (s_start + time_val, s_end) if side in ('first', 'start', 'left') else (s_start, s_end - time_val)
-                if new_start < new_end:
-                    enhanced_prompt += f"\n[COMPUTED: trim {side} of clip {target_idx+1 if target_idx != -1 else len(clips_with_ids)} = trim start: {new_start}, end: {new_end}]"
-
-        # Pattern: "extend/increase [side] of clip N by Xs"
-        extend_match = _re3.search(
-            r'(?:extend|increase|add)\s+(?:the\s+)?(?P<side>first|start|left|last|end|right)\s*(?P<time>\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\s+(?:of|from|to)\s+(?:the\s+)?(?:clip\s+(?P<clip>\d+)|(?P<last>last\s+clip))',
-            enhanced_prompt, _re3.IGNORECASE
-        )
-        if extend_match:
-            side = extend_match.group('side').lower()
-            time_val = float(extend_match.group('time'))
-            clip_num_str = extend_match.group('clip')
-            is_last = extend_match.group('last')
-            target_idx = -1 if is_last else (int(clip_num_str) - 1 if clip_num_str else 0)
-            if clips_with_ids and (0 <= target_idx < len(clips_with_ids) or target_idx == -1):
-                target = clips_with_ids[target_idx]
-                s_start, s_end = float(target.get('sourceStart', 0)), float(target.get('sourceEnd', 0))
-                # Move start earlier to extend left, or end later to extend right
-                new_start, new_end = (max(0, s_start - time_val), s_end) if side in ('first', 'start', 'left') else (s_start, s_end + time_val)
-                if new_start < new_end:
-                    enhanced_prompt += f"\n[COMPUTED: extend {side} of clip {target_idx+1 if target_idx != -1 else len(clips_with_ids)} = trim start: {new_start}, end: {new_end}]"
-
         # Pattern: "split clip N into M parts/equal parts"
         split_parts_match = _re3.search(
             r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
@@ -1494,7 +1346,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             raise ValueError("'actions' field is not a list")
 
         # Validate each action matches the supported types (added "delete")
-        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep", "duplicate", "trim"}
+        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep", "duplicate"}
         for action in result["actions"]:
             if action.get("type") not in valid_types:
                 raise ValueError(f"Invalid action type: {action.get('type')!r}")
@@ -2032,7 +1884,6 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
 
 @app.post("/api/videos/{session_id}/export-zip")
 async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
-    import zipfile
     import tempfile
     import httpx
     import json
@@ -2538,19 +2389,6 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
                 })
             else:
                 warnings.append(f"duplicate: clip index {idx} out of range, skipped")
-        
-        elif action_type == "trim":
-            idx = action.get("clip_index")
-            new_start = action.get("start")
-            new_end = action.get("end")
-            if idx in index_to_id:
-                operations.append({
-                    "type": "trim",
-                    "clipId": index_to_id[idx],
-                    "params": {"start": new_start, "end": new_end}
-                })
-            else:
-                warnings.append(f"trim: clip index {idx} out of range, skipped")
         
         elif action_type == "keep":
             # Keep operation (delete all others)
@@ -3059,19 +2897,6 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
             if len(current_clips) == 0:
                 warnings.append(f"keep: no clips matched keep list, operation skipped")
                 current_clips = clips  # Restore original
-        
-        elif op_type == "trim":
-            # Adjust start/end of a clip
-            for clip in current_clips:
-                if clip.get("id") == clip_id:
-                    new_s = params.get("start")
-                    new_e = params.get("end")
-                    if new_s is not None:
-                        clip["sourceStart"] = float(new_s)
-                    if new_e is not None:
-                        clip["sourceEnd"] = float(new_e)
-                    print(f"[trim] Adjusted clip {clip_id}: source={clip.get('sourceStart')}-{clip.get('sourceEnd')}")
-                    break
     
     # Apply positional renames AT THE END so they work on the post-split/merge timeline
     for op in rename_operations:
@@ -3620,9 +3445,11 @@ async def export_video_remotion(session_id: str, body: RemotionExportRequest):
         for clip in composition.get("clips", []):
             src = clip.get("src", "")
             # Ensure ANY relative /api URL becomes an absolute URL for Remotion to access
+            # Use configured backend base URL, defaulting to http://localhost:8000
+            backend_base_url = os.getenv("BACKEND_BASE_URL", "http://localhost:8000")
             if src.startswith("/api/"):
-                clip["src"] = f"http://localhost:8000{src}"
-                print(f"[{timestamp}] [export-remotion] Converted clip src: {src} → {clip['src']}")
+                clip["src"] = f"{backend_base_url}{src}"
+                print(f"[{timestamp}] [export-remotion] Converted relative clip src: {src} → {clip['src']}")
             elif src.startswith("http://") or src.startswith("https://"):
                 # Already an absolute URL, keep as-is
                 print(f"[{timestamp}] [export-remotion] Clip src already absolute: {src}")

@@ -76,6 +76,13 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   const videoPreviewRef           = useRef<HTMLVideoElement>(null);
   const audioPreviewRef           = useRef<HTMLAudioElement>(null);
 
+  const getPreviewDuration = (asset: PixabayAsset | null): number => {
+    if (!asset || asset._kind !== 'audio') return 0;
+    const raw = photoDurs[asset.id]?.trim();
+    const duration = raw ? Number(raw) : Number(asset.duration ?? 0);
+    return Number.isFinite(duration) ? Math.max(0, duration) : 0;
+  };
+
   // Single-filter state (video / photo / audio tabs)
   const [singleItems, setSingleItems] = useState<PixabayAsset[]>([]);
   const [singlePage, setSinglePage]   = useState(1);
@@ -205,9 +212,8 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     if (!audio) return;
 
     // For audio previews, we want the preview button to play with sound
-    // and stop at the specified duration.
-    const specifiedDuration = Number(preview.duration ?? 0);
-    const previewDuration = Number.isFinite(specifiedDuration) ? Math.max(0, specifiedDuration) : 0;
+    // and stop at the user-selected duration.
+    const previewDuration = getPreviewDuration(preview);
 
     let didCancel = false;
 
@@ -220,68 +226,26 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     audio.pause();
     try { audio.currentTime = 0; } catch {}
 
-    audio.muted = false;
-    audio.volume = 1;
+    const syncAudio = () => {
+      audio.muted = false;
+      audio.volume = 1;
+      if (previewDuration > 0 && audio.currentTime >= previewDuration) {
+        audio.pause();
+      }
+    };
 
-    try { audio.load(); } catch {}
+    audio.addEventListener('timeupdate', syncAudio);
 
-    audio.addEventListener('timeupdate', stopAtDuration);
-
-    // Also stop at the duration using a timeout to match the video preview's deterministic stop.
-    const timeoutId = previewDuration > 0 ? window.setTimeout(() => {
-      try { audio.pause(); } catch {}
-    }, previewDuration * 1000) : null;
-
-    audio.play().catch(() => {
-      // Autoplay may be blocked; user can press play via native controls.
+    audio.play().catch(err => {
+      console.warn('Audio preview play prevented:', err);
     });
 
     return () => {
-      if (timeoutId) window.clearTimeout(timeoutId);
       didCancel = true;
-      audio.removeEventListener('timeupdate', stopAtDuration);
-      if (didCancel) {
-        try { audio.pause(); } catch {}
-      }
+      audio.removeEventListener('timeupdate', syncAudio);
+      audio.pause();
     };
-  }, [preview]);
-
-
-  const playAudioPreview = () => {
-    const audio = audioPreviewRef.current;
-    if (!audio || preview?._kind !== 'audio') return;
-
-    const specifiedDuration = Number(preview.duration ?? 0);
-    const previewDuration = Number.isFinite(specifiedDuration) ? Math.max(0, specifiedDuration) : 0;
-
-    // Reset and play from start.
-    audio.pause();
-    try { audio.currentTime = 0; } catch {}
-
-    audio.muted = false;
-    audio.volume = 1;
-
-    // Stop exactly at the requested duration.
-    const onTimeUpdate = () => {
-      if (previewDuration > 0 && audio.currentTime >= previewDuration) {
-        audio.pause();
-        audio.removeEventListener('timeupdate', onTimeUpdate);
-      }
-    };
-
-    // Ensure we don't accumulate listeners across preview reopens.
-    audio.removeEventListener('timeupdate', onTimeUpdate);
-    audio.addEventListener('timeupdate', onTimeUpdate);
-
-    try {
-      audio.load();
-    } catch {}
-
-    audio.play().catch(() => {
-      audio.removeEventListener('timeupdate', onTimeUpdate);
-      // Native controls let the user start playback if autoplay is blocked.
-    });
-  };
+  }, [preview, photoDurs]);
 
 
   // ── Asset card renderer ────────────────────────────────────────────────────
@@ -501,15 +465,15 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
                     ref={audioPreviewRef}
                     src={audioProxy(preview.previews['preview-hq-mp3'] || preview.previews['preview-lq-mp3'] || preview.previews['preview-hq-ogg'] || preview.previews['preview-lq-ogg'])}
                     controls
-                    autoPlay
                     preload="auto"
-                    onCanPlay={playAudioPreview}
+                    muted={false}
+                    autoPlay={true}
                     onError={() => setAudioPreviewError('Audio preview could not be loaded.')}
                     style={{ width: '100%', maxWidth: '400px' }}
                   />
                   <div style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: '#aaa', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
                     <span>Duration: {Number(photoDurs[preview.id] ?? preview.duration ?? 0).toFixed(1)}s</span>
-                    <span style={{ color: '#9fc5ff' }}>Sound: Preview</span>
+                    <span style={{ color: '#9fc5ff' }}></span>
                   </div>
                   {audioPreviewError && (
 
