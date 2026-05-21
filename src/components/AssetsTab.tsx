@@ -117,7 +117,12 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   }, []);
 
   const fetchAudio = useCallback(async (q: string, pg: number): Promise<{ items: PixabayAsset[]; total: number }> => {
-    const p = new URLSearchParams({ q, page: String(pg), page_size: String(PER_PAGE) });
+    const p = new URLSearchParams({ 
+      q, 
+      page: String(pg), 
+      page_size: String(PER_PAGE),
+      fields: 'id,name,tags,duration,previews,username,images'
+    });
     const res = await fetch(`${FREESOUND_PROXY}?${p}`);
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail ?? `HTTP ${res.status}`);
     const data = await res.json();
@@ -203,49 +208,15 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     }
   };
 
+  // Keep a ref of the duration so changing it doesn't constantly unmount and pause the audio player
+  const previewDurationRef = useRef<number>(0);
+  useEffect(() => {
+    previewDurationRef.current = getPreviewDuration(preview);
+  }, [preview, photoDurs]);
 
   useEffect(() => {
     setAudioPreviewError(null);
-    if (preview?._kind !== 'audio') return;
-
-    const audio = audioPreviewRef.current;
-    if (!audio) return;
-
-    // For audio previews, we want the preview button to play with sound
-    // and stop at the user-selected duration.
-    const previewDuration = getPreviewDuration(preview);
-
-    let didCancel = false;
-
-    const stopAtDuration = () => {
-      if (previewDuration > 0 && audio.currentTime >= previewDuration) {
-        audio.pause();
-      }
-    };
-
-    audio.pause();
-    try { audio.currentTime = 0; } catch {}
-
-    const syncAudio = () => {
-      audio.muted = false;
-      audio.volume = 1;
-      if (previewDuration > 0 && audio.currentTime >= previewDuration) {
-        audio.pause();
-      }
-    };
-
-    audio.addEventListener('timeupdate', syncAudio);
-
-    audio.play().catch(err => {
-      console.warn('Audio preview play prevented:', err);
-    });
-
-    return () => {
-      didCancel = true;
-      audio.removeEventListener('timeupdate', syncAudio);
-      audio.pause();
-    };
-  }, [preview, photoDurs]);
+  }, [preview]);
 
 
   // ── Asset card renderer ────────────────────────────────────────────────────
@@ -255,8 +226,8 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const thumb   = isVid
       ? imgProxy(bestThumb(asset as PixabayVideo))
       : isAudio
-      ? imgProxy((asset as FreesoundAudio).images.waveform_m)
-      : imgProxy((asset as PixabayPhoto).previewURL || (asset as PixabayPhoto).webformatURL);
+      ? imgProxy((asset as FreesoundAudio).images?.waveform_m || '')
+      : imgProxy((asset as PixabayPhoto).previewURL || (asset as PixabayPhoto).webformatURL || '');
     const isAdded = addedIds.has(asset.id);
 
     return (
@@ -459,21 +430,37 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
                 <video ref={videoPreviewRef} src={vidProxy(bestVideoUrl(preview))} className="asset-preview-video" controls autoPlay loop />
               ) : (
                 <div style={{ padding: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', background: '#1a1a2e' }}>
-                  <img src={imgProxy(preview.images.waveform_m) || FALLBACK} alt="waveform" style={{ width: '100%', maxHeight: '150px', objectFit: 'contain', marginBottom: '2rem' }} />
-                  <audio
-                    key={preview.id}
-                    ref={audioPreviewRef}
-                    src={audioProxy(preview.previews['preview-hq-mp3'] || preview.previews['preview-lq-mp3'] || preview.previews['preview-hq-ogg'] || preview.previews['preview-lq-ogg'])}
-                    controls
-                    preload="auto"
-                    muted={false}
-                    autoPlay={true}
-                    onError={() => setAudioPreviewError('Audio preview could not be loaded.')}
-                    style={{ width: '100%', maxWidth: '400px' }}
-                  />
+                <img src={imgProxy(preview.images?.waveform_m || '') || FALLBACK} alt="waveform" style={{ width: '100%', maxHeight: '150px', objectFit: 'contain', marginBottom: '2rem' }} />
+                  {(() => {
+                    const rawAudioUrl = preview.previews?.['preview-hq-mp3'] || preview.previews?.['preview-lq-mp3'] || preview.previews?.['preview-hq-ogg'] || preview.previews?.['preview-lq-ogg'];
+                    return rawAudioUrl ? (
+                      <audio
+                        key={preview.id}
+                        ref={audioPreviewRef}
+                        src={audioProxy(rawAudioUrl)}
+                        controls
+                        preload="metadata"
+                        muted={false}
+                        autoPlay
+                        loop
+                        onError={() => setAudioPreviewError('audio unavailable')}
+                        style={{ width: '100%', maxWidth: '400px' }}
+                      />
+                    ) : null;
+                  })()}
                   <div style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: '#aaa', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
-                    <span>Duration: {Number(photoDurs[preview.id] ?? preview.duration ?? 0).toFixed(1)}s</span>
-                    <span style={{ color: '#9fc5ff' }}></span>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                      Duration (s):
+                      <input 
+                        type="number" 
+                        min="1" 
+                        max="300" 
+                        step="1"
+                        style={{ width: '60px', background: '#2a2a3e', color: '#fff', border: '1px solid #4a9eff', borderRadius: '4px', padding: '2px 6px' }}
+                        value={photoDurs[preview.id] ?? (preview as FreesoundAudio).duration ?? 5}
+                        onChange={e => setPhotoDurs(prev => ({ ...prev, [preview.id]: e.target.value }))} 
+                      />
+                    </label>
                   </div>
                   {audioPreviewError && (
 

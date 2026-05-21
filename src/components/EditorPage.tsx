@@ -39,9 +39,17 @@ function getShortName(name: string | undefined | null, fallback: string) {
 function getAssetPreviewUrl(url?: string | null, kind?: string) {
   if (!url || typeof url !== 'string') return '';
   if (url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('/api/')) return url;
-  const proxyType = kind === 'photo' || kind === 'image' ? 'proxy-image' : 'proxy-video';
+
+  const proxyType =
+    kind === 'photo' || kind === 'image'
+      ? 'proxy-image'
+      : kind === 'audio'
+        ? 'proxy-audio'
+        : 'proxy-video';
+
   return `/api/${proxyType}?url=${encodeURIComponent(url)}`;
 }
+
 
 function getAssetColor(assetKind: string) {
   const assetColors = {
@@ -905,7 +913,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       logger.error('Video sync error:', e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.sessionId, session?.timeline.length]);
+  }, [session?.sessionId]);
 
   // Auto-scroll chat to bottom when new messages arrive
   useEffect(() => {
@@ -1249,7 +1257,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       if (sortedClips.length === 0) return;
 
       const clip = sortedClips[currentClipIndexRef.current];
-      if (!clip) return;
+      if (!clip) {
+        rafId = requestAnimationFrame(rafLoop);
+        return;
+      }
 
       if (clip.assetKind === 'photo') {
         // Update currentTime during photo display so the scrubber moves
@@ -1326,6 +1337,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         video.play().catch(() => {});
       }
       
+      cancelAnimationFrame(rafId);
       rafRunning = true;
       rafId = requestAnimationFrame(rafLoop);
     };
@@ -1355,10 +1367,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const handleAssetPlay = () => {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      if (!rafRunning) {
-        rafRunning = true;
-        rafId = requestAnimationFrame(rafLoop);
-      }
+      cancelAnimationFrame(rafId);
+      rafRunning = true;
+      rafId = requestAnimationFrame(rafLoop);
     };
 
     const handleAssetPause = () => {
@@ -1694,6 +1705,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     setPhotoOpacity(0);
     setActiveAssetClip(null);
     setAssetVideoOpacity(0);
+    setMainVideoOpacity(1);
     if (av && !av.paused) av.pause();
     video.muted = false; // Unmute when showing original video
 
@@ -1704,7 +1716,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     preloadNextMedia(targetIndex);
 
     if (shouldPlayAfterJump) {
-      try { video.play().catch(() => {}); setIsPlaying(true); } catch {}
+      try { video.play().catch(() => {}); setIsPlaying(true); isPlayingRef.current = true; } catch {}
     }
   }
 
@@ -1916,9 +1928,19 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       redoStack: [],
     };
     
+    const wasPlaying = isPlayingRef.current;
+    const deleteStartTime = segmentToDelete.timelineStart ?? 0;
+
     setSession(updatedSession);
     setSelectedSegmentId(null);
     void sessionManager.saveSession(sessionId, updatedSession);
+
+    setTimeout(() => {
+       const track0 = updatedSession.timeline.filter(s => s.track === 0);
+       const totalDur = track0.reduce((sum, s) => sum + Number(s.duration || 0), 0);
+       const nextTime = Math.min(deleteStartTime, totalDur > 0 ? totalDur - 0.1 : 0);
+       void jumpToTimelineTime(nextTime, updatedSession, false, wasPlaying);
+    }, 0);
   };
 
   const handleUndo = () => {
@@ -2737,7 +2759,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   onClick={(e) => {
                     const rect = e.currentTarget.getBoundingClientRect();
                     const pctClick = (e.clientX - rect.left) / rect.width;
-                    void jumpToTimelineTime(pctClick * totalDur);
+                  void jumpToTimelineTime(pctClick * totalDur, session!, false, true);
                   }}
                 >
                   {/* Progress fill */}
@@ -2826,7 +2848,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                         const rect = container.getBoundingClientRect();
                         const clickPx = Math.max(0, Math.min(totalPx, (e.clientX - rect.left) + container.scrollLeft));
                         const clickTime = pxToTime(clickPx);
-                        void jumpToTimelineTime(clickTime);
+                        void jumpToTimelineTime(clickTime, session!, false, true);
                       }}
                       onDragOver={handleTimelineDragOver}
                       onDrop={handleTimelineDrop}
@@ -3216,15 +3238,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                           setSelectedSegmentId(clip.id);
                           setCurrentTime(clip.timelineStart ?? 0);
                           currentClipIndexRef.current = i;
-                          void jumpToTimelineTime((clip.timelineStart ?? 0) + 0.001).then(() => {
-                            const video = videoRef.current;
-                            const av = assetVideoRef.current;
-                            if (clip.assetKind === 'video' && clip.assetUrl && av) {
-                              av.play().catch(() => {});
-                            } else if (clip.assetKind !== 'photo') {
-                              video?.play().catch(() => {});
-                            }
-                          });
+                          void jumpToTimelineTime((clip.timelineStart ?? 0) + 0.001, session!, false, true);
                         }}
                       >
                         {/* Drag handle */}
@@ -3249,7 +3263,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                             className="btn btn-icon"
                             style={{ padding: '4px' }}
                             title="Jump to clip"
-                            onClick={(e) => { e.stopPropagation(); jumpToTimelineTime(clip.timelineStart ?? 0); }}
+                            onClick={(e) => { e.stopPropagation(); jumpToTimelineTime(clip.timelineStart ?? 0, session!, false, true); }}
                           >
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                               <polygon points="5 3 19 12 5 21 5 3" />
@@ -3503,7 +3517,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                       <div
                         key={i}
                         style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start', padding: '0.35rem 0.5rem', borderRadius: '5px', background: 'rgba(255,255,255,0.04)', cursor: 'pointer' }}
-                        onClick={() => void jumpToTimelineTime(seg.start)}
+                        onClick={() => void jumpToTimelineTime(seg.start, session!, false, true)}
                       >
                         <span style={{ fontSize: '0.7rem', color: '#4a9eff', minWidth: '42px', paddingTop: '2px', fontVariantNumeric: 'tabular-nums' }}>
                           {formatTime(seg.start)}
