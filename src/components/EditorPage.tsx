@@ -2763,7 +2763,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   }}
                 >
                   {/* Progress fill */}
-                  <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: '#4a9eff', borderRadius: '2px', transition: 'width 0.05s linear' }} />
+                  <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pct}%`, background: '#4a9eff', borderRadius: '2px', transition: 'none' }} />
                   {/* Thumb */}
                   <div style={{ position: 'absolute', top: '50%', left: `${pct}%`, transform: 'translate(-50%, -50%)', width: '10px', height: '10px', borderRadius: '50%', background: '#fff', boxShadow: '0 0 4px rgba(0,0,0,0.5)' }} />
                 </div>
@@ -3112,6 +3112,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                           bottom: 0,
                           zIndex: 35,
                           pointerEvents: 'auto',
+                          transition: 'none',
                         }}
                         onMouseDown={handlePlayheadMouseDown}
                       />

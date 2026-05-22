@@ -910,8 +910,6 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
     """
     import json as _json
 
-    original_transcript = None
-
     # Validate prompt
     if not body.prompt or not body.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required.")
@@ -1042,14 +1040,18 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             else:
                 name_directive = f"followed by a 'name_clips' action naming each part sequentially."
 
-            if is_content_based_split or is_dynamic_split:
+            is_explicitly_equal = "equal" in body.prompt.lower()
+
+            if is_content_based_split or is_dynamic_split or not is_explicitly_equal:
                 count_text = f"EXACTLY {requested_chapters} parts" if requested_chapters else "logical parts"
                 split_text = f"EXACTLY {splits_needed} split action(s)" if requested_chapters else "the appropriate number of split actions"
                 chapter_instruction = (
                     f"\n\nCRITICAL: User wants {count_text} based on the transcript content. "
                     f"You MUST output {split_text}. "
                     f"Video is {total_duration}s. "
-                    f"Analyze the transcript to find logical topic transitions and use those timestamps for split_time. "
+                    f"Analyze the transcript segments to find logical topic shifts or shifts in discussion based on the text contents. "
+                    f"Use the [XX.Xs] timestamps in the transcript to pick precise split_time values where these topic changes occur. "
+                    f"DO NOT use equal time intervals. "
                     f"Return ONLY a JSON object with an 'actions' array containing the split actions {name_directive}"
                 )
             else:
@@ -1091,59 +1093,48 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
                 )
 
     system_prompt = (
-        "You are an AI video editor. Convert instructions into JSON edit actions.\n\n"
-        "CLIP DATA: Each line shows Index. Title | Timeline:START-END | Source:START-END | Duration:Ds\n"
-        "- Source = timestamps in the ORIGINAL video file\n"
-        "- split_time MUST be a Source timestamp (absolute seconds from original video start)\n"
-        "- Timeline = position in the edited video (use for cut_time)\n"
-        "- Transcript timestamps like [10.5s] indicate the Source time of that text.\n\n"
-        "If the user asks to 'generate chapter names' or 'name these clips', you MUST use the 'name_clips' action with descriptive titles.\n"
-        "NAMING: After split/divide → Clip 1, Clip 2... After rename command → descriptive names.\n"
-        "IMPORTANT: If renaming parts of a split clip, ALWAYS append the part number to the title (e.g., 'Intro (Part 1)', 'Main Content (Part 2)').\n\n"
-        "SPLIT — CRITICAL EXAMPLES:\n"
-        "Clip 1: Source 0-60s\n"
-        "  'split at 10s' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
-        "  'first 10s and rest' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
-        "  'split into 2 parts where 10 sec as first half' → [{\"type\":\"split\",\"clip_index\":1,\"split_time\":10}]\n"
-        "  'split first 20s as first half and rest as second half' → [\n"
-        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
-        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"First Half (Part 1)\"},{\"index\":2,\"title\":\"Second Half (Part 2)\"}]}\n"
-        "  ]\n"
-        "  'split into 3 equal parts' → [\n"
-        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
-        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":40}\n"
-        "  ]\n"
-        "  'split into 4 parts' → split_times: 15, 30, 45\n"
-        "  FORMULA for N parts of clip with Source S-E:\n"
-        "    split_times = [round(S + (E-S)*i/N, 2) for i in 1..N-1]\n"
-        "    Use clip_index: same number for ALL splits (engine finds sub-clips by timestamp)\n\n"
-        "Clip 2: Source 30-90s\n"
-        "  'split clip 2 at 10s from start' → split_time = 30+10 = 40\n"
-        "  'split clip 2 into first 20s and rest' → split_time = 30+20 = 50\n\n"
-        "DELETE TIME RANGE (timeline seconds):\n"
-        "  'delete first 10s of clip 1' → {\"type\":\"cut_time\",\"start\":clip1_tl_start,\"end\":clip1_tl_start+10}\n"
-        "  'delete last 20s of clip 2' → {\"type\":\"cut_time\",\"start\":clip2_tl_end-20,\"end\":clip2_tl_end}\n"
-        "  'delete 10 sec of last clip' → {\"type\":\"cut_time\",\"start\":last_clip_tl_end-10,\"end\":last_clip_tl_end}\n\n"
-        "DELETE CLIP: {\"type\":\"delete\",\"clip_index\":N}\n"
-        "DUPLICATE CLIP: {\"type\":\"duplicate\",\"clip_index\":N}\n"
-        "RENAME CLIP: {\"type\":\"rename\",\"clip_index\":N,\"title\":\"New Name\"}\n"
-        "RENAME MULTIPLE (after split): {\"type\":\"name_clips\",\"clips\":[{\"index\":N,\"title\":\"Name\"}]}\n"
-        "MERGE (combine multiple clips): {\"type\":\"merge\",\"clip_indexes\":[N,M]}\n"
-        "SWAP (exchange positions): {\"type\":\"swap\",\"clip_indexes\":[N,M]}\n\n"
-        "COMBINED COMMANDS — put all actions in one actions array:\n"
-        "  'swap clip 1 and 2' → [{\"type\":\"swap\",\"clip_indexes\":[1,2]}]\n"
-        "  'merge clip 2 and 3' → [{\"type\":\"merge\",\"clip_indexes\":[2,3]}]\n"
-        "  'rename clip 1 to Intro' → [{\"type\":\"rename\",\"clip_index\":1,\"title\":\"Intro\"}]\n"
-        "  'split clip 1 at 10s and rename first part Intro' → [\n"
-        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":10},\n"
-        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"Intro\"},{\"index\":2,\"title\":\"Clip 2\"}]}\n"
-        "  ]\n"
-        "  'split into 3 parts and name them' → [\n"
-        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":T1},\n"
-        "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":T2},\n"
-        "    {\"type\":\"name_clips\",\"clips\":[{\"index\":1,\"title\":\"Part 1\"},{\"index\":2,\"title\":\"Part 2\"},{\"index\":3,\"title\":\"Part 3\"}]}\n"
-        "  ]\n\n"
-        "Return ONLY: {\"actions\":[...]}  No markdown, no explanation.\n"
+        "You are an advanced AI video editor. Convert natural language instructions into a JSON array of edit actions.\n\n"
+        "CRITICAL: Edit based on VIDEO CONTENTS (Transcript)!\n"
+        "Look at the 'Transcript:' field for each clip. The timestamps like [10.5s] show the exact SOURCE TIME of the text.\n"
+        "When a user asks to edit based on topics, content, or what is being said, you MUST use these transcript timestamps to determine the 'start' and 'end' or 'split_time'.\n\n"
+        "CLIP DATA FORMAT:\n"
+        "Index. Title | Timeline:START-END | Source:START-END | Duration:Ds | Transcript: [ts] text...\n\n"
+        "ACTION TYPES:\n"
+        "1. CUT/DELETE BY CONTENT (Source time): Removes a specific topic.\n"
+        "   {\"type\":\"cut_source\",\"start\":10.5,\"end\":25.0}\n"
+        "2. KEEP BY CONTENT (Source time): Keeps ONLY a specific topic, removes everything else.\n"
+        "   {\"type\":\"keep_source\",\"start\":30.0,\"end\":45.5}\n"
+        "3. SPLIT (Source time): Divides a clip into two at a specific topic transition.\n"
+        "   {\"type\":\"split\",\"clip_index\":1,\"split_time\":15.0}\n"
+        "4. RENAME BY POSITION: Renames a clip at a specific position (1-based index) AFTER all cuts/splits are applied.\n"
+        "   {\"type\":\"rename_by_position\",\"position\":1,\"title\":\"Intro\"}\n"
+        "5. SWAP BY POSITION: Swaps two clips by their final positions (1-based) AFTER all cuts/splits.\n"
+        "   {\"type\":\"swap_by_position\",\"positions\":[1,2]}\n"
+        "6. MERGE BY POSITION: Combines multiple clips by their final positions (1-based) AFTER all cuts/splits.\n"
+        "   {\"type\":\"merge_by_position\",\"positions\":[1,2]}\n"
+        "7. DELETE CLIP (by original index): Removes an entire original clip.\n"
+        "   {\"type\":\"delete\",\"clip_index\":2}\n\n"
+        "CHAINING OPERATIONS (ALL TOGETHER):\n"
+        "You MUST combine multiple actions when the user asks for complex edits. They are processed in this order:\n"
+        "1st: cut_source, keep_source, split, delete\n"
+        "2nd: swap_by_position, merge_by_position\n"
+        "3rd: rename_by_position\n\n"
+        "EXAMPLE - 'Delete the part about pricing, swap the intro and conclusion, and rename them':\n"
+        "[\n"
+        "  {\"type\":\"cut_source\",\"start\":45.0,\"end\":60.0},\n"
+        "  {\"type\":\"swap_by_position\",\"positions\":[1,3]},\n"
+        "  {\"type\":\"rename_by_position\",\"position\":1,\"title\":\"Conclusion\"},\n"
+        "  {\"type\":\"rename_by_position\",\"position\":3,\"title\":\"Intro\"}\n"
+        "]\n\n"
+        "EXAMPLE - 'Create chapters for Introduction, Main Topic, and Summary based on what he says':\n"
+        "[\n"
+        "  {\"type\":\"split\",\"clip_index\":1,\"split_time\":25.5},\n"
+        "  {\"type\":\"split\",\"clip_index\":1,\"split_time\":50.0},\n"
+        "  {\"type\":\"rename_by_position\",\"position\":1,\"title\":\"Introduction\"},\n"
+        "  {\"type\":\"rename_by_position\",\"position\":2,\"title\":\"Main Topic\"},\n"
+        "  {\"type\":\"rename_by_position\",\"position\":3,\"title\":\"Summary\"}\n"
+        "]\n\n"
+        "Return ONLY a JSON object: {\"actions\":[...]} No markdown, no explanation.\n"
         f"Currently {len(clips_with_ids)} clip(s). Total: {max((s.get('end',0) for s in clips_with_ids), default=0):.1f}s"
         + chapter_instruction
     )
@@ -1265,19 +1256,23 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
         # Pattern: "split clip N into M parts/equal parts"
         split_parts_match = _re3.search(
-            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
+            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?(?:parts?|clips?|chapters?|sections?)',
             enhanced_prompt, _re3.IGNORECASE
         )
         if split_parts_match and not split_at_match:
             clip_num_str = split_parts_match.group(1)
             clip_num = int(clip_num_str) if clip_num_str else 1
             n_parts  = int(split_parts_match.group(2))
+            is_equal = "equal" in split_parts_match.group(0).lower()
             if clip_num <= len(clips_with_ids) and n_parts >= 2:
-                target = clips_with_ids[clip_num - 1]
-                src_start = float(target.get('start', 0))
-                src_end   = float(target.get('end', 0))
-                split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
-                enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} parts → split_times: {split_pts}]"
+                if is_equal:
+                    target = clips_with_ids[clip_num - 1]
+                    src_start = float(target.get('start', 0))
+                    src_end   = float(target.get('end', 0))
+                    split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
+                    enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} equal parts → split_times: {split_pts}]"
+                else:
+                    enhanced_prompt += f"\n[COMPUTED: divide clip {clip_num} into {n_parts} logical parts based on transcript content (DO NOT use equal time intervals. Pick timestamps from the transcript text where the topic naturally shifts.)]"
 
         user_message_final = (
             f"Clips:\n{segments_text}\n\n"
@@ -1346,7 +1341,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             raise ValueError("'actions' field is not a list")
 
         # Validate each action matches the supported types (added "delete")
-        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep", "duplicate"}
+        valid_types = {"name_clips", "rename", "cut", "delete", "cut_time", "split", "merge", "swap", "keep", "duplicate", "trim", "cut_source", "keep_source", "swap_by_position", "merge_by_position", "rename_by_position"}
         for action in result["actions"]:
             if action.get("type") not in valid_types:
                 raise ValueError(f"Invalid action type: {action.get('type')!r}")
@@ -1457,25 +1452,23 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             print(f"[edit-with-ai] Names after enforcement: {[c['name'] for c in normalized_clips]}")
         
         # PRESERVE TRANSCRIPT: Ensure transcript data is maintained in final clips
-        # Always map transcript from original if available, never lose it
-        if original_transcript and original_transcript.get('segments'):
-            print(f"[edit-with-ai] Preserving original transcript in final clips")
-            for clip in normalized_clips:
-                # Always ensure transcript is present, even if clip already has some
+        print(f"[edit-with-ai] Preserving original transcript in final clips")
+        for clip in normalized_clips:
+            if not clip.get('text'):
                 clip_source_start = clip.get('sourceStart', clip.get('start', 0))
                 clip_source_end = clip.get('sourceEnd', clip.get('end', 0))
                 
-                # Find overlapping transcript segments from original
+                # Find overlapping transcript segments from original clips
                 overlapping_text = []
-                for orig_seg in original_transcript['segments']:
-                    orig_start = orig_seg.get('start', 0)
-                    orig_end = orig_seg.get('end', 0)
+                for orig_clip in clips_with_ids:
+                    orig_start = orig_clip.get('sourceStart', orig_clip.get('start', 0))
+                    orig_end = orig_clip.get('sourceEnd', orig_clip.get('end', 0))
+                    orig_text = orig_clip.get('text', '').strip()
                     
                     # Check if original segment overlaps with current clip
-                    if (orig_start < clip_source_end and orig_end > clip_source_start):
-                        overlapping_text.append(orig_seg.get('text', '').strip())
+                    if orig_text and (orig_start < clip_source_end and orig_end > clip_source_start):
+                        overlapping_text.append(orig_text)
                 
-                # Always set transcript from original (overwrite any existing)
                 if overlapping_text:
                     clip['text'] = ' '.join(overlapping_text)
                     print(f"[edit-with-ai] Preserved transcript for clip {clip.get('id', '?')}: {len(clip['text'])} chars")
@@ -1493,7 +1486,7 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             "clips": normalized_clips,
             "operations": operations,
             "warnings": warnings,
-            "transcript_preserved": original_transcript is not None,
+            "transcript_preserved": True,
             "requires_retranscription": False
         }
 
@@ -2407,6 +2400,40 @@ def _parse_ai_actions_to_operations(actions: list, clips: list) -> tuple[list, l
                 })
             else:
                 warnings.append(f"keep: no valid clip indexes found, keeping all clips")
+                
+        elif action_type == "cut_source":
+            operations.append({
+                "type": "cut_source",
+                "clipId": None,
+                "params": {"start": action.get("start", 0), "end": action.get("end", 0)}
+            })
+        elif action_type == "keep_source":
+            operations.append({
+                "type": "keep_source",
+                "clipId": None,
+                "params": {"start": action.get("start", 0), "end": action.get("end", 0)}
+            })
+        elif action_type == "swap_by_position":
+            operations.append({
+                "type": "swap_by_position",
+                "clipId": None,
+                "params": {"positions": action.get("positions", [])}
+            })
+        elif action_type == "merge_by_position":
+            operations.append({
+                "type": "merge_by_position",
+                "clipId": None,
+                "params": {"positions": action.get("positions", [])}
+            })
+        elif action_type == "rename_by_position":
+            pos = action.get("position")
+            title = action.get("title")
+            if pos is not None and title:
+                operations.append({
+                    "type": "rename_by_position",
+                    "clipId": None,
+                    "params": {"position": pos, "title": title}
+                })
     
     return operations, warnings
 
@@ -2419,8 +2446,9 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
     current_clips = [dict(c) for c in clips]  # Deep copy
     warnings = []
     
-    # Separate operations to run rename_by_position last
-    standard_operations = [op for op in operations if op.get("type") != "rename_by_position"]
+    # Separate operations into pipeline phases
+    standard_operations = [op for op in operations if op.get("type") not in ("rename_by_position", "swap_by_position", "merge_by_position")]
+    positional_operations = [op for op in operations if op.get("type") in ("swap_by_position", "merge_by_position")]
     rename_operations = [op for op in operations if op.get("type") == "rename_by_position"]
     
     for op in standard_operations:
@@ -2897,6 +2925,119 @@ def _apply_operations_with_validation(clips: list, operations: list) -> tuple[li
             if len(current_clips) == 0:
                 warnings.append(f"keep: no clips matched keep list, operation skipped")
                 current_clips = clips  # Restore original
+
+        elif op_type == "cut_source":
+            cut_start = params.get("start", 0)
+            cut_end = params.get("end", 0)
+            print(f"[cut_source] Deleting source range: {cut_start}s - {cut_end}s")
+            new_clips = []
+            for clip in current_clips:
+                c_start = clip.get("sourceStart", clip.get("start", 0))
+                c_end = clip.get("sourceEnd", clip.get("end", 0))
+                
+                if c_end <= cut_start or c_start >= cut_end:
+                    new_clips.append(clip)
+                elif c_start >= cut_start and c_end <= cut_end:
+                    pass # Fully deleted
+                elif c_start < cut_start and c_end > cut_end:
+                    left = dict(clip)
+                    left["id"] = f"{clip.get('id')}-a"
+                    left["sourceEnd"] = cut_start
+                    left["duration"] = cut_start - c_start
+                    if "segments" in left: del left["segments"]
+                    
+                    right = dict(clip)
+                    right["id"] = f"{clip.get('id')}-b"
+                    right["sourceStart"] = cut_end
+                    right["duration"] = c_end - cut_end
+                    if "segments" in right: del right["segments"]
+                    
+                    if left["duration"] >= 0.5: new_clips.append(left)
+                    if right["duration"] >= 0.5: new_clips.append(right)
+                elif c_start < cut_start:
+                    trimmed = dict(clip)
+                    trimmed["sourceEnd"] = cut_start
+                    trimmed["duration"] = cut_start - c_start
+                    if "segments" in trimmed: del trimmed["segments"]
+                    if trimmed["duration"] >= 0.5: new_clips.append(trimmed)
+                else:
+                    trimmed = dict(clip)
+                    trimmed["sourceStart"] = cut_end
+                    trimmed["duration"] = c_end - cut_end
+                    if "segments" in trimmed: del trimmed["segments"]
+                    if trimmed["duration"] >= 0.5: new_clips.append(trimmed)
+            current_clips = new_clips
+
+        elif op_type == "keep_source":
+            k_start = params.get("start", 0)
+            k_end = params.get("end", 0)
+            print(f"[keep_source] Keeping source range: {k_start}s - {k_end}s")
+            new_clips = []
+            for clip in current_clips:
+                c_start = clip.get("sourceStart", clip.get("start", 0))
+                c_end = clip.get("sourceEnd", clip.get("end", 0))
+                
+                i_start = max(c_start, k_start)
+                i_end = min(c_end, k_end)
+                
+                if i_start < i_end:
+                    trimmed = dict(clip)
+                    trimmed["sourceStart"] = i_start
+                    trimmed["sourceEnd"] = i_end
+                    trimmed["duration"] = i_end - i_start
+                    if "segments" in trimmed: del trimmed["segments"]
+                    if trimmed["duration"] >= 0.5: new_clips.append(trimmed)
+            current_clips = new_clips
+
+    # Process positional operations on the modified timeline order
+    if positional_operations:
+        current_clips = _normalize_timeline(current_clips)
+        for op in positional_operations:
+            t = op.get("type")
+            params = op.get("params", {})
+            positions = params.get("positions", [])
+            
+            if t == "swap_by_position" and len(positions) == 2:
+                idx1, idx2 = positions[0] - 1, positions[1] - 1
+                if 0 <= idx1 < len(current_clips) and 0 <= idx2 < len(current_clips):
+                    current_clips[idx1], current_clips[idx2] = current_clips[idx2], current_clips[idx1]
+                    print(f"[swap_by_position] Swapped position {positions[0]} with {positions[1]}")
+            
+            elif t == "merge_by_position" and len(positions) >= 2:
+                indices_to_merge = [p - 1 for p in positions if 0 <= p - 1 < len(current_clips)]
+                if len(indices_to_merge) >= 2:
+                    to_merge = [current_clips[i] for i in indices_to_merge]
+                    to_merge.sort(key=lambda x: x.get("start", 0))
+                    
+                    merged = dict(to_merge[0])
+                    merged["duration"] = sum(c.get("duration", 0) for c in to_merge)
+                    merged["segments"] = []
+                    for c in to_merge:
+                        if c.get("segments"):
+                            merged["segments"].extend(c["segments"])
+                        else:
+                            merged["segments"].append({
+                                "sourceStart": c.get("sourceStart", 0),
+                                "sourceEnd": c.get("sourceEnd", 0),
+                                "duration": c.get("duration", 0)
+                            })
+                    if "sourceStart" in merged: del merged["sourceStart"]
+                    if "sourceEnd" in merged: del merged["sourceEnd"]
+                    merged["title"] = " + ".join(c.get("title") or c.get("name") or f"Clip {i+1}" for i, c in enumerate(to_merge))
+                    
+                    new_clips = []
+                    merged_added = False
+                    for i, clip in enumerate(current_clips):
+                        if i in indices_to_merge:
+                            if not merged_added:
+                                new_clips.append(merged)
+                                merged_added = True
+                        else:
+                            new_clips.append(clip)
+                    current_clips = new_clips
+                    print(f"[merge_by_position] Merged positions {positions}")
+
+    current_clips = _normalize_timeline(current_clips)
     
     # Apply positional renames AT THE END so they work on the post-split/merge timeline
     for op in rename_operations:

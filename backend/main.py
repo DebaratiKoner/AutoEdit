@@ -1155,7 +1155,9 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             else:
                 name_directive = f"followed by a 'name_clips' action naming each part sequentially."
 
-            if is_content_based_split or is_dynamic_split:
+            is_explicitly_equal = "equal" in prompt_l
+
+            if is_content_based_split or is_dynamic_split or not is_explicitly_equal:
                 count_text = f"EXACTLY {requested_chapters} parts" if requested_chapters else "logical parts"
                 split_text = f"EXACTLY {splits_needed} split action(s)" if requested_chapters else "the appropriate number of split actions"
                 chapter_instruction = (
@@ -1233,10 +1235,10 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":20},\n"
         "    {\"type\":\"split\",\"clip_index\":1,\"split_time\":40}\n"
         "  ]\n"
-        "  'split into 4 parts' → split_times: 15, 30, 45\n"
-        "  FORMULA for N parts of clip with Source S-E:\n"
-        "    split_times = [round(S + (E-S)*i/N, 2) for i in 1..N-1]\n"
-        "    Use clip_index: same number for ALL splits (engine finds sub-clips by timestamp)\n\n"
+        "  'split into 3 parts based on topics' → Look at transcript, find 2 topic changes, e.g. T1 and T2:\n"
+        "    [{\"type\":\"split\",\"clip_index\":1,\"split_time\":T1}, {\"type\":\"split\",\"clip_index\":1,\"split_time\":T2}]\n"
+        "  CRITICAL for Splitting: DO NOT just use math/equal intervals unless explicitly asked. ALWAYS look at the transcript timestamps [Xs] and split where the topic changes!\n"
+        "  Use clip_index: same number for ALL splits on the same original clip (engine finds sub-clips by timestamp)\n\n"
         "Clip 2: Source 30-90s\n"
         "  'split clip 2 at 10s from start' → split_time = 30+10 = 40\n"
         "  'split clip 2 into first 20s and rest' → split_time = 30+20 = 50\n\n"
@@ -1422,19 +1424,23 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
         # Pattern: "split clip N into M parts/equal parts"
         split_parts_match = _re3.search(
-            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
+            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?(?:parts?|clips?|chapters?|sections?)',
             enhanced_prompt, _re3.IGNORECASE
         )
         if split_parts_match and not split_at_match:
             clip_num_str = split_parts_match.group(1)
             clip_num = int(clip_num_str) if clip_num_str else 1
             n_parts  = int(split_parts_match.group(2))
+            is_equal = "equal" in split_parts_match.group(0).lower()
             if clip_num <= len(clips_with_ids) and n_parts >= 2:
-                target = clips_with_ids[clip_num - 1]
-                src_start = float(target.get('start', 0))
-                src_end   = float(target.get('end', 0))
-                split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
-                enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} parts → split_times: {split_pts}]"
+                if is_equal:
+                    target = clips_with_ids[clip_num - 1]
+                    src_start = float(target.get('start', 0))
+                    src_end   = float(target.get('end', 0))
+                    split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
+                    enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} equal parts → split_times: {split_pts}]"
+                else:
+                    enhanced_prompt += f"\n[COMPUTED: divide clip {clip_num} into {n_parts} logical parts based on transcript content (DO NOT use equal time intervals. Pick timestamps from the transcript text where the topic naturally shifts.)]"
 
         user_message_final = (
             f"Clips:\n{segments_text}\n\n"

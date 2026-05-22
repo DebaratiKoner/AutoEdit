@@ -1,14 +1,13 @@
-# Autoedit AI TODO
+# TODO
 
-- [x] Inspect how video preview works (player/composition) and how audio preview is currently implemented.
-- [x] Identify mismatch preventing audio preview from behaving like video preview.
-- [ ] Implement fix in `src/components/AssetsTab.tsx` (audio preview play/stop syncing to preview duration, autoplay policy handling).
-- [ ] Add minimal guards to ensure audio preview resets correctly on preview change.
-- [ ] Test: open Assets modal → preview audio → verify it plays with sound, stops at chosen duration, and resets on reopen.
+## Phase 1 — Quick transcription (<20s)
+- [ ] Update backend `POST /api/videos/{session_id}/transcribe` to accept request body `{ quick?: boolean, max_seconds?: number, chunk_seconds?: number, max_chunks?: number }`.
+- [ ] Implement `quick=true` mode using smaller chunks (default 10s) and early-stop after collecting transcript coverage for `max_seconds` (default 20s).
+- [ ] Ensure endpoint remains backward compatible when called with no body.
+- [ ] Update frontend `handleTranscribe` to send `{ quick: true, max_seconds: 20 }` by default.
+- [ ] Keep existing full transcription behavior when user explicitly triggers full mode (if needed, wire a separate flag or keep a fallback).
 
-- [ ] Chapter name generation + clip rename handling for AI operations ("Done" messaging).
-  - [ ] Fix backend edit-with-ai naming enforcement so "name_clips" results persist.
-  - [ ] Ensure frontend preserves `timeline[].name` from AI and does not overwrite with placeholders.
-  - [ ] Ensure chapter names use `name_clips` action and propagate into exported titles.
-  - [ ] Add minimal tests / run manual check: rename clips + generate chapter names.
+## Phase 2 — Validate
+- [ ] Run backend lint/typecheck if available.
+- [ ] Smoke test: upload small video and click Transcribe; verify response arrives in <20s in quick mode.
 
