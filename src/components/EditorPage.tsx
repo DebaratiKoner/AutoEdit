@@ -148,6 +148,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [isAiEditing, setIsAiEditing] = useState(false);
   const [isExporting, setIsExporting] = useState<'whole' | 'clips' | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [exportMode, setExportMode] = useState<'whole' | 'selected'>('whole');
+  const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(new Set());
   const [globalVolume] = useState(1); // Global audio volume control (0-1) - only affects audio tracks
 
   const [videoVolume, setVideoVolume] = useState(1); // Video playback volume (0-1)
@@ -905,15 +907,18 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       const inValidClip = sortedClips.some(c => !c.assetUrl && t >= (c.sourceStart ?? 0) && t < (c.sourceEnd ?? 0));
       if (!inValidClip) {
         if (video.readyState > 0) {
-          video.currentTime = sortedClips[0].sourceStart ?? 0;
+          const nextClip = sortedClips.find(c => !c.assetUrl && (c.sourceStart ?? 0) > t) || sortedClips[0];
+          const wasPlaying = isPlayingRef.current;
+          void jumpToTimelineTime(nextClip.timelineStart ?? 0, session, false, wasPlaying);
+        } else {
+          setCurrentTime(sortedClips[0].timelineStart ?? 0);
         }
-        setCurrentTime(sortedClips[0].timelineStart ?? 0);
       }
     } catch (e) {
       logger.error('Video sync error:', e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.sessionId]);
+  }, [session?.timeline, session?.sessionId]);
 
   // Auto-scroll chat to bottom when new messages arrive
   useEffect(() => {
@@ -1898,21 +1903,27 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     // Remove segment and reorder (preserve custom names)
     const newTimeline = session.timeline
       .filter(seg => seg.id !== targetId)
-      .sort((a, b) => a.order - b.order);
+      .sort((a, b) => {
+        if (a.track !== b.track) return a.track - b.track;
+        return a.order - b.order;
+      });
     
     // Recalculate timeline positions → STRICTLY PRESERVE custom names
+    const track0 = newTimeline.filter(s => s.track === 0);
+    const others = newTimeline.filter(s => s.track !== 0);
     let cumulativeTime = 0;
-    const adjustedTimeline = newTimeline.map((seg, index) => {
+    const adjustedTrack0 = track0.map((seg, index) => {
       const adjusted = { 
         ...seg, 
         order: index, 
         timelineStart: cumulativeTime,
         name: preserveClipName(seg),
-        color: seg.track === 0 ? getClipColor(index) : seg.color
+        color: getClipColor(index)
       };
       cumulativeTime += Number(seg.duration || 0);
       return adjusted;
     });
+    const adjustedTimeline = [...adjustedTrack0, ...others];
     
     const updatedSession: SessionData = {
       ...session,
@@ -2402,16 +2413,48 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   // Asset management functions
 
-  const handleExport = async (mode: 'whole' | 'clips') => {
-    logger.operation(`Export started: ${mode}`);
-    setShowExportMenu(false);
+  const handleExportConfirm = async () => {
+    logger.operation(`Export started: ${exportMode}`);
 
     if (!session || session.timeline.length === 0) {
       alert("No clips to export");
       return;
     }
 
-    setIsExporting(mode);
+    let timelineToExport = session.timeline;
+    let modeToUse: 'whole' | 'clips' = 'whole';
+
+    if (exportMode === 'selected') {
+      timelineToExport = session.timeline.filter(c => selectedExportIds.has(c.id));
+      modeToUse = 'clips';
+    } else {
+      modeToUse = 'whole';
+    }
+
+    setIsExporting(modeToUse);
+
+    // Decode proxy URLs so the backend can fetch the actual asset, or make local URLs absolute
+    const decodedTimelineToExport = timelineToExport.map(clip => {
+      let url = clip.assetUrl;
+      if (url) {
+        if (url.includes('/api/proxy-')) {
+          try {
+            const urlObj = new URL(url, window.location.origin);
+            const originalUrl = urlObj.searchParams.get('url');
+            if (originalUrl) url = decodeURIComponent(originalUrl);
+          } catch (e) {
+            // ignore
+          }
+        } else if (url.startsWith('/')) {
+          try {
+            url = new URL(url, window.location.origin).toString();
+          } catch (e) {
+            // ignore
+          }
+        }
+      }
+      return { ...clip, assetUrl: url };
+    });
 
     try {
       const response = await fetch(
@@ -2422,9 +2465,11 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            timeline: session.timeline,
+            timeline: decodedTimelineToExport,
             transcriptSegments: session.transcriptSegments || [],
-            mode
+            mode: modeToUse,
+            fast: true,
+            preset: "ultrafast"
           })
         }
       );
@@ -2436,19 +2481,18 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       }
 
       const blob = await response.blob();
-      const isClipsMode = mode === 'clips';
+      const isClipsMode = modeToUse === 'clips';
       const downloadUrl = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.style.display = "none";
       a.href = downloadUrl;
-      a.download = isClipsMode ? `autoedit_clips_${sessionId.slice(0, 8)}.mp4` : `autoedit_${sessionId.slice(0, 8)}.mp4`;
       a.download = isClipsMode ? `autoedit_clips_${sessionId.slice(0, 8)}.zip` : `autoedit_${sessionId.slice(0, 8)}.mp4`;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 5000);
+      setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 60000);
 
-      logger.operation(`${mode} export downloaded`);
+      logger.operation(`${modeToUse} export downloaded`);
     } catch (err) {
       console.error(err);
       alert("Export failed");
@@ -2490,7 +2534,15 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <div className="export-menu">
               <button
                 className="btn btn-primary"
-                onClick={() => setShowExportMenu(open => !open)}
+                onClick={() => {
+                  setShowExportMenu(open => {
+                    if (!open) {
+                      setExportMode('whole');
+                      setSelectedExportIds(new Set(session?.timeline.map(c => c.id) || []));
+                    }
+                    return !open;
+                  });
+                }}
                 disabled={isExporting !== null}
                 aria-haspopup="menu"
                 aria-expanded={showExportMenu}
@@ -2499,12 +2551,55 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 <span className="export-menu-caret">v</span>
               </button>
               {showExportMenu && (
-                <div className="export-dropdown" role="menu">
-                  <button type="button" role="menuitem" onClick={() => handleExport('whole')}>
-                    Whole video
-                  </button>
-                  <button type="button" role="menuitem" onClick={() => handleExport('clips')}>
-                    Clips format
+                <div className="export-dropdown" role="menu" style={{ width: '320px', padding: '1rem', cursor: 'default' }} onClick={e => e.stopPropagation()}>
+                  <div style={{ fontWeight: 'bold', marginBottom: '10px', color: '#fff', fontSize: '1rem' }}>Export Options</div>
+                  
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '15px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                      <input type="radio" name="export_mode" checked={exportMode === 'whole'} onChange={() => setExportMode('whole')} />
+                      <span style={{ color: '#fff', fontSize: '0.9rem' }}>Download Full Video</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                      <input type="radio" name="export_mode" checked={exportMode === 'selected'} onChange={() => setExportMode('selected')} />
+                      <span style={{ color: '#fff', fontSize: '0.9rem' }}>Download Specific Clips/Assets</span>
+                    </label>
+                  </div>
+
+                  {exportMode === 'selected' && (
+                    <div style={{ maxHeight: '250px', overflowY: 'auto', background: '#111', padding: '8px', borderRadius: '6px', marginBottom: '15px', border: '1px solid #333' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
+                        <span style={{ fontSize: '0.75rem', color: '#aaa' }}>Select items to download</span>
+                        <div style={{ display: 'flex', gap: '5px' }}>
+                          <button style={{ background: 'none', border: 'none', color: '#4a9eff', fontSize: '0.75rem', cursor: 'pointer', padding: 0 }} onClick={() => setSelectedExportIds(new Set(session?.timeline.map(c => c.id) || []))}>All</button>
+                          <span style={{ color: '#555' }}>|</span>
+                          <button style={{ background: 'none', border: 'none', color: '#4a9eff', fontSize: '0.75rem', cursor: 'pointer', padding: 0 }} onClick={() => setSelectedExportIds(new Set())}>None</button>
+                        </div>
+                      </div>
+                      
+                      <div style={{ marginBottom: '12px' }}>
+                        <div style={{ fontSize: '0.7rem', color: '#888', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px', borderBottom: '1px solid #333', paddingBottom: '2px' }}>
+                          Timeline Items
+                        </div>
+                        {(session?.timeline || []).map(clip => (
+                          <label key={clip.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 2px', cursor: 'pointer' }}>
+                            <input type="checkbox" checked={selectedExportIds.has(clip.id)} onChange={(e) => {
+                              const newSet = new Set(selectedExportIds);
+                              if (e.target.checked) newSet.add(clip.id); else newSet.delete(clip.id);
+                              setSelectedExportIds(newSet);
+                            }} />
+                            <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: clip.color || '#fff' }} />
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ color: '#fff', fontSize: '0.8rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{clip.name || `Clip`}</div>
+                            </div>
+                            <div style={{ color: '#888', fontSize: '0.7rem' }}>{(clip.duration || 0).toFixed(1)}s</div>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <button className="btn btn-primary" style={{ width: '100%', padding: '0.6rem', textAlign: 'center' }} disabled={exportMode === 'selected' && selectedExportIds.size === 0} onClick={() => { setShowExportMenu(false); handleExportConfirm(); }}>
+                    Start Download
                   </button>
                 </div>
               )}
@@ -3309,9 +3404,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           )}
           {activeTab === 'assets' && session && (
             <AssetsTab onAddToTimeline={(asset, photoDuration) => {
-              const assetName = (asset as any).name || asset.tags || 'Asset';
-              const assetDuration = photoDuration || (asset._kind === 'video' ? (asset as any).duration : asset._kind === 'audio' ? (asset as any).duration : 5);
-              const isAudio = asset._kind === 'audio';
+              const assetName = (asset as any).name || (asset as any).tags || 'Asset';
+              const assetDuration = photoDuration || ((asset as any)._kind === 'video' ? (asset as any).duration : (asset as any)._kind === 'audio' ? (asset as any).duration : 5);
+              const isAudio = (asset as any)._kind === 'audio';
 
               // For audio: resolve preview URL from freesound previews
               // For video: use proxied small video URL
@@ -3320,10 +3415,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               if (isAudio) {
                 const previews = (asset as any).previews || {};
                 assetUrl = getAssetPreviewUrl(previews['preview-hq-mp3'] || previews['preview-lq-mp3'] || '', 'audio');
-              } else if (asset._kind === 'video') {
+              } else if ((asset as any)._kind === 'video') {
                 assetUrl = getAssetPreviewUrl((asset as any).videos?.small?.url || (asset as any).videos?.medium?.url || '', 'video');
               } else {
-                assetUrl = getAssetPreviewUrl((asset as any).previewURL || (asset as any).webformatURL || '', 'photo');
+                assetUrl = getAssetPreviewUrl((asset as any).largeImageURL || (asset as any).webformatURL || (asset as any).previewURL || '', 'photo');
               }
 
               if (isAudio) {
@@ -3377,7 +3472,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 id: `asset-${Date.now()}`,
                 name: assetName,
                 assetUrl,
-                assetKind: asset._kind as 'video' | 'photo',
+                assetKind: (asset as any)._kind as 'video' | 'photo',
                 duration: assetDuration,
                 timelineStart: 0,
                 sourceStart: 0,

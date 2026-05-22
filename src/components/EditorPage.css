@@ -160,7 +160,7 @@
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
 }
 
-.export-dropdown button {
+.export-dropdown .menuitem-btn {
   width: 100%;
   display: block;
   padding: 0.55rem 0.7rem;
@@ -174,7 +174,7 @@
   cursor: pointer;
 }
 
-.export-dropdown button:hover {
+.export-dropdown .menuitem-btn:hover {
   background: rgba(74, 144, 226, 0.18);
 }
 
