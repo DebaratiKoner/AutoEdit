@@ -13,7 +13,7 @@ import { SessionManager, CompositionBuilder } from '../services';
 import './EditorPage.css';
 
 const TRANSCRIBE_MAX_ATTEMPTS = 2;
-const TRANSCRIBE_REQUEST_TIMEOUT_MS = 120_000; // Reverted to 120_000 (2 minutes) for more realistic transcription timeout
+const TRANSCRIBE_REQUEST_TIMEOUT_MS = 600_000;
 const TIMELINE_MIN_PX_PER_SEC = 1.5;
 const TIMELINE_MIN_CLIP_PX = 72;
 const TIMELINE_MIN_WIDTH_PX = 200;
@@ -155,6 +155,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [videoVolume, setVideoVolume] = useState(1); // Video playback volume (0-1)
   const [aiPrompt, setAiPrompt] = useState('');
   const [chatHistory, setChatHistory] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
+  
+  const [isGeneratingShort, setIsGeneratingShort] = useState(false);
+  const [shortProgress, setShortProgress] = useState(0);
+  const [generatedShortUrl, setGeneratedShortUrl] = useState<string | null>(null);
 
   const sessionManager = new SessionManager();
 
@@ -568,24 +572,11 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     if (!session) return;
     setIsTranscribing(true);
     try {
-      // Send the actual edited timeline clips so Whisper transcribes only kept segments
-      // Timestamps are mapped back to timeline positions after transcription
-      const track0Clips = session.timeline
-        .filter(s => s.track === 0) 
-        .sort((a, b) => a.order - b.order)
-        .map(s => ({
-          start: s.sourceStart ?? 0,
-          end: s.sourceEnd ?? s.duration,
-          timelineStart: s.timelineStart ?? 0,
-          assetUrl: s.assetUrl,
-        }));
-
       const response = await fetchWithTranscribeRetry(`/api/videos/${sessionId}/transcribe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          clips: track0Clips.length > 0 ? track0Clips : null,
-          quick: false,  // full transcription — audio is compressed to tiny size so it's still fast
+          quick: false,
         })
       });
       if (!response.ok) {
@@ -594,8 +585,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       }
       const data = await response.json();
 
-      // Backend already remaps Whisper timestamps to timeline positions.
-      // Segments arrive with start/end matching the edited timeline.
+      // No clips are sent here on purpose: AI Edit should use the transcript
+      // for the entire uploaded source video, not just the current timeline.
       const latestSession = sessionRef.current || session;
       const updatedSession = {
         ...latestSession,
@@ -604,13 +595,31 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       };
       setSession(updatedSession);
       void sessionManager.saveSession(sessionId, updatedSession);
-      setChatHistory(prev => [...prev, { role: 'assistant', content: 'Transcription complete!' }]);
+      setChatHistory(prev => [...prev, { role: 'assistant', content: 'Full video transcription complete!' }]);
     } catch (e: any) {
       console.error(e);
       alert(`Failed to transcribe video: ${e.message}`);
     } finally {
       setIsTranscribing(false);
     }
+  };
+
+  const jumpToTranscriptSourceTime = (sourceTime: number) => {
+    if (!session) return;
+    const track0Clips = session.timeline
+      .filter(s => s.track === 0 && !s.assetUrl)
+      .sort((a, b) => a.order - b.order);
+    const match = track0Clips.find((seg) => {
+      const sourceStart = seg.sourceStart ?? 0;
+      const sourceEnd = seg.sourceEnd ?? (sourceStart + Number(seg.duration || 0));
+      return sourceTime >= sourceStart && sourceTime < sourceEnd;
+    });
+
+    const timelineTime = match
+      ? (match.timelineStart ?? 0) + Math.max(0, sourceTime - (match.sourceStart ?? 0))
+      : sourceTime;
+
+    void jumpToTimelineTime(timelineTime, session, false, true);
   };
 
   const handleAiEditSubmit = async (e: React.FormEvent) => {
@@ -693,21 +702,20 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             .filter(s => s.track === 0)
             .sort((a, b) => a.order - b.order)
             .map((s, i) => {
-              // Extract transcript text for this specific segment based on timeline overlap
+              // Full-video transcripts use original source timestamps, so match
+              // transcript context against each clip's source window.
               let text = '';
               let detailedTranscript = '';
               if (session.transcriptSegments) {
-                const segStart = s.timelineStart ?? 0;
-                const segEnd = segStart + s.duration;
+                const sourceStart = s.sourceStart ?? 0;
+                const sourceEnd = s.sourceEnd ?? (sourceStart + s.duration);
                 const overlappingSegs = session.transcriptSegments
-                  .filter(ts => ts.start < segEnd && ts.end > segStart);
+                  .filter(ts => ts.start < sourceEnd && ts.end > sourceStart);
                 text = overlappingSegs.map(ts => ts.text).join(' ').trim();
                 
                 // Build a detailed transcript with exact source timestamps for the AI to pick split_time from
                 detailedTranscript = overlappingSegs.map(ts => {
-                  const offset = Math.max(0, ts.start - segStart);
-                  const sourceTs = (s.sourceStart ?? 0) + offset;
-                  return `[${sourceTs.toFixed(1)}s] ${ts.text.trim()}`;
+                  return `[${Number(ts.start || 0).toFixed(1)}s] ${ts.text.trim()}`;
                 }).join(' ');
               }
               return {
@@ -1103,7 +1111,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const EPS = 0.01;
 
     let rafId = 0;
-    let rafRunning = false;
 
     const clearPhotoTimer = () => {
       if (photoTimerRef.current) { 
@@ -1242,7 +1249,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         setActiveAssetClip(null);
         setAssetVideoOpacity(0);
         setCurrentTime(0);
-        rafRunning = false;
         if (video) {
           video.pause();
           try { video.currentTime = sortedClips[0]?.sourceStart ?? 0; } catch(e) {}
@@ -1343,7 +1349,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       }
       
       cancelAnimationFrame(rafId);
-      rafRunning = true;
       rafId = requestAnimationFrame(rafLoop);
     };
 
@@ -1354,7 +1359,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       }
       setIsPlaying(false);
       isPlayingRef.current = false;
-      rafRunning = false;
       cancelAnimationFrame(rafId);
       
       const clip = sortedClips[currentClipIndexRef.current];
@@ -1373,7 +1377,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       setIsPlaying(true);
       isPlayingRef.current = true;
       cancelAnimationFrame(rafId);
-      rafRunning = true;
       rafId = requestAnimationFrame(rafLoop);
     };
 
@@ -1390,11 +1393,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     av?.addEventListener('ended', handleAssetEnded);
 
     // Always start rAF loop — it self-throttles when paused
-    rafRunning = true;
     rafId = requestAnimationFrame(rafLoop);
 
     return () => {
-      rafRunning = false;
       cancelAnimationFrame(rafId);
       clearPhotoTimer();
       video?.removeEventListener('play', handleUnifiedPlay);
@@ -2501,6 +2502,58 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
   };
 
+  const handleGenerateShort = async () => {
+    if (!session) return;
+    try {
+      setIsGeneratingShort(true);
+      setShortProgress(0);
+      setGeneratedShortUrl(null);
+
+      const response = await fetch(`/api/shorts/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: `${sessionId}.mp4`,
+          sessionId: sessionId,
+          duration: 45,
+          captionStyle: "bold_yellow_pop",
+          instruction: aiPrompt,
+          videoDuration: session.duration,
+          width: session.resolution?.width || 1080,
+          height: session.resolution?.height || 1920,
+          fps: 30
+        }),
+      });
+      const data = await response.json();
+      if (!data.jobId) throw new Error("Generation failed");
+      pollShortJob(data.jobId);
+    } catch (err) {
+      console.error(err);
+      setIsGeneratingShort(false);
+    }
+  };
+
+  const pollShortJob = (jobId: string) => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/shorts/status/${jobId}`);
+        const job = await res.json();
+        setShortProgress(job.progress || 0);
+        if (job.status === "ready") {
+          clearInterval(interval);
+          setGeneratedShortUrl(job.finalUrl);
+          setIsGeneratingShort(false);
+        } else if (job.status === "error") {
+          clearInterval(interval);
+          alert("Error: " + job.error);
+          setIsGeneratingShort(false);
+        }
+      } catch (err) {
+        console.error("Poll error", err);
+      }
+    }, 2000);
+  };
+
   const handleResetConfirm = async () => {
     if (session) {
       await sessionManager.clearSession(session.sessionId);
@@ -2530,6 +2583,13 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           <div className="header-right">
             <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
               Reset
+            </button>
+            <button 
+              className="btn btn-secondary" 
+              onClick={handleGenerateShort}
+              disabled={isGeneratingShort || isExporting !== null}
+            >
+              {isGeneratingShort ? `Generating Short... ${shortProgress}%` : 'Generate Short'}
             </button>
             <div className="export-menu">
               <button
@@ -2700,6 +2760,18 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   <video src={getAssetPreviewUrl(activeOverlayClip.assetUrl, activeOverlayClip.assetKind)} autoPlay muted loop className="video-photo-img" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
                 ) : null}
                 <div className="video-photo-label">{getShortName(activeOverlayClip.name, activeOverlayClip.assetKind === 'photo' ? 'Photo' : 'Video')}</div>
+              </div>
+            )}
+            
+            {/* Short Generation Preview Modal inside Player Area */}
+            {generatedShortUrl && (
+              <div style={{ position: 'absolute', inset: 0, zIndex: 100, backgroundColor: 'rgba(0,0,0,0.9)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '2rem' }}>
+                <h3 style={{ color: '#fff', marginBottom: '1rem' }}>Your AI Short is Ready!</h3>
+                <video controls autoPlay className="video-element" src={generatedShortUrl} style={{ maxWidth: '100%', maxHeight: '70%', borderRadius: '8px', border: '2px solid #4a9eff' }} />
+                <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
+                  <a href={generatedShortUrl} download className="btn btn-primary">Download MP4</a>
+                  <button className="btn btn-secondary" onClick={() => setGeneratedShortUrl(null)}>Close</button>
+                </div>
               </div>
             )}
             
@@ -3613,7 +3685,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                       <div
                         key={i}
                         style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start', padding: '0.35rem 0.5rem', borderRadius: '5px', background: 'rgba(255,255,255,0.04)', cursor: 'pointer' }}
-                        onClick={() => void jumpToTimelineTime(seg.start, session!, false, true)}
+                        onClick={() => jumpToTranscriptSourceTime(seg.start)}
                       >
                         <span style={{ fontSize: '0.7rem', color: '#4a9eff', minWidth: '42px', paddingTop: '2px', fontVariantNumeric: 'tabular-nums' }}>
                           {formatTime(seg.start)}

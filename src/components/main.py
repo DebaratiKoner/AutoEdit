@@ -11,14 +11,29 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding='utf-8')
 from dotenv import load_dotenv
 
+def _find_project_root_from(start_dir: str) -> str:
+    current = os.path.abspath(start_dir)
+    while True:
+        if os.path.exists(os.path.join(current, "package.json")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.path.abspath(start_dir)
+        current = parent
+
+PROJECT_ROOT_BOOTSTRAP = _find_project_root_from(os.path.dirname(__file__))
+BACKEND_DIR_BOOTSTRAP = os.path.join(PROJECT_ROOT_BOOTSTRAP, "backend")
+if os.path.isdir(BACKEND_DIR_BOOTSTRAP) and BACKEND_DIR_BOOTSTRAP not in sys.path:
+    sys.path.insert(0, BACKEND_DIR_BOOTSTRAP)
+
 # Load .env file from the backend directory FIRST before anything else
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
+load_dotenv(dotenv_path=os.path.join(BACKEND_DIR_BOOTSTRAP, '.env'))
 if not os.getenv("OPENAI_API_KEY"):
     print("[INFO] API Key not found")
 else:
     print("[INFO] API Key loaded")
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from openai import OpenAI
@@ -78,6 +93,16 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 os.makedirs("uploads", exist_ok=True)  # ensure exists via os as well
 
+def _find_project_root() -> Path:
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "package.json").exists():
+            return candidate
+    return Path.cwd()
+
+PROJECT_ROOT = _find_project_root()
+SHORTS_DIR = PROJECT_ROOT / "src" / "shorts"
+SHORTS_DIR.mkdir(parents=True, exist_ok=True)
+
 # Session → file path mapping — persisted to disk so server restarts don't lose it
 SESSION_STORE_PATH = Path("uploads/.sessions.json")
 
@@ -114,6 +139,22 @@ class PlanEditRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     clips: Optional[list] = None
     quick: Optional[bool] = False
+
+class GenerateShortRequest(BaseModel):
+    filename: Optional[str] = None
+    sessionId: Optional[str] = None
+    duration: int = 45
+    captionStyle: str = "bold_yellow_pop"
+    instruction: str = ""
+    videoDuration: Optional[float] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[int] = None
+    clipStart: Optional[float] = None
+    clipEnd: Optional[float] = None
+
+# In-memory job store for shorts generation
+shorts_jobs = {}
 
 # --- ADD THIS AFTER LINE 217 ---
 
@@ -4057,6 +4098,356 @@ async def proxy_audio(url: str, request: Request):
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to proxy audio: {str(e)}")
+
+
+# ============================================================================
+# AI SHORTS GENERATOR WORKFLOW
+# ============================================================================
+
+def _append_short_log(job_id: str, message: str) -> None:
+    job = shorts_jobs.setdefault(job_id, {})
+    job.setdefault("logs", []).append(f"[{datetime.now().isoformat(timespec='seconds')}] {message}")
+    job["logs"] = job["logs"][-200:]
+
+def _update_short_job(job_id: str, *, status: Optional[str] = None, progress: Optional[int] = None, **extra) -> None:
+    job = shorts_jobs.setdefault(job_id, {})
+    if status is not None:
+        job["status"] = status
+    if progress is not None:
+        job["progress"] = progress
+    job.update(extra)
+
+def _probe_video_duration(video_path: Path) -> float:
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path)
+        ], capture_output=True, text=True, check=True)
+        return max(0.0, float(result.stdout.strip() or 0))
+    except Exception:
+        return 0.0
+
+def _ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centis = int(round((seconds - int(seconds)) * 100))
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+def _escape_ass_text(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
+
+def _escape_filter_path(value: str) -> str:
+    return value.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+def _wrap_caption(text: str, width: int = 34) -> str:
+    import textwrap
+    cleaned = " ".join(str(text or "").split())
+    lines = textwrap.wrap(cleaned, width=width, max_lines=2, placeholder="")
+    return "\\N".join(lines) if lines else ""
+
+def _caption_style(style: str) -> tuple[str, int, int, int]:
+    if style == "minimal_bottom":
+        return "&H00FFFFFF", 48, 160, 0
+    if style == "clean_white":
+        return "&H00FFFFFF", 62, 210, 1
+    return "&H0000FFFF", 74, 235, 1
+
+def _drawtext_filter(base_vf: str, text: str, style: str) -> str:
+    cleaned = " ".join(str(text or "").split())[:140]
+    if not cleaned or style == "off":
+        return base_vf
+    escaped = (
+        cleaned
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+    )
+    if style == "minimal_bottom":
+        color, size, y_offset = "white", 46, 190
+    elif style == "clean_white":
+        color, size, y_offset = "white", 60, 260
+    else:
+        color, size, y_offset = "yellow", 70, 300
+    return (
+        f"{base_vf},drawtext=text='{escaped}':fontcolor={color}:fontsize={size}:"
+        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h-{y_offset}:"
+        "box=1:boxcolor=black@0.35:boxborderw=18"
+    )
+
+def _write_caption_ass(job_id: str, segments: list, duration: float, style: str, fallback_text: str) -> Optional[Path]:
+    if style == "off":
+        return None
+
+    primary, font_size, margin_v, bold = _caption_style(style)
+    caption_lines = []
+    usable = [s for s in segments if str(s.get("text", "")).strip()]
+
+    if not usable and fallback_text.strip():
+        usable = [{"start": 0.0, "end": max(2.5, min(duration, 6.0)), "text": fallback_text.strip()}]
+
+    for segment in usable:
+        start = max(0.0, float(segment.get("start", 0) or 0))
+        end = min(duration, float(segment.get("end", start + 3) or (start + 3)))
+        if end <= start:
+            end = min(duration, start + 3)
+        if start >= duration or end <= 0:
+            continue
+        text = _wrap_caption(str(segment.get("text", "")))
+        if not text:
+            continue
+        caption_lines.append(
+            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{_escape_ass_text(text)}"
+        )
+
+    if not caption_lines:
+        return None
+
+    ass_path = SHORTS_DIR / f"short_{job_id}_captions.ass"
+    ass_content = "\n".join([
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,Arial,{font_size},{primary},&H000000FF,&H00000000,&H99000000,{bold},0,0,0,100,100,0,0,1,5,0,2,80,80,{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        *caption_lines,
+        ""
+    ])
+    ass_path.write_text(ass_content, encoding="utf-8")
+    return ass_path
+
+def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration: float, job_id: str) -> list:
+    if not client.api_key:
+        _append_short_log(job_id, "OpenAI API key not configured; using fallback caption text.")
+        return []
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"shorts_{job_id}_") as tmp:
+            audio_path = Path(tmp) / "clip.mp3"
+            extract = subprocess.run([
+                "ffmpeg", "-y",
+                "-ss", f"{clip_start:.3f}",
+                "-i", str(video_path),
+                "-t", f"{clip_duration:.3f}",
+                "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
+                str(audio_path)
+            ], capture_output=True, text=True)
+            if extract.returncode != 0 or not audio_path.exists():
+                _append_short_log(job_id, "Could not extract audio for captions; rendering with fallback text.")
+                return []
+
+            with open(audio_path, "rb") as audio_file:
+                response = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    language="en",
+                )
+
+        raw_segments = getattr(response, "segments", None) or []
+        segments = []
+        for item in raw_segments:
+            start = float(getattr(item, "start", item.get("start", 0) if isinstance(item, dict) else 0) or 0)
+            end = float(getattr(item, "end", item.get("end", start + 3) if isinstance(item, dict) else start + 3) or start + 3)
+            text = getattr(item, "text", item.get("text", "") if isinstance(item, dict) else "")
+            if str(text).strip():
+                segments.append({"start": start, "end": end, "text": str(text).strip()})
+        return segments
+    except Exception as exc:
+        _append_short_log(job_id, f"Caption transcription failed: {str(exc)[:180]}")
+        return []
+
+def _make_short_title(hook: str, instruction: str, filename: str) -> str:
+    import re
+    words = re.findall(r"[A-Za-z0-9']+", hook or "")
+    if len(words) >= 3:
+        return " ".join(words[:7]).title()
+    if instruction.strip():
+        return f"{instruction.strip().title()} Highlight"
+    return Path(filename).stem.replace("_", " ").replace("-", " ").title() or "AI Short"
+
+def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
+    """Background task to run the AI shorts pipeline."""
+    ass_path: Optional[Path] = None
+    try:
+        actual_session = session_id or (req.sessionId if req.sessionId else str(req.filename).replace(".mp4", ""))
+        video_path = _get_video_path(actual_session)
+        source_duration = float(req.videoDuration or 0) or _probe_video_duration(video_path)
+
+        clip_start = max(0.0, float(req.clipStart or 0))
+        requested_duration = max(3.0, float(req.duration or 45))
+        if req.clipEnd is not None and float(req.clipEnd) > clip_start:
+            clip_duration = float(req.clipEnd) - clip_start
+        else:
+            clip_duration = requested_duration
+        if source_duration > 0:
+            clip_start = min(clip_start, max(0.0, source_duration - 1))
+            clip_duration = min(clip_duration, max(1.0, source_duration - clip_start))
+
+        output_filename = f"short_{job_id}.mp4"
+        output_path = SHORTS_DIR / output_filename
+
+        _update_short_job(job_id, status="transcribing", progress=12)
+        _append_short_log(job_id, f"Source resolved: {video_path.name}")
+        _append_short_log(job_id, "Transcribing selected audio for visible captions.")
+        segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
+
+        hook = next((s["text"] for s in segments if s.get("text")), "")
+        fallback_caption = hook or req.instruction.strip() or Path(req.filename or video_path.name).stem
+        title = _make_short_title(hook, req.instruction, req.filename or video_path.name)
+        reason = (
+            f"Built around your instruction: \"{req.instruction.strip()}\"."
+            if req.instruction.strip()
+            else "Selected a strong opening section from the uploaded source."
+        )
+        selected_clip = {
+            "title": title,
+            "reason": reason,
+            "hook": hook or fallback_caption,
+            "start": round(clip_start, 2),
+            "end": round(clip_start + clip_duration, 2),
+            "duration": round(clip_duration, 2),
+        }
+
+        _update_short_job(job_id, status="picking", progress=38, selectedClip=selected_clip)
+        _append_short_log(job_id, f"Selected clip: {selected_clip['start']}s to {selected_clip['end']}s.")
+
+        _update_short_job(job_id, status="captioning", progress=62)
+        ass_path = _write_caption_ass(job_id, segments, clip_duration, req.captionStyle, fallback_caption)
+        _append_short_log(job_id, "Caption layer prepared." if ass_path else "Caption layer skipped.")
+
+        _update_short_job(job_id, status="rendering", progress=82)
+        base_vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+        vf = base_vf
+        if ass_path:
+            vf = f"{base_vf},subtitles='{_escape_filter_path(str(ass_path))}'"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{clip_start:.3f}",
+            "-i", str(video_path),
+            "-t", f"{clip_duration:.3f}",
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            if ass_path:
+                _append_short_log(job_id, "Subtitle burn failed; retrying render with drawtext caption fallback.")
+                cmd[cmd.index("-vf") + 1] = _drawtext_filter(base_vf, fallback_caption, req.captionStyle)
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                cmd[cmd.index("-vf") + 1] = base_vf
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed")[-500:])
+
+        _append_short_log(job_id, "Render complete.")
+        _update_short_job(
+            job_id,
+            status="ready",
+            progress=100,
+            finalUrl=f"/api/shorts/video/{output_filename}",
+            downloadUrl=f"/api/shorts/download/{job_id}",
+            selectedClip=selected_clip,
+            target={"duration": round(clip_duration, 2), "width": 1080, "height": 1920, "aspect": "9:16"},
+        )
+    except Exception as e:
+        _append_short_log(job_id, f"ERROR: {str(e)}")
+        _update_short_job(job_id, status="error", progress=100, error=str(e))
+    finally:
+        if ass_path:
+            try:
+                ass_path.unlink()
+            except Exception:
+                pass
+
+def _short_file_response(filename: str, *, download: bool) -> FileResponse:
+    safe_name = Path(filename).name
+    if safe_name != filename or not safe_name.startswith("short_") or not safe_name.endswith(".mp4"):
+        raise HTTPException(status_code=400, detail="Invalid short filename")
+
+    path = SHORTS_DIR / safe_name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    kwargs = {"media_type": "video/mp4"}
+    if download:
+        kwargs["filename"] = safe_name
+    return FileResponse(path, **kwargs)
+
+def _short_filename(short_ref: str) -> str:
+    return short_ref if short_ref.startswith("short_") and short_ref.endswith(".mp4") else f"short_{short_ref}.mp4"
+
+@app.post("/api/videos/shorts/generate")
+async def generate_short(background_tasks: BackgroundTasks, req: GenerateShortRequest):
+    job_id = str(uuid.uuid4())
+    shorts_jobs[job_id] = {
+        "jobId": job_id,
+        "status": "queued",
+        "progress": 0,
+        "logs": [],
+        "source": {
+            "filename": req.filename,
+            "duration": req.videoDuration,
+            "width": req.width,
+            "height": req.height,
+            "fps": req.fps,
+        },
+        "target": {
+            "duration": req.duration,
+            "width": 1080,
+            "height": 1920,
+            "aspect": "9:16",
+        },
+    }
+    _append_short_log(job_id, "Queued shorts render.")
+    background_tasks.add_task(process_short_job, job_id, req.sessionId or "", req)
+    return {"success": True, "jobId": job_id}
+
+@app.post("/api/shorts/generate")
+async def generate_short_alias(background_tasks: BackgroundTasks, req: GenerateShortRequest):
+    return await generate_short(background_tasks, req)
+
+@app.get("/api/videos/shorts/status/{job_id}")
+async def short_status(job_id: str):
+    if job_id not in shorts_jobs:
+        raise HTTPException(404, "Job not found")
+    return shorts_jobs[job_id]
+
+@app.get("/api/shorts/status/{job_id}")
+async def short_status_alias(job_id: str):
+    return await short_status(job_id)
+
+@app.get("/api/videos/shorts/download/{job_id}")
+async def short_download(job_id: str):
+    return _short_file_response(_short_filename(job_id), download=True)
+
+@app.get("/api/shorts/download/{job_id}")
+async def short_download_alias(job_id: str):
+    return await short_download(job_id)
+
+@app.get("/api/videos/shorts/video/{filename}")
+async def short_video(filename: str):
+    return _short_file_response(filename, download=False)
+
+@app.get("/api/shorts/video/{filename}")
+async def short_video_alias(filename: str):
+    return _short_file_response(filename, download=False)
 
 
 if __name__ == "__main__":

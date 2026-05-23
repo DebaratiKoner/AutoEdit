@@ -4,6 +4,7 @@
  */
 
 import { useState, useRef, DragEvent, ChangeEvent } from 'react';
+import { Link } from 'react-router-dom';
 import { FileValidator, APIClient } from '../services';
 import { logger } from '../utils';
 import './UploadPage.css';
@@ -187,6 +188,41 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
           onChange={handleFileSelect}
           style={{ display: 'none' }}
         />
+
+        <div style={{ marginTop: '3rem', width: '100%', display: 'flex', justifyContent: 'center' }}>
+          <div style={{
+            background: 'rgba(30, 30, 46, 0.6)',
+            border: '1px solid #2a2a3e',
+            borderRadius: '12px',
+            padding: '1.5rem',
+            maxWidth: '600px',
+            width: '100%',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '1rem'
+          }}>
+            <div style={{ textAlign: 'left' }}>
+              <h3 style={{ margin: '0 0 0.25rem 0', color: '#fff', fontSize: '1.1rem' }}>Create AI Shorts</h3>
+              <p style={{ margin: 0, color: '#aaa', fontSize: '0.85rem' }}>Turn long videos into 9:16 vertical shorts with auto-captions.</p>
+            </div>
+            <Link
+              to="/shorts"
+              style={{
+                background: 'linear-gradient(135deg, #0ea5e9, #10b981)',
+                color: '#fff',
+                textDecoration: 'none',
+                padding: '0.6rem 1.2rem',
+                borderRadius: '8px',
+                fontWeight: 600,
+                fontSize: '0.9rem',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              Try Shorts &rarr;
+            </Link>
+          </div>
+        </div>
       </main>
     </div>
   );

@@ -5,6 +5,8 @@
 
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { UploadPage, EditorPage, ErrorBoundary } from './components';
+import ShortsPage from './shorts/ShortsPage';
+
 
 function AppRoutes() {
   const navigate = useNavigate();
@@ -26,6 +28,8 @@ function AppRoutes() {
           <EditorPageWrapper onReset={handleReset} />
         }
       />
+      
+      <Route path="/shorts" element={<ShortsPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
