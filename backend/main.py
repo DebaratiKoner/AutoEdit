@@ -138,6 +138,7 @@ class GenerateShortRequest(BaseModel):
     fps: Optional[int] = None
     clipStart: Optional[float] = None
     clipEnd: Optional[float] = None
+    transcriptSegments: Optional[list] = None
 
 # In-memory job store for shorts generation
 shorts_jobs = {}
@@ -1201,7 +1202,9 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
             else:
                 name_directive = f"followed by a 'name_clips' action naming each part sequentially."
 
-            if is_content_based_split or is_dynamic_split:
+            is_explicitly_equal = "equal" in body.prompt.lower()
+
+            if is_content_based_split or is_dynamic_split or not is_explicitly_equal:
                 count_text = f"EXACTLY {requested_chapters} parts" if requested_chapters else "logical parts"
                 split_text = f"EXACTLY {splits_needed} split action(s)" if requested_chapters else "the appropriate number of split actions"
                 chapter_instruction = (
@@ -1281,6 +1284,9 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
         "  ]\n"
         "  'split into 4 parts' → split_times: 15, 30, 45\n"
         "  FORMULA for N parts of clip with Source S-E:\n"
+        "  'split into 4 parts' → use transcript content to find 3 logical split_times where the topic naturally transitions.\n"
+        "  'divide into chapters' → find logical split points in the transcript text.\n"
+        "  FORMULA for N EQUAL parts of clip with Source S-E (ONLY if 'equal' is explicitly requested):\n"
         "    split_times = [round(S + (E-S)*i/N, 2) for i in 1..N-1]\n"
         "    Use clip_index: same number for ALL splits (engine finds sub-clips by timestamp)\n\n"
         "Clip 2: Source 30-90s\n"
@@ -1468,19 +1474,28 @@ async def edit_with_ai(session_id: str, body: EditWithAIRequest):
 
         # Pattern: "split clip N into M parts/equal parts"
         split_parts_match = _re3.search(
-            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?parts?',
+            r'(?:split(?:ting)?|divide|dividing|cut(?:ting)?)(?:\s+(?:the\s+)?(?:clip|part|video)\s+(\d+))?\s+into\s+(\d+)\s+(?:equal\s+)?(?:parts?|clips?|chapters?|sections?)',
             enhanced_prompt, _re3.IGNORECASE
         )
         if split_parts_match and not split_at_match:
             clip_num_str = split_parts_match.group(1)
             clip_num = int(clip_num_str) if clip_num_str else 1
             n_parts  = int(split_parts_match.group(2))
+            is_equal = "equal" in split_parts_match.group(0).lower()
             if clip_num <= len(clips_with_ids) and n_parts >= 2:
                 target = clips_with_ids[clip_num - 1]
                 src_start = float(target.get('start', 0))
                 src_end   = float(target.get('end', 0))
                 split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
                 enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} parts → split_times: {split_pts}]"
+                if is_equal:
+                    target = clips_with_ids[clip_num - 1]
+                    src_start = float(target.get('start', 0))
+                    src_end   = float(target.get('end', 0))
+                    split_pts = [round(src_start + (src_end - src_start) * i / n_parts, 2) for i in range(1, n_parts)]
+                    enhanced_prompt += f"\n[COMPUTED: split clip {clip_num} into {n_parts} equal parts → split_times: {split_pts}]"
+                else:
+                    enhanced_prompt += f"\n[COMPUTED: divide clip {clip_num} into {n_parts} logical parts based on transcript content (DO NOT use equal time intervals. Pick timestamps from the transcript text where the topic naturally shifts.)]"
 
         user_message_final = (
             f"Clips:\n{segments_text}\n\n"
@@ -4575,20 +4590,87 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
         video_path = _get_video_path(actual_session)
         source_duration = float(req.videoDuration or 0) or _probe_video_duration(video_path)
 
-        clip_start = max(0.0, float(req.clipStart or 0))
         requested_duration = max(3.0, float(req.duration or 45))
-        if req.clipEnd is not None and float(req.clipEnd) > clip_start:
+        manual_clip = (
+            req.clipStart is not None
+            and req.clipEnd is not None
+            and float(req.clipEnd) > float(req.clipStart)
+        )
+        clip_start = max(0.0, float(req.clipStart or 0)) if manual_clip else 0.0
+        ai_selected_clip = False
+        
+        # --- AI ANALYSIS FOR CLIP SELECTION ---
+        instruction_text = req.instruction.strip() if req.instruction and req.instruction.strip() else "Find the most engaging, viral, and interesting segment suitable for a short-form video."
+        if client.api_key and not manual_clip:
+            if not req.transcriptSegments:
+                _update_short_job(job_id, status="transcribing", progress=5)
+                _append_short_log(job_id, "No transcript provided. Transcribing full video for content analysis...")
+                # To avoid Whisper limit, cap at 45 minutes for analysis
+                analysis_duration = min(source_duration, 2700) 
+                req.transcriptSegments = _transcribe_clip_segments(video_path, 0, analysis_duration, job_id)
+
+            if req.transcriptSegments:
+                _update_short_job(job_id, status="picking", progress=15)
+                _append_short_log(job_id, f"Analyzing video content to select the best segment. Instruction: '{instruction_text}'...")
+                try:
+                    import json as _json
+                    import re as _re_json
+                    seg_text = "\n".join([f"[{s.get('start', 0)}s - {s.get('end', 0)}s] {s.get('text', '')}" for s in req.transcriptSegments[:1000]])
+                    
+                    prompt = (
+                        f"You are an AI video editor. The user has provided a STRICT instruction for this short: '{instruction_text}'.\n"
+                        f"You MUST review the transcript segments below and select the continuous part of the video that BEST matches this instruction.\n"
+                        f"The requested duration is EXACTLY {requested_duration} seconds.\n"
+                        f"The source video duration is {source_duration:.2f} seconds.\n"
+                        f"Selection nonce: {job_id}. If there are multiple strong matches, use this nonce to choose a fresh matching moment instead of always choosing the same segment.\n"
+                        f"Do not choose a segment merely because it appears first. Prioritize instruction match, hook strength, and self-contained meaning.\n"
+                        f"Return ONLY valid JSON with 'start' and 'end' keys (numbers in seconds). Example: {{\"start\": 12.5, \"end\": {12.5 + requested_duration}}}\n\n"
+                        f"Transcript:\n{seg_text}"
+                    )
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.7,
+                        response_format={"type": "json_object"}
+                    )
+                    raw = resp.choices[0].message.content.strip()
+                    
+                    json_match = _re_json.search(r'```(?:json)?\s*(.*?)\s*```', raw, _re_json.DOTALL)
+                    if json_match:
+                        raw = json_match.group(1).strip()
+                    else:
+                        start_obj = raw.find('{')
+                        end_obj = raw.rfind('}')
+                        if start_obj != -1 and end_obj != -1:
+                            raw = raw[start_obj:end_obj+1]
+                            
+                    ans = _json.loads(raw)
+                    if "start" in ans and "end" in ans:
+                        clip_start = float(ans["start"])
+                        
+                        req.clipEnd = clip_start + requested_duration
+                        ai_selected_clip = True
+                        _append_short_log(job_id, f"AI selected segment based on instruction: {clip_start}s to {req.clipEnd}s (Duration enforced: {requested_duration}s)")
+                except Exception as e:
+                    _append_short_log(job_id, f"AI analysis failed, falling back to default start: {e}")
+        # ----------------------------------------
+
+        if manual_clip:
             clip_duration = float(req.clipEnd) - clip_start
         else:
             clip_duration = requested_duration
         if source_duration > 0:
-            clip_start = min(clip_start, max(0.0, source_duration - 1))
-            clip_duration = min(clip_duration, max(1.0, source_duration - clip_start))
+            if not manual_clip and not ai_selected_clip and source_duration > clip_duration:
+                import random
+                clip_start = random.uniform(0.0, max(0.0, source_duration - clip_duration))
+                _append_short_log(job_id, f"No AI clip selection available; using a fresh fallback window at {clip_start:.2f}s.")
+            clip_duration = min(clip_duration, max(1.0, source_duration))
+            clip_start = min(max(0.0, clip_start), max(0.0, source_duration - clip_duration))
 
         output_filename = f"short_{job_id}.mp4"
         output_path = SHORTS_DIR / output_filename
 
-        _update_short_job(job_id, status="transcribing", progress=12)
+        _update_short_job(job_id, status="captioning", progress=25)
         _append_short_log(job_id, f"Source resolved: {video_path.name}")
         _append_short_log(job_id, "Transcribing selected audio for visible captions.")
         segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
@@ -4610,10 +4692,9 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
             "duration": round(clip_duration, 2),
         }
 
-        _update_short_job(job_id, status="picking", progress=38, selectedClip=selected_clip)
+        _update_short_job(job_id, status="captioning", progress=50, selectedClip=selected_clip)
         _append_short_log(job_id, f"Selected clip: {selected_clip['start']}s to {selected_clip['end']}s.")
 
-        _update_short_job(job_id, status="captioning", progress=62)
         ass_path = _write_caption_ass(job_id, segments, clip_duration, req.captionStyle, fallback_caption)
         _append_short_log(job_id, "Caption layer prepared." if ass_path else "Caption layer skipped.")
 

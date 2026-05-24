@@ -21,12 +21,23 @@ export interface TranscriptSegment {
   text: string;
 }
 
-export interface ShortsClipPick {
+export interface DynamicClipSegment {
   start: number;
   end: number;
+  purpose: "hook" | "build" | "payoff";
+  emotion: string;
+  score: number;
+}
+
+export interface ShortsClipPick {
   title: string;
-  reason: string;
   hook: string;
+  reason?: string;
+  start: number;
+  end: number;
+  duration?: number;
+  editingStyle?: string;
+  clips?: DynamicClipSegment[];
 }
 
 export interface ShortsSourceVideo {

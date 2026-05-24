@@ -50,7 +50,6 @@ interface ShortsJobStatus {
 const GENERATION_STEPS = [
   "Transcribing audio",
   "Finding best clip",
-  "Tracking faces",
   "Building captions",
   "Rendering video",
   "Ready",
@@ -72,16 +71,15 @@ function cacheBust(url: string): string {
 }
 
 function stepFromJob(job: ShortsJobStatus): number {
-  if (job.status === "ready") return 5;
-  if (job.status === "rendering") return 4;
-  if (job.status === "captioning") return 3;
+  if (job.status === "ready") return 4;
+  if (job.status === "rendering") return 3;
+  if (job.status === "captioning") return 2;
   if (job.status === "picking") return 1;
   if (job.status === "transcribing") return 0;
 
   const progress = Number(job.progress || 0);
-  if (progress >= 100) return 5;
-  if (progress >= 80) return 4;
-  if (progress >= 62) return 3;
+  if (progress >= 100) return 4;
+  if (progress >= 80) return 3;
   if (progress >= 50) return 2;
   if (progress >= 20) return 1;
   return 0;
@@ -132,7 +130,7 @@ export default function ShortsPage() {
   }, []);
 
   useEffect(() => {
-    if (currentStep === 5 && shortVideoUrl && videoRef.current) {
+    if (currentStep === 4 && shortVideoUrl && videoRef.current) {
       videoRef.current.currentTime = 0;
       videoRef.current.play().catch(() => {});
     }
@@ -163,9 +161,6 @@ export default function ShortsPage() {
     setShortId("Initializing...");
     setLogs([`[${new Date().toISOString()}] Pipeline start. Requesting backend generation...`]);
 
-    const clipStart = selectedClip?.start;
-    const clipEnd = selectedClip ? selectedClip.start + duration : undefined;
-
     try {
       const generateRes = await fetch("/api/shorts/generate", {
         method: "POST",
@@ -180,8 +175,6 @@ export default function ShortsPage() {
           width: source.width,
           height: source.height,
           fps: source.fps,
-          clipStart,
-          clipEnd,
         }),
       });
 
@@ -208,7 +201,7 @@ export default function ShortsPage() {
           if (job.status === "ready") {
             if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
             pollTimerRef.current = null;
-            setCurrentStep(5);
+            setCurrentStep(4);
             setVideoLoading(true);
             setShortVideoUrl(job.finalUrl ? cacheBust(job.finalUrl) : null);
             setShortDownloadUrl(job.downloadUrl || job.finalUrl || null);
@@ -285,7 +278,7 @@ export default function ShortsPage() {
     if (file) void handleFileUpload(file);
   }
 
-  const title = selectedClip?.title || (currentStep === 5 ? "Your AI short is ready" : "Building your short");
+  const title = selectedClip?.title || (currentStep === 4 ? "Your AI short is ready" : "Building your short");
   const reason =
     selectedClip?.reason ||
     "The pipeline is preparing a vertical short, caption layer, and downloadable MP4 from your uploaded source.";
@@ -298,7 +291,6 @@ export default function ShortsPage() {
           {isGenerating ? "< New short" : "AutoEdit - Shorts Creator"}
         </button>
         <div style={{ display: "flex", alignItems: "center", gap: "1rem", color: "#aaa", fontSize: "0.86rem" }}>
-          {isGenerating && <span style={{ fontFamily: "monospace" }}>{shortId}</span>}
           <Link to="/" style={{ textDecoration: "none", color: "#ddd" }}>AI Editor</Link>
         </div>
       </header>
@@ -308,7 +300,7 @@ export default function ShortsPage() {
           <section style={{ width: "100%", maxWidth: "1180px", margin: "0 auto", display: "grid", gridTemplateColumns: "minmax(280px, 360px) minmax(0, 1fr)", gap: "1.5rem", alignItems: "start" }}>
             <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
               <div style={{ position: "relative", width: "100%", aspectRatio: "9/16", overflow: "hidden", borderRadius: "8px", border: "1px solid #383a40", background: "#090a0c", boxShadow: "0 16px 40px rgba(0,0,0,0.4)" }}>
-                {currentStep === 5 && shortVideoUrl ? (
+                {currentStep === 4 && shortVideoUrl ? (
                   <>
                     <video
                       key={shortVideoUrl}
@@ -341,7 +333,7 @@ export default function ShortsPage() {
                 )}
               </div>
 
-              {currentStep === 5 && (
+              {currentStep === 4 && (
                 <a href={shortDownloadUrl || shortVideoUrl || source.url} download={`Short_${shortId}.mp4`} style={{ display: "block", textAlign: "center", padding: "0.9rem", borderRadius: "8px", background: "#4a9eff", color: "#fff", textDecoration: "none", fontWeight: 700 }}>
                   Download Short
                 </a>
@@ -357,7 +349,7 @@ export default function ShortsPage() {
               <div style={panelStyle}>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(0, 1fr))", gap: "0.65rem" }}>
                   {GENERATION_STEPS.map((step, i) => {
-                    const isReadyStep = currentStep === 5 && i === 5;
+                    const isReadyStep = currentStep === 4 && i === 4;
                     const isCompleted = currentStep > i || isReadyStep;
                     const isActive = currentStep === i && !isReadyStep;
                     return (
@@ -409,7 +401,7 @@ export default function ShortsPage() {
                 </div>
               </div>
 
-              {currentStep === 5 && (
+              {currentStep === 4 && (
                 <div style={panelStyle}>
                   <div style={{ color: "#8d929c", fontSize: "0.76rem", textTransform: "uppercase", marginBottom: "0.8rem" }}>Fine-tune trim & re-render</div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 170px 170px", gap: "0.8rem", alignItems: "end" }}>

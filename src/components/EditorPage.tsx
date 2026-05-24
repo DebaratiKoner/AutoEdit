@@ -138,7 +138,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [resizeInitialX, setResizeInitialX] = useState<number>(0);
   const [resizeInitialStart, setResizeInitialStart] = useState<number>(0);
   const [resizeInitialDuration, setResizeInitialDuration] = useState<number>(0);
-  const [, setDragOffset] = useState<number>(0);
   const [isUploadingAsset, setIsUploadingAsset] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const insertAfterClipIdRef = useRef<string | null>(null);
@@ -595,7 +594,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       };
       setSession(updatedSession);
       void sessionManager.saveSession(sessionId, updatedSession);
-      setChatHistory(prev => [...prev, { role: 'assistant', content: 'Full video transcription complete!' }]);
+      setChatHistory(prev => [...prev, { role: 'assistant', content: 'Transcription complete!' }]);
     } catch (e: any) {
       console.error(e);
       alert(`Failed to transcribe video: ${e.message}`);
@@ -2032,22 +2031,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     setDraggedSegmentId(segmentId);
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', segmentId);
-
-    // Compute mouse offset inside clip for smooth dragging drop
-    if (timelineRef.current && session) {
-      const rect = timelineRef.current.getBoundingClientRect();
-      const mouseX = (e.clientX - rect.left) + (timelineRef.current.scrollLeft ?? 0);
-      
-      const { pxToTime, totalPx } = getTimePxMapping(session.timeline);
-      
-      const timeAtCursor = pxToTime(Math.max(0, Math.min(totalPx, mouseX)));
-      const segment = session.timeline.find(s => s.id === segmentId);
-      if (segment && segment.track >= 1) {
-        setDragOffset(timeAtCursor - (segment.timelineStart ?? 0));
-      } else {
-        setDragOffset(0);
-      }
-    }
   };
 
   const handleSegmentDragEnd = () => {
@@ -2521,7 +2504,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           videoDuration: session.duration,
           width: session.resolution?.width || 1080,
           height: session.resolution?.height || 1920,
-          fps: 30
+          fps: 30,
+          transcriptSegments: session.transcriptSegments || []
         }),
       });
       const data = await response.json();

@@ -34,7 +34,7 @@ async function chatJSON(system: string, user: string): Promise<string> {
           { role: "system", content: system },
           { role: "user", content: user },
         ],
-        temperature: 0.3,
+        temperature: 0.7,
         response_format: { type: "json_object" },
       }),
     });
@@ -55,7 +55,7 @@ async function chatJSON(system: string, user: string): Promise<string> {
   throw new Error("Clip picker: max retries exceeded");
 }
 
-export async function pickBestClip(params: {
+export async function planDynamicShort(params: {
   segments: TranscriptSegment[];
   sourceDuration: number;
   targetDuration: number;
@@ -67,35 +67,64 @@ export async function pickBestClip(params: {
     .map((s) => `[${s.start.toFixed(1)}s - ${s.end.toFixed(1)}s] ${s.text}`)
     .join("\n");
 
-  const minDur = Math.max(10, Math.round(targetDuration * 0.7));
-  const maxDur = Math.min(90, Math.round(targetDuration * 1.3));
+  const system = `
+You are an elite viral short-form video editor.
 
-  const system = `You are a short-form video editor. Given a transcript of a longer video, you find the single BEST self-contained clip to turn into a viral 9:16 short. You always respond with valid JSON only.`;
+Your job is to:
+- analyze the transcript
+- obey the user instruction
+- create the MOST engaging short possible
+- dynamically adapt pacing based on requested duration
 
+RULES:
+
+SHORT DURATION STRATEGY:
+- 10-20 sec → aggressive hook only
+- 20-40 sec → hook + buildup + payoff
+- 40-60 sec → mini story arc
+- 60+ sec → full narrative with emotional pacing
+
+INSTRUCTION PRIORITY:
+- funny → fast pacing, reactions, punchlines
+- educational → clarity, concise value
+- motivational → emotional/high-energy moments
+- storytelling → suspense + payoff
+- podcast → insightful conversational moments
+
+You MUST:
+- remove boring parts
+- avoid filler
+- prioritize retention
+- prioritize curiosity
+- prioritize emotional spikes
+
+Return JSON only.
+`;
   const instructionBlock = instruction?.trim()
-    ? `USER INSTRUCTION (obey this above all else if compatible):\n"${instruction.trim()}"\n`
-    : `USER INSTRUCTION: (none — pick whatever will perform best as a standalone short)\n`;
+    ? `USER INSTRUCTION (STRICT - YOU MUST OBEY THIS):\n"${instruction.trim()}"\n`
+    : `USER INSTRUCTION: (Find the most engaging, viral, and interesting segment suitable for a short-form video.)\n`;
 
   const user = `TRANSCRIPT (with timestamps in seconds):
 ${transcript}
 
 TOTAL VIDEO DURATION: ${sourceDuration.toFixed(1)}s
-TARGET SHORT DURATION: ~${targetDuration}s (acceptable range ${minDur}s–${maxDur}s)
+TARGET SHORT DURATION: EXACTLY ${targetDuration}s
+SELECTION NONCE: ${Date.now()}-${Math.random().toString(36).slice(2)}
 ${instructionBlock}
 
 SELECTION RULES:
-1. Pick ONE continuous range [start, end] from the transcript timestamps above. Do NOT invent times outside these ranges.
+1. Pick ONE continuous range [start, end] from the transcript timestamps above that BEST matches the user instruction.
 2. The clip must be self-contained: it should make sense on its own with no prior context.
 3. Must have a strong hook in the first 3 seconds.
-4. Must feel complete — avoid cutting off mid-thought. Align start/end to sentence boundaries from the transcript.
-5. Duration must be between ${minDur}s and ${maxDur}s.
-6. If a user instruction is provided, prioritize clips matching that instruction/topic.
-7. Prefer clips with: concrete insights, surprising claims, emotional peaks, actionable advice, punchy delivery, humor, or strong stories. Avoid intros, outros, filler, and logistics talk.
+4. The total duration (end - start) MUST be EXACTLY ${targetDuration} seconds.
+5. If a user instruction is provided, prioritize clips matching that instruction/topic above all else.
+6. Prefer clips with: concrete insights, surprising claims, emotional peaks, actionable advice.
+7. If multiple clips match, use the selection nonce to choose a fresh matching option instead of always choosing the earliest/default segment.
 
 Respond with JSON ONLY:
 {
   "start": 12.4,
-  "end": 67.8,
+  "end": ${12.4 + targetDuration},
   "title": "5-6 word catchy title",
   "hook": "first line (1 sentence) of the clip — what will grab viewers",
   "reason": "1-2 sentences on why this clip"
@@ -109,12 +138,9 @@ Respond with JSON ONLY:
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
     throw new Error("Clip picker returned invalid start/end");
   }
-  start = Math.max(0, start);
-  end = Math.min(sourceDuration, end);
-  const dur = end - start;
-  if (dur < 5) {
-    throw new Error(`Clip picker chose a too-short clip (${dur.toFixed(1)}s)`);
-  }
+  const clipDuration = Math.min(targetDuration, sourceDuration);
+  start = Math.min(Math.max(0, start), Math.max(0, sourceDuration - clipDuration));
+  end = start + clipDuration;
 
   return {
     start,
@@ -124,6 +150,8 @@ Respond with JSON ONLY:
     reason: String(parsed.reason || "").slice(0, 300),
   };
 }
+
+export const pickBestClip = planDynamicShort;
 
 export function wordsInRange(
   words: TranscriptWord[],
