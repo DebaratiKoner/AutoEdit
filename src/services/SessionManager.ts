@@ -50,6 +50,13 @@ export class SessionManager {
    */
   async saveSession(sessionId: string, data: SessionData): Promise<void> {
     try {
+      const key = `${STORAGE_PREFIX}${sessionId}`;
+      localStorage.setItem(key, JSON.stringify(data));
+    } catch (storageError) {
+      console.warn('localStorage hot-cache save failed:', storageError);
+    }
+
+    try {
       // Try IndexedDB first
       const db = await this.initDB();
       const transaction = db.transaction([STORE_NAME], 'readwrite');
@@ -82,6 +89,16 @@ export class SessionManager {
    */
   async loadSession(sessionId: string): Promise<SessionData | null> {
     try {
+      const key = `${STORAGE_PREFIX}${sessionId}`;
+      const stored = localStorage.getItem(key);
+      if (stored != null) {
+        return JSON.parse(stored);
+      }
+    } catch (error) {
+      console.warn('localStorage hot-cache load failed, trying IndexedDB:', error);
+    }
+
+    try {
       // Try IndexedDB first
       const db = await this.initDB();
         const transaction = db.transaction([STORE_NAME], 'readonly');
@@ -99,18 +116,6 @@ export class SessionManager {
       }
     } catch (error) {
       console.warn('IndexedDB load failed, trying localStorage:', error);
-    }
-
-    try {
-      // Fallback to localStorage
-      const key = `${STORAGE_PREFIX}${sessionId}`;
-      const stored = localStorage.getItem(key);
-      if (stored != null) {
-        return JSON.parse(stored);
-      }
-
-    } catch (error) {
-      console.warn('localStorage load failed, checking in-memory storage:', error);
     }
 
     // Final fallback to in-memory storage

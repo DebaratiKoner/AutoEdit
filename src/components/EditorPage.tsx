@@ -76,6 +76,37 @@ function getClipColor(index: number) {
   return color;
 }
 
+const openVideoDatabase = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('VideoEditorDB', 1);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains('videos')) {
+        db.createObjectStore('videos', { keyPath: 'id' });
+      }
+    };
+  });
+};
+
+const getLocalVideoUrl = async (id: string): Promise<string | null> => {
+  try {
+    const db = await openVideoDatabase();
+    return new Promise((resolve) => {
+      const transaction = db.transaction(['videos'], 'readonly');
+      const store = transaction.objectStore('videos');
+      const request = store.get(id);
+      request.onsuccess = () => resolve(request.result?.file ? URL.createObjectURL(request.result.file) : null);
+      request.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+};
+
 interface EditorPageProps {
   sessionId: string;
   onReset?: () => void;
@@ -97,8 +128,9 @@ async function fetchWithTranscribeRetry(input: RequestInfo | URL, init: RequestI
       if (response.ok || response.status < 500 || attempt === TRANSCRIBE_MAX_ATTEMPTS) {
         return response;
       }
-    } catch (error: any) {
-      lastError = error?.name === 'AbortError'
+    } catch (error: unknown) {
+      const err = error as Error;
+      lastError = err?.name === 'AbortError'
         ? new Error('Transcription request timed out. Please try a shorter edit or check the backend logs.')
         : error;
 
@@ -491,7 +523,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             const cutOffset = currentTime - start;
             const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
             
-            const { segments: _segments, ...segBase } = seg as any;
+            const segBase = { ...seg };
+            delete (segBase as { segments?: unknown }).segments;
             const segment1: TimelineSegment = { ...segBase, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
             const segment2: TimelineSegment = { ...segBase, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: Number(seg.duration || 0) - cutOffset };
             
@@ -595,9 +628,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       setSession(updatedSession);
       void sessionManager.saveSession(sessionId, updatedSession);
       setChatHistory(prev => [...prev, { role: 'assistant', content: 'Transcription complete!' }]);
-    } catch (e: any) {
-      console.error(e);
-      alert(`Failed to transcribe video: ${e.message}`);
+    } catch (e: unknown) {
+      const err = e as Error;
+      console.error(err);
+      alert(`Failed to transcribe video: ${err.message}`);
     } finally {
       setIsTranscribing(false);
     }
@@ -621,8 +655,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     void jumpToTimelineTime(timelineTime, session, false, true);
   };
 
-  const handleAiEditSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleAiEditSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (!session || !aiPrompt.trim()) return;
 
     const userInput = aiPrompt.trim();
@@ -745,7 +779,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       const data = await response.json();
       
       // Map backend clips back to TimelineSegment format
-      const track0 = (data.clips || []).map((clip: any, i: number) => {
+      const track0 = (data.clips || []).map((clip: Record<string, any>, i: number) => {
         // Try to find the original segment by exact ID, or if the AI appended a suffix for a split
         const origSeg = session.timeline.find(s => 
           s.id === clip.id || 
@@ -757,9 +791,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         const assetKind = clip.assetKind ?? origSeg?.assetKind;
         const srcStart = clip.sourceStart ?? clip.start ?? (origSeg?.sourceStart ?? 0);
         const srcEnd = clip.sourceEnd ?? clip.end ?? (origSeg?.sourceEnd ?? 0);
-        const mergedSegments = clip.segments ?? (origSeg as any)?.segments;
+        const mergedSegments = clip.segments ?? (origSeg as { segments?: unknown[] })?.segments;
         const mergedDuration = Array.isArray(mergedSegments)
-          ? mergedSegments.reduce((sum: number, segment: any) => (
+          ? mergedSegments.reduce((sum: number, segment: Record<string, any>) => (
               sum + ((segment.sourceEnd ?? segment.end ?? 0) - (segment.sourceStart ?? segment.start ?? 0))
             ), 0)
           : 0;
@@ -832,9 +866,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
         }
       }, 100);
 
-    } catch (e: any) {
-      console.error(e);
-      setChatHistory(prev => [...prev, { role: 'assistant', content: `Error: ${e.message}` }]);
+    } catch (e: unknown) {
+      const err = e as Error;
+      console.error(err);
+      setChatHistory(prev => [...prev, { role: 'assistant', content: `Error: ${err.message}` }]);
     } finally {
       setIsAiEditing(false);
     }
@@ -1406,11 +1441,18 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   }, [session?.timeline]);
 
   async function loadSession() {
+    let localUrl = null;
+    try {
+      localUrl = await getLocalVideoUrl(sessionId);
+    } catch (e) {
+      logger.warn('Failed to get local video url', e);
+    }
+
     // 1. Try to restore a previously saved session (survives refresh)
     const data = await sessionManager.loadSession(sessionId);
     if (data) {
-      // Always use the backend stream URL — blob URLs don't survive refresh
-      const streamUrl = `/api/videos/${sessionId}/stream`;
+      // Use the local blob URL if available, else fallback to backend stream URL
+      const streamUrl = localUrl || `/api/videos/${sessionId}/stream`;
       
       // Migrate: assign colors and tracks to clips that don't have them
       const migratedTimeline = pinAudioToTimelineStart(data.timeline.map((seg, index) => ({
@@ -1436,7 +1478,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
 
     // 2. Fresh load — build session using backend stream URL directly
-    const streamUrl = `/api/videos/${sessionId}/stream`;
+    const streamUrl = localUrl || `/api/videos/${sessionId}/stream`;
     logger.debug('Fresh session load, videoUrl:', streamUrl);
 
     // Get duration from a temporary video element
@@ -1817,7 +1859,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     const segment1Name = `${baseName}-1`;
     const segment2Name = `${baseName}-2`;
 
-    const { segments: _segments, ...segmentBase } = segmentToCut as any;
+    const segmentBase = { ...segmentToCut };
+    delete (segmentBase as { segments?: unknown }).segments;
     
     const segment1: TimelineSegment = {
       ...segmentBase,
@@ -2398,7 +2441,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   // Asset management functions
 
   const handleExportConfirm = async () => {
-    logger.operation(`Export started: ${exportMode}`);
+    logger.operation(`Export started`);
 
     if (!session || session.timeline.length === 0) {
       alert("No clips to export");
@@ -2406,16 +2449,15 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
 
     let timelineToExport = session.timeline;
-    let modeToUse: 'whole' | 'clips' = 'whole';
-
     if (exportMode === 'selected') {
+      if (selectedExportIds.size === 0) {
+        alert("Please select at least one item to export");
+        return;
+      }
       timelineToExport = session.timeline.filter(c => selectedExportIds.has(c.id));
-      modeToUse = 'clips';
-    } else {
-      modeToUse = 'whole';
     }
-
-    setIsExporting(modeToUse);
+    
+    setIsExporting(exportMode === 'whole' ? 'whole' : 'clips');
 
     // Decode proxy URLs so the backend can fetch the actual asset, or make local URLs absolute
     const decodedTimelineToExport = timelineToExport.map(clip => {
@@ -2441,45 +2483,42 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     });
 
     try {
-      const response = await fetch(
-        `/api/videos/${sessionId}/export-zip`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            timeline: decodedTimelineToExport,
-            transcriptSegments: session.transcriptSegments || [],
-            mode: modeToUse,
-            fast: true,
-            preset: "ultrafast"
-          })
-        }
-      );
+      // Simulate a brief processing delay for UI feedback
+      await delay(1000);
+      
+      const response = await fetch(`/api/videos/${sessionId}/export-zip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          timeline: decodedTimelineToExport,
+          transcriptSegments: session.transcriptSegments || [],
+          mode: exportMode === 'whole' ? 'whole' : 'clips'
+        })
+      });
 
       if (!response.ok) {
-        const text = await response.text();
-        console.error("Export failed:", response.status, text);
-        throw new Error("Export failed");
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Export failed on server');
       }
 
       const blob = await response.blob();
-      const isClipsMode = modeToUse === 'clips';
-      const downloadUrl = window.URL.createObjectURL(blob);
+      const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.style.display = "none";
       a.href = downloadUrl;
-      a.download = isClipsMode ? `autoedit_clips_${sessionId.slice(0, 8)}.zip` : `autoedit_${sessionId.slice(0, 8)}.mp4`;
+      
+      const ext = exportMode === 'whole' ? 'mp4' : 'zip';
+      a.download = `autoedit_${exportMode}_${sessionId.slice(0, 8)}.${ext}`;
+      
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 60000);
+      URL.revokeObjectURL(downloadUrl);
 
-      logger.operation(`${modeToUse} export downloaded`);
+      logger.operation(`${exportMode} export downloaded`);
     } catch (err) {
       console.error(err);
-      alert("Export failed");
+      alert("Export failed: " + (err instanceof Error ? err.message : String(err)));
     } finally {
       setIsExporting(null);
     }
@@ -2575,7 +2614,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             >
               {isGeneratingShort ? `Generating Short... ${shortProgress}%` : 'Generate Short'}
             </button>
-            <div className="export-menu">
+            <div className="export-menu" style={{ position: 'relative' }}>
               <button
                 className="btn btn-primary"
                 onClick={() => {
@@ -2592,11 +2631,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 aria-expanded={showExportMenu}
               >
                 {isExporting ? 'Exporting...' : 'Export'}
-                <span className="export-menu-caret">v</span>
+                <span className="export-menu-caret" style={{ marginLeft: '6px', fontSize: '0.8rem' }}>▼</span>
               </button>
               {showExportMenu && (
-                <div className="export-dropdown" role="menu" style={{ width: '320px', padding: '1rem', cursor: 'default' }} onClick={e => e.stopPropagation()}>
-                  <div style={{ fontWeight: 'bold', marginBottom: '10px', color: '#fff', fontSize: '1rem' }}>Export Options</div>
+                <div className="export-dropdown" role="menu" style={{ position: 'absolute', top: 'calc(100% + 8px)', right: 0, width: '320px', padding: '1rem', background: '#1e1e1e', border: '1px solid #333', borderRadius: '6px', zIndex: 100, boxShadow: '0 4px 12px rgba(0,0,0,0.5)' }} onClick={e => e.stopPropagation()}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                    <div style={{ fontWeight: 'bold', color: '#fff', fontSize: '1rem' }}>Export Options</div>
+                    <button style={{ background: 'none', border: 'none', color: '#aaa', cursor: 'pointer', fontSize: '1.2rem', padding: 0 }} onClick={() => setShowExportMenu(false)}>×</button>
+                  </div>
                   
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '15px' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
@@ -3305,7 +3347,24 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <div className="clips-tab">
 
               <div style={{ marginBottom: '0.75rem' }}>
+              <div style={{ marginBottom: '0.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <h3 style={{ margin: 0, fontSize: '1.1rem', color: '#fff' }}>Timeline Clips</h3>
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '4px 8px', fontSize: '0.8rem', display: 'flex', gap: '4px', alignItems: 'center' }}
+                  onClick={() => {
+                    insertAfterClipIdRef.current = null;
+                    fileInputRef.current?.click();
+                  }}
+                  disabled={isUploadingAsset}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="17 8 12 3 7 8" />
+                    <line x1="12" y1="3" x2="12" y2="15" />
+                  </svg>
+                  {isUploadingAsset ? 'Uploading...' : 'Upload Media'}
+                </button>
               </div>
               {/* Hidden file input for per-clip local insert */}
               <input
@@ -3317,7 +3376,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               />
               {session.timeline.length === 0 ? (
                 <div style={{ color: '#666', textAlign: 'center', padding: '2rem 1rem' }}>
-                  No items yet. Add from Assets tab.
+                  No items yet. Click "Upload Media" or add from Assets tab.
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: '60vh', overflowY: 'auto', paddingRight: '4px' }}>
@@ -3457,6 +3516,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 </div>
               )}
             </div>
+            </div>
           )}
           {activeTab === 'assets' && session && (
             <AssetsTab onAddToTimeline={(asset, photoDuration) => {
@@ -3561,7 +3621,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   if (currentTime > start + 0.05 && currentTime < end - 0.05) {
                     const cutOffset = currentTime - start;
                     const sourceCutTime = (seg.sourceStart ?? 0) + cutOffset;
-                  const { segments: _segments, ...segBase } = seg as any;
+                    const segBase = { ...seg };
+                    delete (segBase as { segments?: unknown }).segments;
                     const segment1: TimelineSegment = { ...segBase, id: `${seg.id}-1`, sourceEnd: sourceCutTime, duration: cutOffset };
                     const segment2: TimelineSegment = { ...segBase, id: `${seg.id}-2`, sourceStart: sourceCutTime, duration: Number(seg.duration || 0) - cutOffset };
                     newTrack0 = [...track0Segments.slice(0, i), segment1, newSegment, segment2, ...track0Segments.slice(i + 1)];
@@ -3706,7 +3767,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
                         if (!isAiEditing && aiPrompt.trim() && session?.transcript) {
-                          handleAiEditSubmit(e as any);
+                          handleAiEditSubmit();
                         }
                       }
                     }}

@@ -317,7 +317,7 @@ export default function ShortsPage() {
                         setVideoLoading(false);
                         setLogs((prev) => [...prev, `[${new Date().toISOString()}] Preview failed to load. Try the download button.`]);
                       }}
-                      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+                      style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
                     />
                     {videoLoading && (
                       <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.55)", color: "#d8d8d8", fontSize: "0.9rem" }}>

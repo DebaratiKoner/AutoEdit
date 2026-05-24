@@ -432,7 +432,8 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
                 <div style={{ padding: '2rem', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', background: '#1a1a2e' }}>
                 <img src={imgProxy(preview.images?.waveform_m || '') || FALLBACK} alt="waveform" style={{ width: '100%', maxHeight: '150px', objectFit: 'contain', marginBottom: '2rem' }} />
                   {(() => {
-                    const rawAudioUrl = preview.previews?.['preview-hq-mp3'] || preview.previews?.['preview-lq-mp3'] || preview.previews?.['preview-hq-ogg'] || preview.previews?.['preview-lq-ogg'];
+                    const audioPreview = preview as FreesoundAudio;
+                    const rawAudioUrl = audioPreview.previews?.['preview-hq-mp3'] || audioPreview.previews?.['preview-lq-mp3'] || audioPreview.previews?.['preview-hq-ogg'] || audioPreview.previews?.['preview-lq-ogg'];
                     return rawAudioUrl ? (
                       <audio
                         key={preview.id}
