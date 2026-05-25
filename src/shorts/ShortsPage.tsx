@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 
 export type CaptionStyle = "bold_yellow_pop" | "clean_white" | "minimal_bottom" | "off";
 
@@ -17,6 +17,20 @@ interface UploadedSource {
   height: number;
   fps: number;
   url: string;
+}
+
+interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface ShortsLocationState {
+  fromEditor?: boolean;
+  source?: UploadedSource;
+  serverSessionId?: string;
+  instruction?: string;
+  transcriptSegments?: TranscriptSegment[];
 }
 
 interface SelectedClip {
@@ -93,13 +107,16 @@ const panelStyle = {
 } as const;
 
 export default function ShortsPage() {
+  const location = useLocation();
+  const editorState = (location.state || null) as ShortsLocationState | null;
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [source, setSource] = useState<UploadedSource | null>(null);
-  const [serverSessionId, setServerSessionId] = useState<string | null>(null);
+  const [source, setSource] = useState<UploadedSource | null>(editorState?.source || null);
+  const [serverSessionId, setServerSessionId] = useState<string | null>(editorState?.serverSessionId || null);
+  const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>(editorState?.transcriptSegments || []);
 
-  const [instruction, setInstruction] = useState("");
+  const [instruction, setInstruction] = useState(editorState?.instruction || "");
   const [duration, setDuration] = useState(60);
   const [captionStyle, setCaptionStyle] = useState<CaptionStyle>("bold_yellow_pop");
   const [submitting, setSubmitting] = useState(false);
@@ -175,6 +192,7 @@ export default function ShortsPage() {
           width: source.width,
           height: source.height,
           fps: source.fps,
+          transcriptSegments,
         }),
       });
 
@@ -263,6 +281,7 @@ export default function ShortsPage() {
         fps: 30,
         url: `/api/videos/${data.sessionId}/stream`,
       });
+      setTranscriptSegments(data.transcriptSegments || []);
       setUploading(false);
       setUploadProgress(100);
     } catch {
@@ -467,7 +486,7 @@ export default function ShortsPage() {
                 <div style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{source.filename}</div>
                 <div style={{ color: "#aaa", fontSize: "0.88rem", marginTop: "0.25rem" }}>{formatDuration(source.duration)} · {source.width}x{source.height} · {source.fps}fps</div>
               </div>
-              <button onClick={() => { setSource(null); setServerSessionId(null); }} style={{ background: "none", border: 0, color: "#4a9eff", cursor: "pointer" }}>Change</button>
+              <button onClick={() => { setSource(null); setServerSessionId(null); setTranscriptSegments([]); }} style={{ background: "none", border: 0, color: "#4a9eff", cursor: "pointer" }}>Change</button>
             </div>
 
             <label>

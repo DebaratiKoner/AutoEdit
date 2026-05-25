@@ -2070,13 +2070,15 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         return FileResponse(
             str(clips_zip_cache_path),
             media_type="application/zip",
-            filename=f"autoedit_clips_{session_id[:8]}.zip"
+            filename=f"autoedit_clips_{session_id[:8]}.zip",
+            content_disposition_type="attachment",
         )
     if body.mode == "whole" and whole_video_cache_path.exists() and whole_video_cache_path.stat().st_size > 1024:
         return FileResponse(
             str(whole_video_cache_path),
             media_type="video/mp4",
-            filename=f"autoedit_whole_{session_id[:8]}.mp4"
+            filename=f"autoedit_whole_{session_id[:8]}.mp4",
+            content_disposition_type="attachment",
         )
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"export_{session_id}_"))
@@ -2275,7 +2277,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             return FileResponse(
                 str(clips_zip_cache_path),
                 media_type="application/zip",
-                filename=f"autoedit_clips_{session_id[:8]}.zip"
+                filename=f"autoedit_clips_{session_id[:8]}.zip",
+                content_disposition_type="attachment",
             )
 
         # Mix audio for both modes so separate clips have background audio included
@@ -2343,12 +2346,12 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         if body.mode == "whole":
             if not main_video_path.exists():
                 raise HTTPException(status_code=400, detail="No clips could be processed for export.")
-            main_video_path = _normalize_export_duration(main_video_path, temp_dir / "whole_exact.mp4", target_duration)
             shutil.copyfile(main_video_path, whole_video_cache_path)
             return FileResponse(
                 str(whole_video_cache_path),
                 media_type="video/mp4",
-                filename=f"autoedit_whole_{session_id[:8]}.mp4"
+                filename=f"autoedit_whole_{session_id[:8]}.mp4",
+                content_disposition_type="attachment",
             )
             
         if body.mode == "clips":
@@ -2392,7 +2395,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             return FileResponse(
                 str(clips_zip_cache_path),
                 media_type="application/zip",
-                filename=f"autoedit_clips_{session_id[:8]}.zip"
+                filename=f"autoedit_clips_{session_id[:8]}.zip",
+                content_disposition_type="attachment",
             )
 
     except subprocess.CalledProcessError as e:
@@ -4421,6 +4425,31 @@ def _write_caption_ass(job_id: str, segments: list, duration: float, style: str,
     ass_path.write_text(ass_content, encoding="utf-8")
     return ass_path
 
+def _caption_segments_from_transcript(transcript_segments: Optional[list], clip_start: float, clip_duration: float) -> list:
+    if not transcript_segments:
+        return []
+
+    clip_end = clip_start + clip_duration
+    captions = []
+    for segment in transcript_segments:
+        try:
+            seg_start = float(segment.get("start", 0) or 0)
+            seg_end = float(segment.get("end", seg_start) or seg_start)
+        except (TypeError, ValueError, AttributeError):
+            continue
+
+        text = str(segment.get("text", "")).strip() if isinstance(segment, dict) else ""
+        if not text or seg_end <= clip_start or seg_start >= clip_end:
+            continue
+
+        captions.append({
+            "start": max(0.0, seg_start - clip_start),
+            "end": min(clip_duration, seg_end - clip_start),
+            "text": text,
+        })
+
+    return captions
+
 def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration: float, job_id: str) -> list:
     if not client.api_key:
         _append_short_log(job_id, "OpenAI API key not configured; using fallback caption text.")
@@ -4561,8 +4590,12 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
 
         _update_short_job(job_id, status="captioning", progress=25)
         _append_short_log(job_id, f"Source resolved: {video_path.name}")
-        _append_short_log(job_id, "Transcribing selected audio for visible captions.")
-        segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
+        segments = _caption_segments_from_transcript(req.transcriptSegments, clip_start, clip_duration)
+        if segments:
+            _append_short_log(job_id, "Using existing transcript for visible captions.")
+        else:
+            _append_short_log(job_id, "Transcribing selected audio for visible captions.")
+            segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
 
         hook = next((s["text"] for s in segments if s.get("text")), "")
         fallback_caption = hook or req.instruction.strip() or Path(req.filename or video_path.name).stem

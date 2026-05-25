@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { formatTime, logger } from '../utils';
 import LZString from 'lz-string';
 import type { SessionData, TimelineSegment, CompositionSchema } from '../types';
@@ -148,6 +149,7 @@ async function fetchWithTranscribeRetry(input: RequestInfo | URL, init: RequestI
 }
 
 export function EditorPage({ sessionId, onReset }: EditorPageProps) {
+  const navigate = useNavigate();
   const [session, setSession] = useState<SessionData | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [activeAssetClip, setActiveAssetClip] = useState<TimelineSegment | null>(null);
@@ -187,10 +189,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [aiPrompt, setAiPrompt] = useState('');
   const [chatHistory, setChatHistory] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
   
-  const [isGeneratingShort, setIsGeneratingShort] = useState(false);
-  const [shortProgress, setShortProgress] = useState(0);
-  const [generatedShortUrl, setGeneratedShortUrl] = useState<string | null>(null);
-
   const sessionManager = new SessionManager();
 
   // LZ Compressor singleton (avoids repeated imports)
@@ -2440,6 +2438,35 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   // Asset management functions
 
+  const postExportDownload = (payload: unknown) => {
+    const frameName = `export-download-${Date.now()}`;
+    const iframe = document.createElement("iframe");
+    iframe.name = frameName;
+    iframe.style.display = "none";
+
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = `/api/videos/${sessionId}/export-zip-download`;
+    form.target = frameName;
+    form.enctype = "application/x-www-form-urlencoded";
+    form.style.display = "none";
+
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = "payload";
+    input.value = JSON.stringify(payload);
+
+    form.appendChild(input);
+    document.body.appendChild(iframe);
+    document.body.appendChild(form);
+    form.submit();
+
+    window.setTimeout(() => {
+      form.remove();
+      iframe.remove();
+    }, 120_000);
+  };
+
   const handleExportConfirm = async () => {
     logger.operation(`Export started`);
 
@@ -2448,19 +2475,17 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return;
     }
 
-    let timelineToExport = session.timeline;
     if (exportMode === 'selected') {
       if (selectedExportIds.size === 0) {
         alert("Please select at least one item to export");
         return;
       }
-      timelineToExport = session.timeline.filter(c => selectedExportIds.has(c.id));
     }
     
     setIsExporting(exportMode === 'whole' ? 'whole' : 'clips');
 
     // Decode proxy URLs so the backend can fetch the actual asset, or make local URLs absolute
-    const decodedTimelineToExport = timelineToExport.map(clip => {
+    const decodedFullTimeline = session.timeline.map(clip => {
       let url = clip.assetUrl;
       if (url) {
         if (url.includes('/api/proxy-')) {
@@ -2471,110 +2496,63 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           } catch (e) {
             // ignore
           }
-        } else if (url.startsWith('/')) {
-          try {
-            url = new URL(url, window.location.origin).toString();
-          } catch (e) {
-            // ignore
-          }
         }
       }
       return { ...clip, assetUrl: url };
     });
 
-    try {
-      // Simulate a brief processing delay for UI feedback
-      await delay(1000);
-      
-      const response = await fetch(`/api/videos/${sessionId}/export-zip`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          timeline: decodedTimelineToExport,
-          transcriptSegments: session.transcriptSegments || [],
-          mode: exportMode === 'whole' ? 'whole' : 'clips'
-        })
-      });
+    let exportSelectedIds: string[] | undefined;
+    if (exportMode === 'selected') {
+      const selectedIds = new Set(selectedExportIds);
+      const selectedRanges = session.timeline
+        .filter(clip => selectedIds.has(clip.id) && (clip.track ?? 0) === 0)
+        .map(clip => {
+          const start = Number(clip.timelineStart ?? 0);
+          return { start, end: start + Number(clip.duration || 0) };
+        });
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.detail || 'Export failed on server');
-      }
-
-      const blob = await response.blob();
-      const downloadUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.style.display = "none";
-      a.href = downloadUrl;
-      
-      const ext = exportMode === 'whole' ? 'mp4' : 'zip';
-      a.download = `autoedit_${exportMode}_${sessionId.slice(0, 8)}.${ext}`;
-      
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(downloadUrl);
-
-      logger.operation(`${exportMode} export downloaded`);
-    } catch (err) {
-      console.error(err);
-      alert("Export failed: " + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setIsExporting(null);
-    }
-  };
-
-  const handleGenerateShort = async () => {
-    if (!session) return;
-    try {
-      setIsGeneratingShort(true);
-      setShortProgress(0);
-      setGeneratedShortUrl(null);
-
-      const response = await fetch(`/api/shorts/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: `${sessionId}.mp4`,
-          sessionId: sessionId,
-          duration: 45,
-          captionStyle: "bold_yellow_pop",
-          instruction: aiPrompt,
-          videoDuration: session.duration,
-          width: session.resolution?.width || 1080,
-          height: session.resolution?.height || 1920,
-          fps: 30,
-          transcriptSegments: session.transcriptSegments || []
-        }),
-      });
-      const data = await response.json();
-      if (!data.jobId) throw new Error("Generation failed");
-      pollShortJob(data.jobId);
-    } catch (err) {
-      console.error(err);
-      setIsGeneratingShort(false);
-    }
-  };
-
-  const pollShortJob = (jobId: string) => {
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/shorts/status/${jobId}`);
-        const job = await res.json();
-        setShortProgress(job.progress || 0);
-        if (job.status === "ready") {
-          clearInterval(interval);
-          setGeneratedShortUrl(job.finalUrl);
-          setIsGeneratingShort(false);
-        } else if (job.status === "error") {
-          clearInterval(interval);
-          alert("Error: " + job.error);
-          setIsGeneratingShort(false);
+      for (const clip of session.timeline) {
+        if (selectedIds.has(clip.id) || (clip.track ?? 0) === 0) continue;
+        const start = Number(clip.timelineStart ?? 0);
+        const end = start + Number(clip.duration || 0);
+        if (selectedRanges.some(range => start < range.end && range.start < end)) {
+          selectedIds.add(clip.id);
         }
-      } catch (err) {
-        console.error("Poll error", err);
       }
-    }, 2000);
+
+      exportSelectedIds = Array.from(selectedIds);
+    }
+
+    postExportDownload({
+      timeline: decodedFullTimeline,
+      selectedIds: exportSelectedIds,
+      transcriptSegments: session.transcriptSegments || [],
+      mode: exportMode === 'whole' ? 'whole' : 'clips'
+    });
+
+    logger.operation(`${exportMode} export download requested`);
+    window.setTimeout(() => setIsExporting(null), 10_000);
+  };
+
+  const handleGenerateShort = () => {
+    if (!session) return;
+    
+    navigate('/shorts', {
+      state: {
+        fromEditor: true,
+        serverSessionId: sessionId,
+        instruction: aiPrompt,
+        transcriptSegments: session.transcriptSegments || [],
+        source: {
+          filename: `Session ${sessionId.slice(0, 8)}.mp4`,
+          duration: session.duration,
+          width: session.resolution?.width || 1920,
+          height: session.resolution?.height || 1080,
+          fps: 30,
+          url: session.videoUrl
+        }
+      }
+    });
   };
 
   const handleResetConfirm = async () => {
@@ -2610,9 +2588,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <button 
               className="btn btn-secondary" 
               onClick={handleGenerateShort}
-              disabled={isGeneratingShort || isExporting !== null}
+              disabled={isExporting !== null}
             >
-              {isGeneratingShort ? `Generating Short... ${shortProgress}%` : 'Generate Short'}
+              Generate Short
             </button>
             <div className="export-menu" style={{ position: 'relative' }}>
               <button
@@ -2786,18 +2764,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   <video src={getAssetPreviewUrl(activeOverlayClip.assetUrl, activeOverlayClip.assetKind)} autoPlay muted loop className="video-photo-img" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
                 ) : null}
                 <div className="video-photo-label">{getShortName(activeOverlayClip.name, activeOverlayClip.assetKind === 'photo' ? 'Photo' : 'Video')}</div>
-              </div>
-            )}
-            
-            {/* Short Generation Preview Modal inside Player Area */}
-            {generatedShortUrl && (
-              <div style={{ position: 'absolute', inset: 0, zIndex: 100, backgroundColor: 'rgba(0,0,0,0.9)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '2rem' }}>
-                <h3 style={{ color: '#fff', marginBottom: '1rem' }}>Your AI Short is Ready!</h3>
-                <video controls autoPlay className="video-element" src={generatedShortUrl} style={{ maxWidth: '100%', maxHeight: '70%', borderRadius: '8px', border: '2px solid #4a9eff' }} />
-                <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
-                  <a href={generatedShortUrl} download className="btn btn-primary">Download MP4</a>
-                  <button className="btn btn-secondary" onClick={() => setGeneratedShortUrl(null)}>Close</button>
-                </div>
               </div>
             )}
             
