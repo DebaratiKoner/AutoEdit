@@ -2438,33 +2438,54 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   // Asset management functions
 
-  const postExportDownload = (payload: unknown) => {
-    const frameName = `export-download-${Date.now()}`;
-    const iframe = document.createElement("iframe");
-    iframe.name = frameName;
-    iframe.style.display = "none";
+  const postExportDownload = async (payload: unknown) => {
+    try {
+      const response = await fetch(`/api/videos/${sessionId}/export-zip`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
 
-    const form = document.createElement("form");
-    form.method = "POST";
-    form.action = `/api/videos/${sessionId}/export-zip-download`;
-    form.target = frameName;
-    form.enctype = "application/x-www-form-urlencoded";
-    form.style.display = "none";
+      if (!response.ok) {
+        throw new Error(`Export failed: ${response.statusText}`);
+      }
 
-    const input = document.createElement("input");
-    input.type = "hidden";
-    input.name = "payload";
-    input.value = JSON.stringify(payload);
+      let filename = `export-${sessionId.slice(0, 8)}.zip`;
+      const contentDisposition = response.headers.get('Content-Disposition');
+      if (contentDisposition) {
+        const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
+        if (filenameMatch && filenameMatch[1]) {
+          filename = filenameMatch[1];
+        }
+      } else {
+        const p = payload as any;
+        if (p.mode === 'whole') {
+          filename = `autoedit_whole_${sessionId.slice(0, 8)}.mp4`;
+        } else {
+          filename = `autoedit_clips_${sessionId.slice(0, 8)}.zip`;
+        }
+      }
 
-    form.appendChild(input);
-    document.body.appendChild(iframe);
-    document.body.appendChild(form);
-    form.submit();
-
-    window.setTimeout(() => {
-      form.remove();
-      iframe.remove();
-    }, 120_000);
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.style.display = 'none';
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.setTimeout(() => {
+        window.URL.revokeObjectURL(url);
+        a.remove();
+      }, 100);
+    } catch (error) {
+      console.error('Export error:', error);
+      alert('Failed to export video. Please try again.');
+    } finally {
+      setIsExporting(null);
+    }
   };
 
   const handleExportConfirm = async () => {
@@ -2523,7 +2544,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       exportSelectedIds = Array.from(selectedIds);
     }
 
-    postExportDownload({
+    await postExportDownload({
       timeline: decodedFullTimeline,
       selectedIds: exportSelectedIds,
       transcriptSegments: session.transcriptSegments || [],
@@ -2531,7 +2552,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     });
 
     logger.operation(`${exportMode} export download requested`);
-    window.setTimeout(() => setIsExporting(null), 10_000);
   };
 
   const handleGenerateShort = () => {

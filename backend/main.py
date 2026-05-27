@@ -71,6 +71,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # Configuration
@@ -1996,6 +1997,13 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
     output_path = export_dir / f"{session_id}_{signature}{out_ext}"
 
     if output_path.exists() and output_path.stat().st_size > 1024 * 1024:
+        local_exports_dir = PROJECT_ROOT / "exports"
+        local_exports_dir.mkdir(exist_ok=True)
+        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}{out_ext}"
+        import shutil
+        shutil.copyfile(output_path, local_copy_path)
+        print(f"[fast-export] Saved local copy to {local_copy_path} (from cache)")
+
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
@@ -2124,21 +2132,45 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
             if not src_path:
                 return None
 
-            if is_image:
-                cmd = [
-                    "ffmpeg", "-loop", "1", "-i", str(src_path),
-                    "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}",
-                    "-t", str(duration), "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", pix_fmt,
-                    "-c:a", "aac", "-b:a", "128k", "-ar", str(ar), "-ac", str(ac), "-shortest", "-y", str(clip_path)
-                ]
+            c_v = v_stream.get("codec_name", "libx264")
+            if c_v == "h264": c_v = "libx264"
+            elif c_v == "hevc": c_v = "libx265"
+            elif c_v == "vp9": c_v = "libvpx-vp9"
+            elif c_v == "vp8": c_v = "libvpx"
+            else: c_v = "libx264"
+
+            has_audio = bool(aud_props.get("streams"))
+            c_a = a_stream.get("codec_name", "aac") if has_audio else "aac"
+            if c_a != "aac": c_a = "aac"
+
+            v_args = ["-c:v", c_v, "-pix_fmt", pix_fmt]
+            if c_v in ["libx264", "libx265"]:
+                v_args.extend(["-preset", "ultrafast", "-crf", "28"])
+            elif c_v in ["libvpx-vp9", "libvpx"]:
+                v_args.extend(["-deadline", "realtime", "-cpu-used", "8", "-crf", "30", "-b:v", "0"])
+
+            if has_audio:
+                a_args = ["-c:a", c_a, "-ar", str(ar), "-ac", str(ac), "-b:a", "128k"]
             else:
-                cmd = [
-                    "ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
-                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", pix_fmt,
-                    "-c:a", "aac", "-b:a", "128k", "-ar", str(ar), "-ac", str(ac), "-y", str(clip_path)
-                ]
+                a_args = ["-an"]
+
+            if is_image:
+                cmd = ["ffmpeg", "-loop", "1", "-i", str(src_path)]
+                if has_audio:
+                    cmd.extend(["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}"])
+                cmd.extend(["-t", str(duration), "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"])
+                cmd.extend(v_args)
+                cmd.extend(a_args)
+                if has_audio:
+                    cmd.append("-shortest")
+                cmd.extend(["-y", str(clip_path)])
+            else:
+                cmd = ["ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
+                       "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"]
+                cmd.extend(v_args)
+                cmd.extend(a_args)
+                cmd.extend(["-y", str(clip_path)])
+                
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0 and clip_path.exists():
                 return (i, clip_path)
@@ -2196,6 +2228,13 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
 
         tmp_final.replace(output_path)
 
+        local_exports_dir = PROJECT_ROOT / "exports"
+        local_exports_dir.mkdir(exist_ok=True)
+        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}{out_ext}"
+        import shutil
+        shutil.copyfile(output_path, local_copy_path)
+        print(f"[fast-export] Saved local copy to {local_copy_path}")
+
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
@@ -2249,12 +2288,27 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
     whole_video_cache_path = export_cache_dir / f"{session_id}_{cache_signature}_whole{out_ext}"
 
     if body.mode == "clips" and clips_zip_cache_path.exists() and clips_zip_cache_path.stat().st_size > 1024:
+        local_exports_dir = PROJECT_ROOT / "exports"
+        local_exports_dir.mkdir(exist_ok=True)
+        local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}.zip"
+        import shutil
+        shutil.copyfile(clips_zip_cache_path, local_copy_path)
+        print(f"[export-zip] Saved local copy to {local_copy_path} (from cache)")
+
         return FileResponse(
             str(clips_zip_cache_path),
             media_type="application/zip",
             filename=f"autoedit_clips_{session_id[:8]}.zip"
         )
     if body.mode == "whole" and whole_video_cache_path.exists() and whole_video_cache_path.stat().st_size > 1024:
+        local_exports_dir = PROJECT_ROOT / "exports"
+        local_exports_dir.mkdir(exist_ok=True)
+        filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
+        local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}{out_ext}"
+        import shutil
+        shutil.copyfile(whole_video_cache_path, local_copy_path)
+        print(f"[export-zip] Saved local copy to {local_copy_path} (from cache)")
+
         media_type = mimetypes.guess_type(str(whole_video_cache_path))[0] or "video/mp4"
         filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
         return FileResponse(
@@ -2407,6 +2461,13 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                 for cf, arcname, clip in final_clip_files:
                     zipf.write(cf, f"Exported_Media/{arcname}")
                     
+            local_exports_dir = PROJECT_ROOT / "exports"
+            local_exports_dir.mkdir(exist_ok=True)
+            local_copy_path = local_exports_dir / f"autoedit_export_{session_id[:8]}.zip"
+            import shutil
+            shutil.copyfile(clips_zip_cache_path, local_copy_path)
+            print(f"[export-zip] Saved local copy to {local_copy_path}")
+
             return FileResponse(str(clips_zip_cache_path), media_type="application/zip", filename=f"autoedit_export_{session_id[:8]}.zip")
 
         main_video_path = temp_dir / f"main_edited_video{out_ext}"
@@ -2496,21 +2557,46 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                 return None
             if not src_path:
                 return None
-            if is_image:
-                cmd = [
-                    "ffmpeg", "-loop", "1", "-i", str(src_path),
-                    "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}",
-                    "-t", str(duration), "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", pix_fmt,
-                    "-c:a", "aac", "-b:a", "128k", "-ar", str(ar), "-ac", str(ac), "-shortest", "-y", str(clip_path)
-                ]
+
+            c_v = v_stream.get("codec_name", "libx264")
+            if c_v == "h264": c_v = "libx264"
+            elif c_v == "hevc": c_v = "libx265"
+            elif c_v == "vp9": c_v = "libvpx-vp9"
+            elif c_v == "vp8": c_v = "libvpx"
+            else: c_v = "libx264"
+
+            has_audio = bool(aud_props.get("streams"))
+            c_a = a_stream.get("codec_name", "aac") if has_audio else "aac"
+            if c_a != "aac": c_a = "aac"
+
+            v_args = ["-c:v", c_v, "-pix_fmt", pix_fmt]
+            if c_v in ["libx264", "libx265"]:
+                v_args.extend(["-preset", "ultrafast", "-crf", "28"])
+            elif c_v in ["libvpx-vp9", "libvpx"]:
+                v_args.extend(["-deadline", "realtime", "-cpu-used", "8", "-crf", "30", "-b:v", "0"])
+
+            if has_audio:
+                a_args = ["-c:a", c_a, "-ar", str(ar), "-ac", str(ac), "-b:a", "128k"]
             else:
-                cmd = [
-                    "ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
-                    "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", pix_fmt,
-                    "-c:a", "aac", "-b:a", "128k", "-ar", str(ar), "-ac", str(ac), "-y", str(clip_path)
-                ]
+                a_args = ["-an"]
+
+            if is_image:
+                cmd = ["ffmpeg", "-loop", "1", "-i", str(src_path)]
+                if has_audio:
+                    cmd.extend(["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}"])
+                cmd.extend(["-t", str(duration), "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"])
+                cmd.extend(v_args)
+                cmd.extend(a_args)
+                if has_audio:
+                    cmd.append("-shortest")
+                cmd.extend(["-y", str(clip_path)])
+            else:
+                cmd = ["ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
+                       "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"]
+                cmd.extend(v_args)
+                cmd.extend(a_args)
+                cmd.extend(["-y", str(clip_path)])
+                
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0 and clip_path.exists():
                 return ((clip_idx, seg_idx), clip_path)
@@ -2661,6 +2747,15 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             if not main_video_path.exists():
                 raise HTTPException(status_code=400, detail="No clips could be processed for export.")
             shutil.copyfile(main_video_path, whole_video_cache_path)
+
+            local_exports_dir = PROJECT_ROOT / "exports"
+            local_exports_dir.mkdir(exist_ok=True)
+            filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
+            local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}{out_ext}"
+            import shutil
+            shutil.copyfile(whole_video_cache_path, local_copy_path)
+            print(f"[export-zip] Saved local copy to {local_copy_path}")
+
             media_type = mimetypes.guess_type(str(whole_video_cache_path))[0] or "video/mp4"
             filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
             return FileResponse(
@@ -2723,6 +2818,13 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                 for cf, arcname in final_clip_files:
                     zipf.write(cf, f"Exported_Media/{arcname}")
                     
+            local_exports_dir = PROJECT_ROOT / "exports"
+            local_exports_dir.mkdir(exist_ok=True)
+            local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}.zip"
+            import shutil
+            shutil.copyfile(clips_zip_cache_path, local_copy_path)
+            print(f"[export-zip] Saved local copy to {local_copy_path}")
+
             return FileResponse(
                 str(clips_zip_cache_path),
                 media_type="application/zip",
@@ -3843,29 +3945,6 @@ async def _export_video_ffmpeg_fallback(session_id: str, composition: dict):
     export_request = ExportRequest(clips=clips)
     result = await export_video(session_id, export_request)
 
-    # Post-process: make exported audio very loud for the whole duration.
-    # Aggressive but capped using ffmpeg's volume filter.
-    loud_gain = 2.5
-    try:
-        if hasattr(result, "path") and result.path:
-            in_path = Path(result.path)
-            if in_path.exists():
-                tmp_path = in_path.with_suffix(".loud.tmp.mp4")
-                subprocess.run([
-                    "ffmpeg",
-                    "-y",
-                    "-i", str(in_path),
-                    "-af", f"volume={loud_gain}",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    str(tmp_path)
-                ], check=True, capture_output=True, text=True)
-                tmp_path.replace(in_path)
-    except Exception as e:
-        print(f"[ffmpeg-fallback] loudness post-process failed (non-fatal): {e}")
-
     return result
 
 
@@ -4259,7 +4338,7 @@ def _write_caption_ass(job_id: str, segments: list, duration: float, style: str,
     ass_path.write_text(ass_content, encoding="utf-8")
     return ass_path
 
-def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration: float, job_id: str) -> list:
+def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration: float, job_id: str, base_prog: int = 0, max_prog: int = 0) -> list:
     if not client.api_key:
         _append_short_log(job_id, "OpenAI API key not configured; using fallback caption text.")
         return []
@@ -4267,17 +4346,38 @@ def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration
     try:
         with tempfile.TemporaryDirectory(prefix=f"shorts_{job_id}_") as tmp:
             audio_path = Path(tmp) / "clip.mp3"
-            extract = subprocess.run([
+            cmd = [
                 "ffmpeg", "-y",
                 "-ss", f"{clip_start:.3f}",
                 "-i", str(video_path),
                 "-t", f"{clip_duration:.3f}",
                 "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
                 str(audio_path)
-            ], capture_output=True, text=True)
-            if extract.returncode != 0 or not audio_path.exists():
+            ]
+            
+            import re
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+            
+            output_log = []
+            for line in process.stdout:
+                output_log.append(line)
+                if base_prog < max_prog and clip_duration > 0:
+                    match = time_pattern.search(line)
+                    if match:
+                        h, m, s = match.groups()
+                        current_time = int(h) * 3600 + int(m) * 60 + float(s)
+                        percent = min(1.0, current_time / clip_duration)
+                        current_progress = base_prog + int(percent * (max_prog - base_prog) * 0.3)
+                        _update_short_job(job_id, progress=current_progress)
+            
+            process.wait()
+            if process.returncode != 0 or not audio_path.exists():
                 _append_short_log(job_id, "Could not extract audio for captions; rendering with fallback text.")
                 return []
+            
+            if base_prog < max_prog:
+                _update_short_job(job_id, progress=base_prog + int((max_prog - base_prog) * 0.35))
 
             with open(audio_path, "rb") as audio_file:
                 response = client.audio.transcriptions.create(
@@ -4295,6 +4395,10 @@ def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration
             text = getattr(item, "text", item.get("text", "") if isinstance(item, dict) else "")
             if str(text).strip():
                 segments.append({"start": start, "end": end, "text": str(text).strip()})
+                
+        if base_prog < max_prog:
+            _update_short_job(job_id, progress=max_prog)
+            
         return segments
     except Exception as exc:
         _append_short_log(job_id, f"Caption transcription failed: {str(exc)[:180]}")
@@ -4334,7 +4438,7 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
                 _append_short_log(job_id, "No transcript provided. Transcribing full video for content analysis...")
                 # To avoid Whisper limit, cap at 45 minutes for analysis
                 analysis_duration = min(source_duration, 2700) 
-                req.transcriptSegments = _transcribe_clip_segments(video_path, 0, analysis_duration, job_id)
+                req.transcriptSegments = _transcribe_clip_segments(video_path, 0, analysis_duration, job_id, base_prog=5, max_prog=15)
 
             if req.transcriptSegments:
                 _update_short_job(job_id, status="picking", progress=15)
@@ -4400,7 +4504,7 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
         _update_short_job(job_id, status="captioning", progress=25)
         _append_short_log(job_id, f"Source resolved: {video_path.name}")
         _append_short_log(job_id, "Transcribing selected audio for visible captions.")
-        segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
+        segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id, base_prog=25, max_prog=45)
 
         hook = next((s["text"] for s in segments if s.get("text")), "")
         fallback_caption = hook or req.instruction.strip() or Path(req.filename or video_path.name).stem
@@ -4425,11 +4529,27 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
         ass_path = _write_caption_ass(job_id, segments, clip_duration, req.captionStyle, fallback_caption)
         _append_short_log(job_id, "Caption layer prepared." if ass_path else "Caption layer skipped.")
 
-        _update_short_job(job_id, status="rendering", progress=82)
+        _update_short_job(job_id, status="rendering", progress=60)
         base_vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
         vf = base_vf
         if ass_path:
             vf = f"{base_vf},subtitles='{_escape_filter_path(str(ass_path))}'"
+
+        def run_render(cmd_args):
+            import re
+            process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+            out_log = []
+            for line in process.stdout:
+                out_log.append(line)
+                match = time_pattern.search(line)
+                if match and clip_duration > 0:
+                    h, m, s = match.groups()
+                    current_time = int(h) * 3600 + int(m) * 60 + float(s)
+                    percent = min(1.0, current_time / clip_duration)
+                    _update_short_job(job_id, progress=60 + int(percent * 39))
+            process.wait()
+            return process.returncode, "".join(out_log[-30:])
 
         cmd = [
             "ffmpeg", "-y",
@@ -4442,17 +4562,18 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
             "-movflags", "+faststart",
             str(output_path)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
+        
+        retcode, errlog = run_render(cmd)
+        if retcode != 0:
             if ass_path:
                 _append_short_log(job_id, "Subtitle burn failed; retrying render with drawtext caption fallback.")
                 cmd[cmd.index("-vf") + 1] = _drawtext_filter(base_vf, fallback_caption, req.captionStyle)
-                result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
+                retcode, errlog = run_render(cmd)
+            if retcode != 0:
                 cmd[cmd.index("-vf") + 1] = base_vf
-                result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed")[-500:])
+                retcode, errlog = run_render(cmd)
+            if retcode != 0:
+                raise RuntimeError((errlog or "ffmpeg failed")[-500:])
 
         _append_short_log(job_id, "Render complete.")
         _update_short_job(
