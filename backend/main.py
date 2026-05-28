@@ -133,6 +133,7 @@ class GenerateShortRequest(BaseModel):
     duration: int = 45
     captionStyle: str = "bold_yellow_pop"
     instruction: str = ""
+    prompt: Optional[str] = ""
     videoDuration: Optional[float] = None
     width: Optional[int] = None
     height: Optional[int] = None
@@ -1996,10 +1997,11 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
     export_dir.mkdir(parents=True, exist_ok=True)
     output_path = export_dir / f"{session_id}_{signature}{out_ext}"
 
-    if output_path.exists() and output_path.stat().st_size > 1024 * 1024:
+    if output_path.exists() and output_path.stat().st_size > 1024:
         local_exports_dir = PROJECT_ROOT / "exports"
         local_exports_dir.mkdir(exist_ok=True)
-        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}{out_ext}"
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}_{timestamp_str}{out_ext}"
         import shutil
         shutil.copyfile(output_path, local_copy_path)
         print(f"[fast-export] Saved local copy to {local_copy_path} (from cache)")
@@ -2007,8 +2009,9 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
-            filename=f"edited-{session_id[:8]}{out_ext}",
+            filename=f"edited-{session_id[:8]}_{timestamp_str}{out_ext}",
             media_type=media_type,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
         )
 
     export_id = str(uuid.uuid4())[:8]
@@ -2230,7 +2233,8 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
 
         local_exports_dir = PROJECT_ROOT / "exports"
         local_exports_dir.mkdir(exist_ok=True)
-        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}{out_ext}"
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}_{timestamp_str}{out_ext}"
         import shutil
         shutil.copyfile(output_path, local_copy_path)
         print(f"[fast-export] Saved local copy to {local_copy_path}")
@@ -2238,8 +2242,9 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
-            filename=f"edited-{session_id[:8]}{out_ext}",
+            filename=f"edited-{session_id[:8]}_{timestamp_str}{out_ext}",
             media_type=media_type,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
         )
 
     except subprocess.CalledProcessError as e:
@@ -2270,7 +2275,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         raise HTTPException(status_code=404, detail="Source video not found")
         
     selected_id_set = set(body.selectedIds) if body.selectedIds is not None else None
-    top_level_clips = [clip for clip in body.timeline if clip.get("track", 0) == 0 and (selected_id_set is None or clip.get("id") in selected_id_set)]
+    top_level_clips = [clip for clip in body.timeline if clip.get("track", 0) == 0]
     has_video_assets = any(
         (clip.get("assetUrl") or (isinstance(seg, dict) and seg.get("assetUrl")))
         for clip in top_level_clips
@@ -2290,7 +2295,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
     if body.mode == "clips" and clips_zip_cache_path.exists() and clips_zip_cache_path.stat().st_size > 1024:
         local_exports_dir = PROJECT_ROOT / "exports"
         local_exports_dir.mkdir(exist_ok=True)
-        local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}.zip"
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
         import shutil
         shutil.copyfile(clips_zip_cache_path, local_copy_path)
         print(f"[export-zip] Saved local copy to {local_copy_path} (from cache)")
@@ -2298,13 +2304,15 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         return FileResponse(
             str(clips_zip_cache_path),
             media_type="application/zip",
-            filename=f"autoedit_clips_{session_id[:8]}.zip"
+            filename=f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
         )
     if body.mode == "whole" and whole_video_cache_path.exists() and whole_video_cache_path.stat().st_size > 1024:
         local_exports_dir = PROJECT_ROOT / "exports"
         local_exports_dir.mkdir(exist_ok=True)
         filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
-        local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}{out_ext}"
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}"
         import shutil
         shutil.copyfile(whole_video_cache_path, local_copy_path)
         print(f"[export-zip] Saved local copy to {local_copy_path} (from cache)")
@@ -2314,7 +2322,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         return FileResponse(
             str(whole_video_cache_path),
             media_type=media_type,
-            filename=f"{filename_prefix}_{session_id[:8]}{out_ext}"
+            filename=f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
         )
 
     temp_dir = Path(tempfile.mkdtemp(prefix=f"export_{session_id}_"))
@@ -2328,7 +2337,6 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         audio_clips = [
             clip for clip in body.timeline
             if clip.get("assetKind") == "audio" and (clip.get("assetUrl") or "").strip()
-            and (selected_id_set is None or clip.get("id") in selected_id_set)
         ]
 
         has_any_audio_tracks = any(
@@ -2463,12 +2471,18 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     
             local_exports_dir = PROJECT_ROOT / "exports"
             local_exports_dir.mkdir(exist_ok=True)
-            local_copy_path = local_exports_dir / f"autoedit_export_{session_id[:8]}.zip"
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            local_copy_path = local_exports_dir / f"autoedit_export_{session_id[:8]}_{timestamp_str}.zip"
             import shutil
             shutil.copyfile(clips_zip_cache_path, local_copy_path)
             print(f"[export-zip] Saved local copy to {local_copy_path}")
 
-            return FileResponse(str(clips_zip_cache_path), media_type="application/zip", filename=f"autoedit_export_{session_id[:8]}.zip")
+            return FileResponse(
+                str(clips_zip_cache_path), 
+                media_type="application/zip", 
+                filename=f"autoedit_export_{session_id[:8]}_{timestamp_str}.zip",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+            )
 
         main_video_path = temp_dir / f"main_edited_video{out_ext}"
 
@@ -2710,7 +2724,14 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     cmd.extend(["-i", str(audio_path)])
 
                 filters = []
-                mix_inputs = ["[0:a]"]
+                
+                probe_main = subprocess.run([
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name", "-of", "json", str(main_video_path)
+                ], capture_output=True, text=True)
+                main_has_audio = bool(json.loads(probe_main.stdout).get("streams"))
+                
+                mix_inputs = ["[0:a]"] if main_has_audio else []
                 for idx, (_audio_path, audio_clip) in enumerate(audio_inputs, start=1):
                     source_start = float(audio_clip.get("sourceStart", audio_clip.get("start", 0)) or 0)
                     duration = float(audio_clip.get("duration", 0) or max(0.0, float(audio_clip.get("sourceEnd", audio_clip.get("end", 0)) or 0) - source_start))
@@ -2719,7 +2740,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     
                     trim = f"atrim=start={source_start}:duration={duration}" if duration > 0 else f"atrim=start={source_start}"
                     delay_ms = int(timeline_start * 1000)
-                    delay_filter = f"adelay={delay_ms}|{delay_ms}" if delay_ms > 0 else ""
+                    delay_filter = f"adelay={delay_ms}:all=1" if delay_ms > 0 else ""
                     
                     filter_parts = [trim, "asetpts=PTS-STARTPTS", f"volume={volume}"]
                     if delay_filter:
@@ -2728,17 +2749,33 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     filters.append(f"[{idx}:a]{','.join(filter_parts)}[aud{idx}]")
                     mix_inputs.append(f"[aud{idx}]")
 
-                filters.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0[aout]")
-                cmd.extend([
-                    "-filter_complex", ";".join(filters),
-                    "-map", "0:v",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    str(mixed_video_path)
-                ])
+                inputs_count = len(mix_inputs)
+                if inputs_count > 1:
+                    # duration=first works if we have [0:a]. If we don't, it matches the first audio clip. We use longest instead if no main audio.
+                    duration_param = "first" if main_has_audio else "longest"
+                    filters.append(f"{''.join(mix_inputs)}amix=inputs={inputs_count}:duration={duration_param}:dropout_transition=0[aout]")
+                    cmd.extend([
+                        "-filter_complex", ";".join(filters),
+                        "-map", "0:v",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        str(mixed_video_path)
+                    ])
+                elif inputs_count == 1 and not main_has_audio:
+                    filters.append(f"{mix_inputs[0]}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]")
+                    cmd.extend([
+                        "-filter_complex", ";".join(filters),
+                        "-map", "0:v",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        str(mixed_video_path)
+                    ])
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
                 if mixed_video_path.exists():
                     main_video_path = mixed_video_path
@@ -2751,7 +2788,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             local_exports_dir = PROJECT_ROOT / "exports"
             local_exports_dir.mkdir(exist_ok=True)
             filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
-            local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}{out_ext}"
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}"
             import shutil
             shutil.copyfile(whole_video_cache_path, local_copy_path)
             print(f"[export-zip] Saved local copy to {local_copy_path}")
@@ -2761,7 +2799,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             return FileResponse(
                 str(whole_video_cache_path),
                 media_type=media_type,
-                filename=f"{filename_prefix}_{session_id[:8]}{out_ext}"
+                filename=f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
             )
             
         if body.mode == "clips":
@@ -2820,7 +2859,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     
             local_exports_dir = PROJECT_ROOT / "exports"
             local_exports_dir.mkdir(exist_ok=True)
-            local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}.zip"
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
             import shutil
             shutil.copyfile(clips_zip_cache_path, local_copy_path)
             print(f"[export-zip] Saved local copy to {local_copy_path}")
@@ -2828,7 +2868,8 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             return FileResponse(
                 str(clips_zip_cache_path),
                 media_type="application/zip",
-                filename=f"autoedit_clips_{session_id[:8]}.zip"
+                filename=f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
             )
 
     except subprocess.CalledProcessError as e:
@@ -4069,7 +4110,8 @@ async def export_video(session_id: str, body: ExportRequest):
         # Save a copy to local 'exports' directory
         local_exports_dir = PROJECT_ROOT / "exports"
         local_exports_dir.mkdir(exist_ok=True)
-        local_copy_path = local_exports_dir / f"edited_{session_id[:8]}{out_ext}"
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_copy_path = local_exports_dir / f"edited_{session_id[:8]}_{timestamp_str}{out_ext}"
         import shutil
         shutil.copyfile(output_path, local_copy_path)
         print(f"[export] Saved local copy to {local_copy_path}")
@@ -4078,9 +4120,10 @@ async def export_video(session_id: str, body: ExportRequest):
         return FileResponse(
             path=str(output_path),
             media_type=media_type,
-            filename=f"edited_{session_id[:8]}{out_ext}",
+            filename=f"edited_{session_id[:8]}_{timestamp_str}{out_ext}",
             headers={
-                "Content-Disposition": f'attachment; filename="edited_{session_id[:8]}{out_ext}"'
+                "Content-Disposition": f'attachment; filename="edited_{session_id[:8]}_{timestamp_str}{out_ext}"',
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
             }
         )
 
@@ -4258,7 +4301,7 @@ def _wrap_caption(text: str, width: int = 34) -> str:
     import textwrap
     cleaned = " ".join(str(text or "").split())
     lines = textwrap.wrap(cleaned, width=width, max_lines=2, placeholder="")
-    return "\\N".join(lines) if lines else ""
+    return "\n".join(lines) if lines else ""
 
 def _caption_style(style: str) -> tuple[str, int, int, int]:
     if style == "minimal_bottom":
@@ -4344,15 +4387,20 @@ def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration
         return []
 
     try:
+        import concurrent.futures
+        
         with tempfile.TemporaryDirectory(prefix=f"shorts_{job_id}_") as tmp:
-            audio_path = Path(tmp) / "clip.mp3"
+            temp_dir = Path(tmp)
+            
+            # Segment the audio directly with ffmpeg into 20s chunks for parallel processing
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", f"{clip_start:.3f}",
                 "-i", str(video_path),
                 "-t", f"{clip_duration:.3f}",
-                "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
-                str(audio_path)
+                "-vn", "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "16000", "-ac", "1",
+                "-f", "segment", "-segment_time", "20",
+                str(temp_dir / "out_%03d.mp3")
             ]
             
             import re
@@ -4372,29 +4420,63 @@ def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration
                         _update_short_job(job_id, progress=current_progress)
             
             process.wait()
-            if process.returncode != 0 or not audio_path.exists():
+            if process.returncode != 0:
                 _append_short_log(job_id, "Could not extract audio for captions; rendering with fallback text.")
                 return []
             
             if base_prog < max_prog:
                 _update_short_job(job_id, progress=base_prog + int((max_prog - base_prog) * 0.35))
 
-            with open(audio_path, "rb") as audio_file:
-                response = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="verbose_json",
-                    language="en",
-                )
+            chunk_files = sorted(list(temp_dir.glob("out_*.mp3")))
+            if not chunk_files:
+                return []
 
-        raw_segments = getattr(response, "segments", None) or []
-        segments = []
-        for item in raw_segments:
-            start = float(getattr(item, "start", item.get("start", 0) if isinstance(item, dict) else 0) or 0)
-            end = float(getattr(item, "end", item.get("end", start + 3) if isinstance(item, dict) else start + 3) or start + 3)
-            text = getattr(item, "text", item.get("text", "") if isinstance(item, dict) else "")
-            if str(text).strip():
-                segments.append({"start": start, "end": end, "text": str(text).strip()})
+            def _transcribe_chunk(cf, offset_time):
+                import time
+                if cf.stat().st_size < 500:
+                    return []
+                for attempt in range(3):
+                    try:
+                        with open(cf, "rb") as af:
+                            resp = client.audio.transcriptions.create(
+                                model="whisper-1",
+                                file=af,
+                                response_format="verbose_json",
+                                language="en"
+                            )
+                        
+                        segs = []
+                        raw_segments = getattr(resp, "segments", None) or []
+                        for item in raw_segments:
+                            s_start = float(getattr(item, "start", item.get("start", 0) if isinstance(item, dict) else 0) or 0)
+                            s_end = float(getattr(item, "end", item.get("end", s_start + 3) if isinstance(item, dict) else s_start + 3) or s_start + 3)
+                            text = getattr(item, "text", item.get("text", "") if isinstance(item, dict) else "")
+                            if str(text).strip():
+                                segs.append({
+                                    "start": round(s_start + offset_time, 2),
+                                    "end": round(s_end + offset_time, 2),
+                                    "text": str(text).strip()
+                                })
+                        return segs
+                    except Exception as e:
+                        error_str = repr(e).lower() + " " + str(e).lower()
+                        if any(k in error_str for k in ["audio_too_short", "too short", "minimum audio length", "invalid_request_error"]):
+                            return []
+                        if attempt == 2:
+                            print(f"Chunk transcription failed: {e}")
+                            return []
+                        time.sleep(2 ** attempt)
+                return []
+
+            segments = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = []
+                for i, cf in enumerate(chunk_files):
+                    offset = i * 20.0
+                    futures.append(executor.submit(_transcribe_chunk, cf, offset))
+                
+                for future in futures:
+                    segments.extend(future.result())
                 
         if base_prog < max_prog:
             _update_short_job(job_id, progress=max_prog)
@@ -4431,70 +4513,91 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
         ai_selected_clip = False
         
         # --- AI ANALYSIS FOR CLIP SELECTION ---
-        instruction_text = req.instruction.strip() if req.instruction and req.instruction.strip() else "Find the most engaging, viral, and interesting segment suitable for a short-form video."
+        user_instruction = req.instruction.strip() if req.instruction and req.instruction.strip() else (req.prompt.strip() if getattr(req, 'prompt', None) else "")
+        instruction_text = user_instruction if user_instruction else "Find the most engaging, viral, and interesting segment suitable for a short-form video."
+        
         if client.api_key and not manual_clip:
             if not req.transcriptSegments:
                 _update_short_job(job_id, status="transcribing", progress=5)
                 _append_short_log(job_id, "No transcript provided. Transcribing full video for content analysis...")
-                # To avoid Whisper limit, cap at 45 minutes for analysis
-                analysis_duration = min(source_duration, 2700) 
+                # Analyze up to first 5 minutes to ensure AI selection loads extremely fast
+                analysis_duration = min(source_duration, 300) 
                 req.transcriptSegments = _transcribe_clip_segments(video_path, 0, analysis_duration, job_id, base_prog=5, max_prog=15)
 
-            if req.transcriptSegments:
-                _update_short_job(job_id, status="picking", progress=15)
-                _append_short_log(job_id, f"Analyzing video content to select the best segment. Instruction: '{instruction_text}'...")
-                try:
-                    import json as _json
-                    import re as _re_json
+            _update_short_job(job_id, status="picking", progress=15)
+            _append_short_log(job_id, f"Analyzing video content to select the best segment. Instruction: '{instruction_text}'...")
+            try:
+                import json as _json
+                import re as _re_json
+                
+                if req.transcriptSegments and len(req.transcriptSegments) > 0:
                     seg_text = "\n".join([f"[{s.get('start', 0)}s - {s.get('end', 0)}s] {s.get('text', '')}" for s in req.transcriptSegments[:1000]])
-                    
-                    prompt = (
-                        f"You are an AI video editor. The user has provided a STRICT instruction for this short: '{instruction_text}'.\n"
-                        f"You MUST review the transcript segments below and select the continuous part of the video that BEST matches this instruction.\n"
-                        f"The requested duration is EXACTLY {requested_duration} seconds.\n"
-                        f"The source video duration is {source_duration:.2f} seconds.\n"
-                        f"Selection nonce: {job_id}. If there are multiple strong matches, use this nonce to choose a fresh matching moment instead of always choosing the same segment.\n"
-                        f"Do not choose a segment merely because it appears first. Prioritize instruction match, hook strength, and self-contained meaning.\n"
-                        f"Return ONLY valid JSON with 'start' and 'end' keys (numbers in seconds). Example: {{\"start\": 12.5, \"end\": {12.5 + requested_duration}}}\n\n"
-                        f"Transcript:\n{seg_text}"
-                    )
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.7,
-                        response_format={"type": "json_object"}
-                    )
-                    raw = resp.choices[0].message.content.strip()
-                    
-                    json_match = _re_json.search(r'```(?:json)?\s*(.*?)\s*```', raw, _re_json.DOTALL)
-                    if json_match:
-                        raw = json_match.group(1).strip()
-                    else:
-                        start_obj = raw.find('{')
-                        end_obj = raw.rfind('}')
-                        if start_obj != -1 and end_obj != -1:
-                            raw = raw[start_obj:end_obj+1]
-                            
-                    ans = _json.loads(raw)
-                    if "start" in ans and "end" in ans:
-                        clip_start = float(ans["start"])
+                else:
+                    seg_text = "[No speech/transcript detected in this video]"
+                
+                system_prompt = (
+                    "You are an expert AI video editor. Your task is to select the EXACT continuous segment from the video "
+                    "that most appropriately matches the user's instruction, based entirely on the transcript content.\n\n"
+                    "CRITICAL RULES:\n"
+                    "1. Thoroughly read the transcript and evaluate which spoken parts perfectly align with the user's focus/instruction.\n"
+                    "2. If the instruction asks for a specific topic (e.g. 'the part about X'), locate the exact timestamps where X is discussed.\n"
+                    "3. If specific timestamps are literally requested (e.g. 'from 15s to 90s'), use those exact timestamps.\n"
+                    f"4. The target duration is roughly {requested_duration} seconds, but prioritize semantic completeness (don't cut off mid-sentence).\n"
+                    "5. Return ONLY a valid JSON object with 'start' and 'end' keys (numbers in seconds)."
+                )
+                user_message = (
+                    f"Instruction or focus: '{instruction_text}'\n"
+                    f"Requested Duration: {requested_duration}s\n"
+                    f"Video Duration: {source_duration:.2f}s\n\n"
+                    f"Transcript:\n{seg_text}"
+                )
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
+                )
+                raw = resp.choices[0].message.content.strip()
+                
+                json_match = _re_json.search(r'```(?:json)?\s*(.*?)\s*```', raw, _re_json.DOTALL)
+                if json_match:
+                    raw = json_match.group(1).strip()
+                else:
+                    start_obj = raw.find('{')
+                    end_obj = raw.rfind('}')
+                    if start_obj != -1 and end_obj != -1:
+                        raw = raw[start_obj:end_obj+1]
                         
-                        req.clipEnd = clip_start + requested_duration
-                        ai_selected_clip = True
-                        _append_short_log(job_id, f"AI selected segment based on instruction: {clip_start}s to {req.clipEnd}s (Duration enforced: {requested_duration}s)")
-                except Exception as e:
-                    _append_short_log(job_id, f"AI analysis failed, falling back to default start: {e}")
+                ans = _json.loads(raw)
+                if "start" in ans and "end" in ans:
+                    clip_start = float(ans["start"])
+                    req.clipEnd = clip_start + requested_duration
+                    ai_selected_clip = True
+                    _append_short_log(job_id, f"AI selected segment based on instruction: {clip_start:.2f}s to {req.clipEnd:.2f}s (Duration enforced: {requested_duration}s)")
+            except Exception as e:
+                _append_short_log(job_id, f"AI analysis failed, falling back: {e}")
         # ----------------------------------------
 
         if manual_clip:
             clip_duration = float(req.clipEnd) - clip_start
         else:
-            clip_duration = requested_duration
+            if ai_selected_clip and getattr(req, "clipEnd", None):
+                clip_duration = float(req.clipEnd) - clip_start
+            else:
+                clip_duration = requested_duration
+                
         if source_duration > 0:
             if not manual_clip and not ai_selected_clip and source_duration > clip_duration:
-                import random
-                clip_start = random.uniform(0.0, max(0.0, source_duration - clip_duration))
-                _append_short_log(job_id, f"No AI clip selection available; using a fresh fallback window at {clip_start:.2f}s.")
+                if user_instruction:
+                    clip_start = 0.0
+                    _append_short_log(job_id, f"No AI clip selection available; using fallback window starting at {clip_start:.2f}s.")
+                else:
+                    import random
+                    clip_start = random.uniform(0.0, max(0.0, source_duration - clip_duration))
+                    _append_short_log(job_id, f"No AI clip selection available; using a random fallback window at {clip_start:.2f}s.")
             clip_duration = min(clip_duration, max(1.0, source_duration))
             clip_start = min(max(0.0, clip_start), max(0.0, source_duration - clip_duration))
 
@@ -4503,8 +4606,23 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
 
         _update_short_job(job_id, status="captioning", progress=25)
         _append_short_log(job_id, f"Source resolved: {video_path.name}")
-        _append_short_log(job_id, "Transcribing selected audio for visible captions.")
-        segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id, base_prog=25, max_prog=45)
+
+        segments = []
+        if req.transcriptSegments:
+            _append_short_log(job_id, "Using existing transcript for captions (skipping re-transcription).")
+            for s in req.transcriptSegments:
+                s_start = float(s.get("start", 0))
+                s_end = float(s.get("end", s_start + 3))
+                if s_end > clip_start and s_start < clip_start + clip_duration:
+                    segments.append({
+                        "start": max(0.0, s_start - clip_start),
+                        "end": s_end - clip_start,
+                        "text": s.get("text", "")
+                    })
+            _update_short_job(job_id, progress=45)
+        else:
+            _append_short_log(job_id, "Transcribing selected audio for visible captions.")
+            segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id, base_prog=25, max_prog=45)
 
         hook = next((s["text"] for s in segments if s.get("text")), "")
         fallback_caption = hook or req.instruction.strip() or Path(req.filename or video_path.name).stem
@@ -4557,7 +4675,7 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
             "-i", str(video_path),
             "-t", f"{clip_duration:.3f}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "0", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             str(output_path)

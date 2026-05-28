@@ -2132,6 +2132,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             if out_path.exists():
                 clip_files.append(out_path)
                 chapters_meta.append({
+                    "id": clip.get("id"),
                     "index": len(clip_files),
                     "title": title,
                     "duration": round(clip_duration, 2),
@@ -2190,27 +2191,57 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     cmd.extend(["-i", str(audio_path)])
 
                 filters = []
-                mix_inputs = ["[0:a]"]
+                
+                probe_main = subprocess.run([
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name", "-of", "json", str(main_video_path)
+                ], capture_output=True, text=True)
+                main_has_audio = bool(json.loads(probe_main.stdout).get("streams"))
+                
+                mix_inputs = ["[0:a]"] if main_has_audio else []
                 for idx, (_audio_path, audio_clip) in enumerate(audio_inputs, start=1):
+                    source_start = float(audio_clip.get("sourceStart", audio_clip.get("start", 0)) or 0)
                     duration = float(audio_clip.get("duration", 0) or 0)
+                    timeline_start = float(audio_clip.get("timelineStart", 0) or 0)
                     volume = max(0.0, min(1.0, float(audio_clip.get("volume", 1) or 1)))
-                    trim = f"atrim=start=0"
-                    if duration > 0:
-                        trim += f":duration={duration}"
-                    filters.append(f"[{idx}:a]{trim},asetpts=PTS-STARTPTS,volume={volume}[aud{idx}]")
+                    
+                    trim = f"atrim=start={source_start}:duration={duration}" if duration > 0 else f"atrim=start={source_start}"
+                    delay_ms = int(timeline_start * 1000)
+                    delay_filter = f"adelay={delay_ms}:all=1" if delay_ms > 0 else ""
+                    
+                    filter_parts = [trim, "asetpts=PTS-STARTPTS", f"volume={volume}"]
+                    if delay_filter:
+                        filter_parts.append(delay_filter)
+                        
+                    filters.append(f"[{idx}:a]{','.join(filter_parts)}[aud{idx}]")
                     mix_inputs.append(f"[aud{idx}]")
 
-                filters.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0[aout]")
-                cmd.extend([
-                    "-filter_complex", ";".join(filters),
-                    "-map", "0:v",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    str(mixed_video_path)
-                ])
+                inputs_count = len(mix_inputs)
+                if inputs_count > 1:
+                    duration_param = "first" if main_has_audio else "longest"
+                    filters.append(f"{''.join(mix_inputs)}amix=inputs={inputs_count}:duration={duration_param}:dropout_transition=0[aout]")
+                    cmd.extend([
+                        "-filter_complex", ";".join(filters),
+                        "-map", "0:v",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        str(mixed_video_path)
+                    ])
+                elif inputs_count == 1 and not main_has_audio:
+                    filters.append(f"{mix_inputs[0]}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]")
+                    cmd.extend([
+                        "-filter_complex", ";".join(filters),
+                        "-map", "0:v",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-movflags", "+faststart",
+                        str(mixed_video_path)
+                    ])
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
                 if mixed_video_path.exists():
                     main_video_path = mixed_video_path
@@ -2232,31 +2263,33 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             final_clips_dir = temp_dir / "final_clips"
             final_clips_dir.mkdir(exist_ok=True)
             
+            selected_id_set = set(body.selectedIds) if body.selectedIds is not None else None
             final_clip_files = []
             current_start_time = 0.0
             
             # Slice the fully mixed video back into perfectly timed individual clips
             for idx, chapter in enumerate(chapters_meta):
-                duration = chapter["duration"]
-                title = chapter["title"]
-                safe_title = "".join([c if c.isalnum() or c in " _-" else "_" for c in title])
-                out_path = final_clips_dir / f"{idx+1:02d}_{safe_title}.mp4"
-                
-                subprocess.run([
-                    "ffmpeg", "-y", "-ss", str(current_start_time), "-t", str(duration),
-                    "-i", str(main_video_path),
-                    "-c:v", "copy", "-c:a", "copy", str(out_path)
-                ], capture_output=True, text=True, check=True)
-                
-                if out_path.exists():
-                    final_clip_files.append(out_path)
+                if selected_id_set is None or chapter.get("id") in selected_id_set:
+                    duration = chapter["duration"]
+                    title = chapter["title"]
+                    safe_title = "".join([c if c.isalnum() or c in " _-" else "_" for c in title])
+                    out_path = final_clips_dir / f"{idx+1:02d}_{safe_title}{out_ext}"
+                    
+                    subprocess.run([
+                        "ffmpeg", "-y", "-ss", str(current_start_time), "-t", str(duration),
+                        "-i", str(main_video_path),
+                        "-c:v", "copy", "-c:a", "copy", str(out_path)
+                    ], capture_output=True, text=True, check=True)
+                    
+                    if out_path.exists():
+                        final_clip_files.append(out_path)
                 
                 current_start_time += duration
                 
             with zipfile.ZipFile(clips_zip_cache_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for cf in final_clip_files:
                     zipf.write(cf, f"Exported_Media/{cf.name}")
-                    
+
             return FileResponse(
                 str(clips_zip_cache_path),
                 media_type="application/zip",
@@ -3812,7 +3845,7 @@ def _wrap_caption(text: str, width: int = 34) -> str:
     import textwrap
     cleaned = " ".join(str(text or "").split())
     lines = textwrap.wrap(cleaned, width=width, max_lines=2, placeholder="")
-    return "\\N".join(lines) if lines else ""
+    return "\n".join(lines) if lines else ""
 
 def _caption_style(style: str) -> tuple[str, int, int, int]:
     if style == "minimal_bottom":
@@ -3898,37 +3931,78 @@ def _transcribe_clip_segments(video_path: Path, clip_start: float, clip_duration
         return []
 
     try:
+        import concurrent.futures
+        
         with tempfile.TemporaryDirectory(prefix=f"shorts_{job_id}_") as tmp:
-            audio_path = Path(tmp) / "clip.mp3"
+            temp_dir = Path(tmp)
+            
+            # Segment the audio directly with ffmpeg into 20s chunks for parallel processing
             extract = subprocess.run([
                 "ffmpeg", "-y",
                 "-ss", f"{clip_start:.3f}",
                 "-i", str(video_path),
                 "-t", f"{clip_duration:.3f}",
-                "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
-                str(audio_path)
+                "-vn", "-c:a", "libmp3lame", "-b:a", "64k", "-ar", "16000", "-ac", "1",
+                "-f", "segment", "-segment_time", "20",
+                str(temp_dir / "out_%03d.mp3")
             ], capture_output=True, text=True)
+            
             if extract.returncode != 0 or not audio_path.exists():
                 _append_short_log(job_id, "Could not extract audio for captions; rendering with fallback text.")
                 return []
 
-            with open(audio_path, "rb") as audio_file:
-                response = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="verbose_json",
-                    language="en",
-                )
+            chunk_files = sorted(list(temp_dir.glob("out_*.mp3")))
+            if not chunk_files:
+                return []
 
-        raw_segments = getattr(response, "segments", None) or []
-        segments = []
-        for item in raw_segments:
-            start = float(getattr(item, "start", item.get("start", 0) if isinstance(item, dict) else 0) or 0)
-            end = float(getattr(item, "end", item.get("end", start + 3) if isinstance(item, dict) else start + 3) or start + 3)
-            text = getattr(item, "text", item.get("text", "") if isinstance(item, dict) else "")
-            if str(text).strip():
-                segments.append({"start": start, "end": end, "text": str(text).strip()})
-        return segments
+            def _transcribe_chunk(cf, offset_time):
+                import time
+                if cf.stat().st_size < 500:
+                    return []
+                for attempt in range(3):
+                    try:
+                        with open(cf, "rb") as af:
+                            resp = client.audio.transcriptions.create(
+                                model="whisper-1",
+                                file=af,
+                                response_format="verbose_json",
+                                language="en"
+                            )
+                        
+                        segs = []
+                        raw_segments = getattr(resp, "segments", None) or []
+                        for item in raw_segments:
+                            s_start = float(getattr(item, "start", item.get("start", 0) if isinstance(item, dict) else 0) or 0)
+                            s_end = float(getattr(item, "end", item.get("end", s_start + 3) if isinstance(item, dict) else s_start + 3) or s_start + 3)
+                            text = getattr(item, "text", item.get("text", "") if isinstance(item, dict) else "")
+                            if str(text).strip():
+                                segs.append({
+                                    "start": round(s_start + offset_time, 2),
+                                    "end": round(s_end + offset_time, 2),
+                                    "text": str(text).strip()
+                                })
+                        return segs
+                    except Exception as e:
+                        error_str = repr(e).lower() + " " + str(e).lower()
+                        if any(k in error_str for k in ["audio_too_short", "too short", "minimum audio length", "invalid_request_error"]):
+                            return []
+                        if attempt == 2:
+                            print(f"Chunk transcription failed: {e}")
+                            return []
+                        time.sleep(2 ** attempt)
+                return []
+
+            segments = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = []
+                for i, cf in enumerate(chunk_files):
+                    offset = i * 20.0
+                    futures.append(executor.submit(_transcribe_chunk, cf, offset))
+                
+                for future in futures:
+                    segments.extend(future.result())
+                    
+            return segments
     except Exception as exc:
         _append_short_log(job_id, f"Caption transcription failed: {str(exc)[:180]}")
         return []
@@ -3965,8 +4039,8 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
             if not req.transcriptSegments:
                 _update_short_job(job_id, status="transcribing", progress=5)
                 _append_short_log(job_id, "No transcript provided. Transcribing full video for content analysis...")
-                # To avoid Whisper limit, cap at 45 minutes for analysis
-                analysis_duration = min(source_duration, 2700) 
+                # Analyze up to first 5 minutes to ensure AI selection loads extremely fast
+                analysis_duration = min(source_duration, 300) 
                 req.transcriptSegments = _transcribe_clip_segments(video_path, 0, analysis_duration, job_id)
 
             if req.transcriptSegments:
@@ -4032,8 +4106,22 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
 
         _update_short_job(job_id, status="captioning", progress=25)
         _append_short_log(job_id, f"Source resolved: {video_path.name}")
-        _append_short_log(job_id, "Transcribing selected audio for visible captions.")
-        segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
+        
+        segments = []
+        if req.transcriptSegments:
+            _append_short_log(job_id, "Using existing transcript for captions (skipping re-transcription).")
+            for s in req.transcriptSegments:
+                s_start = float(s.get("start", 0))
+                s_end = float(s.get("end", s_start + 3))
+                if s_end > clip_start and s_start < clip_start + clip_duration:
+                    segments.append({
+                        "start": max(0.0, s_start - clip_start),
+                        "end": s_end - clip_start,
+                        "text": s.get("text", "")
+                    })
+        else:
+            _append_short_log(job_id, "Transcribing selected audio for visible captions.")
+            segments = _transcribe_clip_segments(video_path, clip_start, clip_duration, job_id)
 
         hook = next((s["text"] for s in segments if s.get("text")), "")
         fallback_caption = hook or req.instruction.strip() or Path(req.filename or video_path.name).stem
@@ -4070,7 +4158,7 @@ def process_short_job(job_id: str, session_id: str, req: GenerateShortRequest):
             "-i", str(video_path),
             "-t", f"{clip_duration:.3f}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "0", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             str(output_path)

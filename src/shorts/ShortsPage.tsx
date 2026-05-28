@@ -188,6 +188,7 @@ export default function ShortsPage() {
           duration,
           captionStyle,
           instruction,
+          prompt: instruction,
           videoDuration: source.duration,
           width: source.width,
           height: source.height,
@@ -496,7 +497,11 @@ export default function ShortsPage() {
 
             <label>
               <span style={{ display: "block", fontWeight: 700, marginBottom: "0.5rem" }}>Target duration: {duration}s</span>
-              <input type="range" min="15" max="90" value={duration} onChange={(e) => setDuration(Number(e.target.value))} style={{ width: "100%", accentColor: "#4a9eff" }} />
+              <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+                <span style={{ fontSize: "0.85rem", color: "#aaa", fontWeight: 600 }}>15s</span>
+                <input type="range" min="15" max="90" value={duration} onChange={(e) => setDuration(Number(e.target.value))} style={{ flex: 1, accentColor: "#4a9eff", margin: 0 }} title={`${duration}s`} />
+                <span style={{ fontSize: "0.85rem", color: "#aaa", fontWeight: 600 }}>90s</span>
+              </div>
             </label>
 
             <div>

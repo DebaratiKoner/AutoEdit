@@ -181,8 +181,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const [isAiEditing, setIsAiEditing] = useState(false);
   const [isExporting, setIsExporting] = useState<'whole' | 'clips' | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
-  const [exportMode, setExportMode] = useState<'whole' | 'selected'>('whole');
-  const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(new Set());
+  const [showExportClipsModal, setShowExportClipsModal] = useState(false);
+  const [exportSelectedClipIds, setExportSelectedClipIds] = useState<string[]>([]);
   const [globalVolume] = useState(1); // Global audio volume control (0-1) - only affects audio tracks
 
   const [videoVolume, setVideoVolume] = useState(1); // Video playback volume (0-1)
@@ -2440,34 +2440,21 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   const postExportDownload = async (payload: unknown) => {
     try {
-      const response = await fetch(`/api/videos/${sessionId}/export-zip`, {
+      const response = await fetch(`/api/videos/${sessionId}/export-zip-download`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `payload=${encodeURIComponent(JSON.stringify(payload))}`
       });
-
-      if (!response.ok) {
-        throw new Error(`Export failed: ${response.statusText}`);
+      
+      if (!response.ok) throw new Error('Export failed');
+      
+      let filename = `edited_${sessionId.slice(0, 8)}.mp4`;
+      const disposition = response.headers.get('Content-Disposition');
+      if (disposition && disposition.includes('filename=')) {
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        if (match && match[1]) filename = match[1];
       }
-
-      let filename = `export-${sessionId.slice(0, 8)}.zip`;
-      const contentDisposition = response.headers.get('Content-Disposition');
-      if (contentDisposition) {
-        const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
-        if (filenameMatch && filenameMatch[1]) {
-          filename = filenameMatch[1];
-        }
-      } else {
-        const p = payload as any;
-        if (p.mode === 'whole') {
-          filename = `autoedit_whole_${sessionId.slice(0, 8)}.mp4`;
-        } else {
-          filename = `autoedit_clips_${sessionId.slice(0, 8)}.zip`;
-        }
-      }
-
+      
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -2476,10 +2463,8 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       a.download = filename;
       document.body.appendChild(a);
       a.click();
-      window.setTimeout(() => {
-        window.URL.revokeObjectURL(url);
-        a.remove();
-      }, 100);
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
     } catch (error) {
       console.error('Export error:', error);
       alert('Failed to export video. Please try again.');
@@ -2488,22 +2473,16 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     }
   };
 
-  const handleExportConfirm = async () => {
-    logger.operation(`Export started`);
+  const handleExportConfirm = async (mode: 'whole' | 'clips', selectedIds?: string[]) => {
+    logger.operation(`Export started - Mode: ${mode}`);
 
     if (!session || session.timeline.length === 0) {
       alert("No clips to export");
       return;
     }
 
-    if (exportMode === 'selected') {
-      if (selectedExportIds.size === 0) {
-        alert("Please select at least one item to export");
-        return;
-      }
-    }
-    
-    setIsExporting(exportMode === 'whole' ? 'whole' : 'clips');
+    setIsExporting(mode);
+    setShowExportMenu(false);
 
     // Decode proxy URLs so the backend can fetch the actual asset, or make local URLs absolute
     const decodedFullTimeline = session.timeline.map(clip => {
@@ -2522,36 +2501,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return { ...clip, assetUrl: url };
     });
 
-    let exportSelectedIds: string[] | undefined;
-    if (exportMode === 'selected') {
-      const selectedIds = new Set(selectedExportIds);
-      const selectedRanges = session.timeline
-        .filter(clip => selectedIds.has(clip.id) && (clip.track ?? 0) === 0)
-        .map(clip => {
-          const start = Number(clip.timelineStart ?? 0);
-          return { start, end: start + Number(clip.duration || 0) };
-        });
-
-      for (const clip of session.timeline) {
-        if (selectedIds.has(clip.id) || (clip.track ?? 0) === 0) continue;
-        const start = Number(clip.timelineStart ?? 0);
-        const end = start + Number(clip.duration || 0);
-        if (selectedRanges.some(range => start < range.end && range.start < end)) {
-          selectedIds.add(clip.id);
-        }
-      }
-
-      exportSelectedIds = Array.from(selectedIds);
-    }
-
     await postExportDownload({
       timeline: decodedFullTimeline,
-      selectedIds: exportSelectedIds,
+      selectedIds,
       transcriptSegments: session.transcriptSegments || [],
-      mode: exportMode === 'whole' ? 'whole' : 'clips'
+      mode
     });
 
-    logger.operation(`${exportMode} export download requested`);
+    logger.operation(`${mode} export download requested`);
   };
 
   const handleGenerateShort = () => {
@@ -2615,77 +2572,55 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <div className="export-menu" style={{ position: 'relative' }}>
               <button
                 className="btn btn-primary"
-                onClick={() => {
-                  setShowExportMenu(open => {
-                    if (!open) {
-                      setExportMode('whole');
-                      setSelectedExportIds(new Set(session?.timeline.map(c => c.id) || []));
-                    }
-                    return !open;
-                  });
-                }}
+                onClick={() => setShowExportMenu(!showExportMenu)}
                 disabled={isExporting !== null}
-                aria-haspopup="menu"
-                aria-expanded={showExportMenu}
               >
-                {isExporting ? 'Exporting...' : 'Export'}
-                <span className="export-menu-caret" style={{ marginLeft: '6px', fontSize: '0.8rem' }}>▼</span>
+                {isExporting ? `Exporting ${isExporting}...` : 'Export ▼'}
               </button>
               {showExportMenu && (
-                <div className="export-dropdown" role="menu" style={{ position: 'absolute', top: 'calc(100% + 8px)', right: 0, width: '320px', padding: '1rem', background: '#1e1e1e', border: '1px solid #333', borderRadius: '6px', zIndex: 100, boxShadow: '0 4px 12px rgba(0,0,0,0.5)' }} onClick={e => e.stopPropagation()}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                    <div style={{ fontWeight: 'bold', color: '#fff', fontSize: '1rem' }}>Export Options</div>
-                    <button style={{ background: 'none', border: 'none', color: '#aaa', cursor: 'pointer', fontSize: '1.2rem', padding: 0 }} onClick={() => setShowExportMenu(false)}>×</button>
+                <>
+                  <div
+                    style={{ position: 'fixed', inset: 0, zIndex: 999 }}
+                    onClick={() => setShowExportMenu(false)}
+                  />
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: '100%',
+                      right: 0,
+                      marginTop: '0.5rem',
+                      background: '#1e2a3a',
+                      border: '1px solid #4a9eff',
+                      borderRadius: '6px',
+                      overflow: 'hidden',
+                      zIndex: 1000,
+                      minWidth: '200px',
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+                    }}
+                  >
+                    <button
+                      className="btn"
+                      style={{ width: '100%', textAlign: 'left', padding: '0.75rem 1rem', background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '0.9rem' }}
+                      onClick={() => handleExportConfirm('whole')}
+                    >
+                      Export as full video
+                    </button>
+                    <div style={{ height: '1px', background: '#2a2a3e' }} />
+                    <button
+                      className="btn"
+                      style={{ width: '100%', textAlign: 'left', padding: '0.75rem 1rem', background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '0.9rem' }}
+                      onClick={() => {
+                        setShowExportMenu(false);
+                        setShowExportClipsModal(true);
+                        if (session) {
+                          setExportSelectedClipIds(session.timeline.filter(s => s.track === 0).map(s => s.id));
+                        }
+                      }}
+                    >
+                      Export as separate clips 
+                    </button>
                   </div>
-                  
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '15px' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                      <input type="radio" name="export_mode" checked={exportMode === 'whole'} onChange={() => setExportMode('whole')} />
-                      <span style={{ color: '#fff', fontSize: '0.9rem' }}>Download Full Video</span>
-                    </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-                      <input type="radio" name="export_mode" checked={exportMode === 'selected'} onChange={() => setExportMode('selected')} />
-                      <span style={{ color: '#fff', fontSize: '0.9rem' }}>Download Specific Clips/Assets</span>
-                    </label>
-                  </div>
-
-                  {exportMode === 'selected' && (
-                    <div style={{ maxHeight: '250px', overflowY: 'auto', background: '#111', padding: '8px', borderRadius: '6px', marginBottom: '15px', border: '1px solid #333' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
-                        <span style={{ fontSize: '0.75rem', color: '#aaa' }}>Select items to download</span>
-                        <div style={{ display: 'flex', gap: '5px' }}>
-                          <button style={{ background: 'none', border: 'none', color: '#4a9eff', fontSize: '0.75rem', cursor: 'pointer', padding: 0 }} onClick={() => setSelectedExportIds(new Set(session?.timeline.map(c => c.id) || []))}>All</button>
-                          <span style={{ color: '#555' }}>|</span>
-                          <button style={{ background: 'none', border: 'none', color: '#4a9eff', fontSize: '0.75rem', cursor: 'pointer', padding: 0 }} onClick={() => setSelectedExportIds(new Set())}>None</button>
-                        </div>
-                      </div>
-                      
-                      <div style={{ marginBottom: '12px' }}>
-                        <div style={{ fontSize: '0.7rem', color: '#888', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px', borderBottom: '1px solid #333', paddingBottom: '2px' }}>
-                          Timeline Items
-                        </div>
-                        {(session?.timeline || []).map(clip => (
-                          <label key={clip.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 2px', cursor: 'pointer' }}>
-                            <input type="checkbox" checked={selectedExportIds.has(clip.id)} onChange={(e) => {
-                              const newSet = new Set(selectedExportIds);
-                              if (e.target.checked) newSet.add(clip.id); else newSet.delete(clip.id);
-                              setSelectedExportIds(newSet);
-                            }} />
-                            <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: clip.color || '#fff' }} />
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <div style={{ color: '#fff', fontSize: '0.8rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{clip.name || `Clip`}</div>
-                            </div>
-                            <div style={{ color: '#888', fontSize: '0.7rem' }}>{(clip.duration || 0).toFixed(1)}s</div>
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  <button className="btn btn-primary" style={{ width: '100%', padding: '0.6rem', textAlign: 'center' }} disabled={exportMode === 'selected' && selectedExportIds.size === 0} onClick={() => { setShowExportMenu(false); handleExportConfirm(); }}>
-                    Start Download
-                  </button>
-                </div>
+                </>
               )}
             </div>
           </div>
@@ -3645,7 +3580,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               // Phase 4.14: Capture FULL session snapshot BEFORE mutation
               const previousSnapshot = saveFullSessionSnapshot(session);
 
-              setSession({
+              const updatedSessionData: SessionData = {
                 ...session,
                 timeline: [...adjustedTrack0, ...otherTracks],
                 undoStack: [...session.undoStack, { 
@@ -3654,7 +3589,10 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                   actionType: 'ADD_ASSET' as const
                 }],
                 redoStack: [],
-              });
+              };
+              
+              setSession(updatedSessionData);
+              void sessionManager.saveSession(sessionId, updatedSessionData);
 
               // Scroll timeline to show the newly added clip
               setTimeout(() => {
@@ -3785,6 +3723,75 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
               </button>
               <button className="btn btn-danger" onClick={handleResetConfirm}>
                 Reset
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Export Clips Selection Modal */}
+      {showExportClipsModal && session && (
+        <div className="dialog-overlay" onClick={() => setShowExportClipsModal(false)}>
+          <div className="dialog" style={{ width: '400px', maxWidth: '90vw' }} onClick={(e) => e.stopPropagation()}>
+            <h2 style={{ marginTop: 0 }}>Select Clips to Export</h2>
+            <div style={{ display: 'flex', gap: '10px', marginBottom: '1rem' }}>
+              <button 
+                className="btn btn-secondary" 
+                style={{ padding: '4px 8px', fontSize: '0.8rem' }}
+                onClick={() => setExportSelectedClipIds(session.timeline.filter(s => s.track === 0).map(s => s.id))}
+              >
+                Select All
+              </button>
+              <button 
+                className="btn btn-secondary" 
+                style={{ padding: '4px 8px', fontSize: '0.8rem' }}
+                onClick={() => setExportSelectedClipIds([])}
+              >
+                Deselect All
+              </button>
+            </div>
+            
+            <div style={{ maxHeight: '300px', overflowY: 'auto', background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: '6px', padding: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {session.timeline
+                .filter(clip => clip.track === 0)
+                .sort((a, b) => a.order - b.order)
+                .map((clip) => (
+                  <label key={clip.id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', padding: '0.25rem' }}>
+                    <input 
+                      type="checkbox" 
+                      checked={exportSelectedClipIds.includes(clip.id)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setExportSelectedClipIds(prev => [...prev, clip.id]);
+                        } else {
+                          setExportSelectedClipIds(prev => prev.filter(id => id !== clip.id));
+                        }
+                      }}
+                      style={{ accentColor: '#4a9eff', width: '16px', height: '16px', flexShrink: 0 }}
+                    />
+                    <div style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: '#fff' }}>
+                      {clip.name || `Clip ${clip.order + 1}`}
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: '#888', fontVariantNumeric: 'tabular-nums' }}>
+                      {(clip.duration || 0).toFixed(1)}s
+                    </div>
+                  </label>
+                ))}
+            </div>
+
+            <div className="dialog-actions" style={{ marginTop: '1.5rem' }}>
+              <button className="btn btn-secondary" onClick={() => setShowExportClipsModal(false)}>
+                Cancel
+              </button>
+              <button 
+                className="btn btn-primary" 
+                onClick={() => {
+                  setShowExportClipsModal(false);
+                  handleExportConfirm('clips', exportSelectedClipIds);
+                }}
+                disabled={exportSelectedClipIds.length === 0}
+              >
+                Export Selected ({exportSelectedClipIds.length})
               </button>
             </div>
           </div>
