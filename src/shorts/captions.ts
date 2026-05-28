@@ -13,7 +13,7 @@ function toAssTime(sec: number): string {
 
 function escapeAssText(text: string): string {
   return text
-    .replace(/\\/g, "")
+    .replace(/\\/g, "\\\\")
     .replace(/\{/g, "\\{")
     .replace(/\}/g, "\\}")
     .replace(/\n/g, "\\N");
@@ -118,7 +118,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   const cleaned = words
     .map((w) => ({
       ...w,
-      word: (w.word || "").replace(/\\/g, "").trim(),
+      word: (w.word || "").trim(),
     }))
     .filter((w) => w.word.length > 0 && w.end > w.start);
 

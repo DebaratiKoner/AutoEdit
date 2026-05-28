@@ -1,5 +1,5 @@
 import { transcribeWithWords } from "./transcribe";
-import { pickBestClip } from "./clip-picker";
+import { planDynamicShort } from "./clip-picker";
 import { assembleJob } from "./assemble";
 import {
   appendLog,
@@ -37,7 +37,7 @@ export async function runPipeline(jobId: string): Promise<void> {
       );
     } else {
       appendLog(jobId, `Finding best clip with LLM…`);
-      clip = await pickBestClip({
+      clip = await planDynamicShort({
         segments,
         sourceDuration: job.source.duration,
         targetDuration: job.targetDuration,

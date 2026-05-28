@@ -90,6 +90,21 @@ SHORTS_DIR = PROJECT_ROOT / "src" / "shorts"
 SHORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Session → file path mapping — persisted to disk so server restarts don't lose it
+def _save_local_export_copy(source_path: Path, filename: str, log_prefix: str) -> list[Path]:
+    import shutil
+
+    saved_paths: list[Path] = []
+    for directory in [PROJECT_ROOT / "exports", Path.home() / "Downloads"]:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / filename
+            shutil.copyfile(source_path, destination)
+            saved_paths.append(destination)
+            print(f"[{log_prefix}] Saved local copy to {destination}")
+        except Exception as exc:
+            print(f"[{log_prefix}] Could not save local copy to {directory}: {exc}")
+    return saved_paths
+
 SESSION_STORE_PATH = Path("uploads/.sessions.json")
 
 def _load_session_store() -> dict:
@@ -1983,10 +1998,31 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
     if video_path is None:
         raise HTTPException(status_code=404, detail="Video file not found")
 
+    """
+    Extremely fast export using ffmpeg's concat demuxer for stream copying.
+    This is guaranteed to be fast but does NOT support timelines with mixed assets (images, etc.).
+    For asset support, use the /export-zip endpoint.
+    """
     timeline = body.timeline if body.timeline else body.clips
     if not timeline:
         raise HTTPException(status_code=400, detail="No clips/timeline provided")
 
+    # Flatten merged clips
+    flattened_timeline = []
+    for clip in timeline:
+        if clip.get("segments"):
+            for seg in clip["segments"]:
+                flat = dict(clip)
+                flat["sourceStart"] = seg.get("sourceStart", seg.get("start", 0))
+                flat["sourceEnd"] = seg.get("sourceEnd", seg.get("end", 0))
+                flat.pop("segments", None)
+                flattened_timeline.append(flat)
+        else:
+            flattened_timeline.append(clip)
+
+    has_assets = any(clip.get("assetUrl") for clip in flattened_timeline)
+
+    video_path = _get_video_path(session_id)
     signature = _export_signature(session_id, timeline)
 
     out_ext = video_path.suffix.lower()
@@ -1997,22 +2033,61 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
     export_dir.mkdir(parents=True, exist_ok=True)
     output_path = export_dir / f"{session_id}_{signature}{out_ext}"
 
-    if output_path.exists() and output_path.stat().st_size > 1024:
-        local_exports_dir = PROJECT_ROOT / "exports"
-        local_exports_dir.mkdir(exist_ok=True)
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}_{timestamp_str}{out_ext}"
-        import shutil
-        shutil.copyfile(output_path, local_copy_path)
-        print(f"[fast-export] Saved local copy to {local_copy_path} (from cache)")
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"edited-{session_id[:8]}_{timestamp_str}{out_ext}"
 
+    if output_path.exists() and output_path.stat().st_size > 1024:
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
-            filename=f"edited-{session_id[:8]}_{timestamp_str}{out_ext}",
+            filename=filename,
             media_type=media_type,
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+            headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"}
         )
+
+    if has_assets:
+        return await export_zip_endpoint(
+            session_id,
+            ExportZipRequest(timeline=timeline, transcriptSegments=[], mode="whole")
+        )
+
+    concat_txt_path = output_path.with_suffix(".txt")
+    valid_clip_count = 0
+    with open(concat_txt_path, "w", encoding="utf-8") as f:
+        for clip in flattened_timeline:
+            start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
+            end = float(clip.get("sourceEnd", clip.get("end", 0)) or 0)
+            duration = float(clip.get("duration") or 0)
+            if duration <= 0:
+                duration = max(0.0, end - start)
+            if duration <= 0.05:
+                continue
+            escaped_path = str(video_path.absolute()).replace("'", r"\'").replace("\\", "/")
+            f.write(f"file '{escaped_path}'\n")
+            f.write(f"inpoint {start}\n")
+            f.write(f"outpoint {start + duration}\n")
+            valid_clip_count += 1
+
+    if valid_clip_count == 0:
+        concat_txt_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="No valid clips to export.")
+
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt_path), "-c", "copy"]
+    if out_ext in [".mp4", ".mov"]:
+        cmd.extend(["-movflags", "+faststart"])
+    cmd.append(str(output_path))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    concat_txt_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Fast export failed: {result.stderr[-300:]}")
+
+    media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
+    return FileResponse(
+        path=str(output_path),
+        filename=filename,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"}
+    )
 
     export_id = str(uuid.uuid4())[:8]
     temp_dir = UPLOAD_DIR / f"export_{export_id}"
@@ -2022,19 +2097,6 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
     clip_files = []
 
     try:
-        # Flatten merged clips
-        flattened_timeline = []
-        for clip in timeline:
-            if clip.get("segments"):
-                for seg in clip["segments"]:
-                    flat = dict(clip)
-                    flat["sourceStart"] = seg.get("sourceStart", seg.get("start", 0))
-                    flat["sourceEnd"] = seg.get("sourceEnd", seg.get("end", 0))
-                    flat.pop("segments", None)
-                    flattened_timeline.append(flat)
-            else:
-                flattened_timeline.append(clip)
-
         import json
         import concurrent.futures
         import asyncio
@@ -2068,6 +2130,32 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
         a_stream = aud_props.get("streams", [{}])[0] if aud_props.get("streams") else {}
         ar = a_stream.get("sample_rate", "44100")
         ac = a_stream.get("channels", "2")
+        has_audio = bool(aud_props.get("streams"))
+
+        if has_assets:
+            c_v = "libx264"
+            c_a = "aac"
+        else:
+            c_v = v_stream.get("codec_name", "libx264")
+            if c_v == "h264": c_v = "libx264"
+            elif c_v == "hevc": c_v = "libx265"
+            elif c_v == "vp9": c_v = "libvpx-vp9"
+            elif c_v == "vp8": c_v = "libvpx"
+            else: c_v = "libx264"
+
+            c_a = a_stream.get("codec_name", "aac") if has_audio else "aac"
+            if c_a != "aac": c_a = "aac"
+
+        v_args = ["-c:v", c_v, "-pix_fmt", pix_fmt]
+        if c_v in ["libx264", "libx265"]:
+            v_args.extend(["-preset", "ultrafast", "-crf", "28"])
+        elif c_v in ["libvpx-vp9", "libvpx"]:
+            v_args.extend(["-deadline", "realtime", "-cpu-used", "8", "-crf", "30", "-b:v", "0"])
+
+        if has_audio:
+            a_args = ["-c:a", c_a, "-ar", str(ar), "-ac", str(ac), "-b:a", "128k"]
+        else:
+            a_args = ["-an"]
 
         def _process_fast_asset(i, clip):
             asset_url = clip.get("assetUrl")
@@ -2118,46 +2206,24 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                     loop = asyncio.new_event_loop()
                     src_path = loop.run_until_complete(_dl())
                     loop.close()
-                    content = src_path.read_bytes()[:12]
-                    is_image = (
-                        src_path.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"] or
-                        content[:2] == b'\xff\xd8' or
-                        content[:4] == b'\x89PNG' or
-                        (content[:4] == b'RIFF' and content[8:12] == b'WEBP') or
-                        content[:3] == b'GIF'
-                    )
                 except Exception as e:
                     print(f"[fast-export] Failed to DL asset {asset_url}: {e}")
                     return None
+        flattened_timeline = []
+        for clip in timeline:
+            if clip.get("segments"):
+                for seg in clip["segments"]:
+                    if seg.get("assetUrl"):
+                        raise HTTPException(status_code=400, detail="Fast export does not support timelines with assets. Use the 'Export Clips' option instead.")
+                    flattened_timeline.append(seg)
             else:
                 return None
 
             if not src_path:
                 return None
 
-            c_v = v_stream.get("codec_name", "libx264")
-            if c_v == "h264": c_v = "libx264"
-            elif c_v == "hevc": c_v = "libx265"
-            elif c_v == "vp9": c_v = "libvpx-vp9"
-            elif c_v == "vp8": c_v = "libvpx"
-            else: c_v = "libx264"
-
-            has_audio = bool(aud_props.get("streams"))
-            c_a = a_stream.get("codec_name", "aac") if has_audio else "aac"
-            if c_a != "aac": c_a = "aac"
-
-            v_args = ["-c:v", c_v, "-pix_fmt", pix_fmt]
-            if c_v in ["libx264", "libx265"]:
-                v_args.extend(["-preset", "ultrafast", "-crf", "28"])
-            elif c_v in ["libvpx-vp9", "libvpx"]:
-                v_args.extend(["-deadline", "realtime", "-cpu-used", "8", "-crf", "30", "-b:v", "0"])
-
-            if has_audio:
-                a_args = ["-c:a", c_a, "-ar", str(ar), "-ac", str(ac), "-b:a", "128k"]
-            else:
-                a_args = ["-an"]
-
-            if is_image:
+            asset_kind = clip.get("assetKind", "video")
+            if asset_kind == "photo":
                 cmd = ["ffmpeg", "-loop", "1", "-i", str(src_path)]
                 if has_audio:
                     cmd.extend(["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}"])
@@ -2166,6 +2232,14 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                 cmd.extend(a_args)
                 if has_audio:
                     cmd.append("-shortest")
+                cmd.extend(["-y", str(clip_path)])
+            elif asset_kind == "audio":
+                cmd = ["ffmpeg", "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}"]
+                cmd.extend(["-i", str(src_path)])
+                cmd.extend(["-t", str(duration)])
+                cmd.extend(v_args)
+                cmd.extend(a_args)
+                cmd.append("-shortest")
                 cmd.extend(["-y", str(clip_path)])
             else:
                 cmd = ["ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
@@ -2177,27 +2251,55 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0 and clip_path.exists():
                 return (i, clip_path)
+            else:
+                print(f"[fast-export] Failed to process asset clip {i}: {res.stderr}")
             return None
 
-        asset_clips = {}
+        def _process_original_clip(i, clip):
+            start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
+            end = float(clip.get("sourceEnd", clip.get("end", 0)) or 0)
+            duration = float(clip.get("duration") or 0)
+            if duration <= 0:
+                duration = max(0.0, end - start)
+            if duration <= 0.05:
+                return None
+
+            clip_path = temp_dir / f"clip_{i}.mp4"
+
+            cmd = ["ffmpeg", "-ss", str(start), "-i", str(video_path), "-t", str(duration),
+                   "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"]
+            cmd.extend(v_args)
+            cmd.extend(a_args)
+            cmd.extend(["-y", str(clip_path)])
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0 and clip_path.exists():
+                return (i, clip_path)
+            else:
+                print(f"[fast-export] Failed to process original clip {i}: {res.stderr}")
+            return None
+
+        processed_clips = {}
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             for i, clip in enumerate(flattened_timeline):
                 if clip.get("assetUrl"):
                     futures.append(executor.submit(_process_fast_asset, i, clip))
+                elif has_assets:
+                    futures.append(executor.submit(_process_original_clip, i, clip))
             for future in futures:
                 res = future.result()
                 if res:
-                    asset_clips[res[0]] = res[1]
+                    processed_clips[res[0]] = res[1]
 
+        concat_txt_path = output_path.with_suffix(".txt")
         valid_clip_count = 0
-        with open(concat_file, "w", encoding="utf-8") as f:
+        with open(concat_txt_path, "w", encoding="utf-8") as f:
             for i, clip in enumerate(flattened_timeline):
-                if i in asset_clips:
-                    escaped_path = str(asset_clips[i].absolute()).replace("'", r"\'").replace("\\", "/")
+                if i in processed_clips:
+                    escaped_path = str(processed_clips[i].absolute()).replace("'", r"\'").replace("\\", "/")
                     f.write(f"file '{escaped_path}'\n")
                     valid_clip_count += 1
-                elif not clip.get("assetUrl"):
+                elif not has_assets and not clip.get("assetUrl"):
                     start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
                     end = float(clip.get("sourceEnd", clip.get("end", 0)) or 0)
                     duration = float(clip.get("duration") or 0)
@@ -2215,14 +2317,7 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
             raise HTTPException(status_code=400, detail="No valid clips to export.")
 
         tmp_final = temp_dir / f"final{out_ext}"
-        cmd = [
-            "ffmpeg",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat_file),
-            "-c", "copy",
-            "-y"
-        ]
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt_path), "-c", "copy"]
         if out_ext in [".mp4", ".mov"]:
             cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(tmp_final))
@@ -2231,20 +2326,12 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
 
         tmp_final.replace(output_path)
 
-        local_exports_dir = PROJECT_ROOT / "exports"
-        local_exports_dir.mkdir(exist_ok=True)
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_copy_path = local_exports_dir / f"edited-{session_id[:8]}_{timestamp_str}{out_ext}"
-        import shutil
-        shutil.copyfile(output_path, local_copy_path)
-        print(f"[fast-export] Saved local copy to {local_copy_path}")
-
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
-            filename=f"edited-{session_id[:8]}_{timestamp_str}{out_ext}",
+            filename=filename,
             media_type=media_type,
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+            headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"}
         )
 
     except subprocess.CalledProcessError as e:
@@ -2256,6 +2343,8 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+        if 'concat_txt_path' in locals() and concat_txt_path.exists():
+            concat_txt_path.unlink(missing_ok=True)
 
 @app.post("/api/videos/{session_id}/export-zip")
 async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
@@ -2275,7 +2364,10 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         raise HTTPException(status_code=404, detail="Source video not found")
         
     selected_id_set = set(body.selectedIds) if body.selectedIds is not None else None
-    top_level_clips = [clip for clip in body.timeline if clip.get("track", 0) == 0]
+    top_level_clips = [
+        clip for clip in body.timeline
+        if clip.get("track", 0) == 0 and (selected_id_set is None or clip.get("id") in selected_id_set)
+    ]
     has_video_assets = any(
         (clip.get("assetUrl") or (isinstance(seg, dict) and seg.get("assetUrl")))
         for clip in top_level_clips
@@ -2293,36 +2385,25 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
     whole_video_cache_path = export_cache_dir / f"{session_id}_{cache_signature}_whole{out_ext}"
 
     if body.mode == "clips" and clips_zip_cache_path.exists() and clips_zip_cache_path.stat().st_size > 1024:
-        local_exports_dir = PROJECT_ROOT / "exports"
-        local_exports_dir.mkdir(exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
-        import shutil
-        shutil.copyfile(clips_zip_cache_path, local_copy_path)
-        print(f"[export-zip] Saved local copy to {local_copy_path} (from cache)")
+        download_filename = f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
 
         return FileResponse(
             str(clips_zip_cache_path),
             media_type="application/zip",
-            filename=f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip",
+            filename=download_filename,
             headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
         )
     if body.mode == "whole" and whole_video_cache_path.exists() and whole_video_cache_path.stat().st_size > 1024:
-        local_exports_dir = PROJECT_ROOT / "exports"
-        local_exports_dir.mkdir(exist_ok=True)
         filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}"
-        import shutil
-        shutil.copyfile(whole_video_cache_path, local_copy_path)
-        print(f"[export-zip] Saved local copy to {local_copy_path} (from cache)")
+        download_filename = f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}"
 
         media_type = mimetypes.guess_type(str(whole_video_cache_path))[0] or "video/mp4"
-        filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
         return FileResponse(
             str(whole_video_cache_path),
             media_type=media_type,
-            filename=f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}",
+            filename=download_filename,
             headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
         )
 
@@ -2334,153 +2415,99 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         clip_files = []
         chapters_meta = []
 
-        audio_clips = [
-            clip for clip in body.timeline
-            if clip.get("assetKind") == "audio" and (clip.get("assetUrl") or "").strip()
-        ]
+        selected_timeline_start = min(
+            [float(c.get("timelineStart", 0) or 0) for c in top_level_clips],
+            default=0.0,
+        )
+        selected_timeline_end = max(
+            [
+                float(c.get("timelineStart", 0) or 0) + float(c.get("duration", 0) or 0)
+                for c in top_level_clips
+            ],
+            default=0.0,
+        )
+
+        def _audio_belongs_to_export(clip):
+            if clip.get("assetKind") != "audio" or not (clip.get("assetUrl") or "").strip():
+                return False
+            if selected_id_set is None or clip.get("id") in selected_id_set:
+                return True
+            clip_start = float(clip.get("timelineStart", 0) or 0)
+            clip_end = clip_start + float(clip.get("duration", 0) or 0)
+            return selected_timeline_end > selected_timeline_start and clip_start < selected_timeline_end and clip_end > selected_timeline_start
+
+        audio_clips = [clip for clip in body.timeline if _audio_belongs_to_export(clip)]
 
         has_any_audio_tracks = any(
             c.get("assetKind") == "audio" and (c.get("assetUrl") or "").strip()
             for c in body.timeline
         )
 
-        # ULTRA FAST PATH FOR EXPORT (Zips all media, maintaining duration, without full rendering)
-        if body.mode == "clips" and not has_any_audio_tracks:
-            print("[export-zip] Using ULTRA FAST PATH for individual media files")
-            final_clips_dir = temp_dir / "final_clips"
-            final_clips_dir.mkdir(exist_ok=True)
-            
-            import concurrent.futures
-            import urllib.request
-
-            selected_id_set = set(body.selectedIds) if body.selectedIds is not None else None
-            selected_timeline = [
-                clip for clip in body.timeline
-                if selected_id_set is None or clip.get("id") in selected_id_set
-            ]
-
-            def _clip_duration(clip):
-                duration = clip.get("duration")
-                if duration is not None:
-                    return max(0.0, float(duration or 0))
-                start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
-                end = float(clip.get("sourceEnd", clip.get("end", start)) or start)
-                return max(0.0, end - start)
-
-            def _fast_slice(idx, clip):
-                if selected_id_set is not None and clip.get("id") not in selected_id_set:
-                    return None
-
-                title = clip.get("title", clip.get("name", f"Clip_{idx+1}"))
-                safe_title = "".join([c if c.isalnum() or c in " _-" else "_" for c in title])
-                asset_url = clip.get("assetUrl")
-                asset_kind = clip.get("assetKind", "video")
-                source_start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
-                source_end = float(clip.get("sourceEnd", clip.get("end", source_start)) or source_start)
-                duration = _clip_duration(clip)
-                
-                if not asset_url:
-                    out_path = final_clips_dir / f"{idx+1:02d}_{safe_title}{out_ext}"
-                    segments = clip.get("segments") if isinstance(clip.get("segments"), list) and clip.get("segments") else [clip]
-                    
-                    concat_txt = final_clips_dir / f"concat_{idx}.txt"
-                    valid_segs = 0
-                    with open(concat_txt, "w", encoding="utf-8") as f:
-                        for seg in segments:
-                            src_start = float(seg.get("sourceStart", seg.get("start", 0)))
-                            src_end = float(seg.get("sourceEnd", seg.get("end", 0)))
-                            if src_end - src_start <= 0: continue
-                            escaped_path = str(video_path.absolute()).replace("'", r"\'").replace("\\", "/")
-                            f.write(f"file '{escaped_path}'\n")
-                            f.write(f"inpoint {src_start}\n")
-                            f.write(f"outpoint {src_end}\n")
-                            valid_segs += 1
-                    
-                    if valid_segs > 0:
-                        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy"]
-                        if out_ext in [".mp4", ".mov"]:
-                            cmd.extend(["-movflags", "+faststart"])
-                        cmd.append(str(out_path))
-                        subprocess.run(cmd, capture_output=True, check=False)
-                        if out_path.exists():
-                            return (out_path, out_path.name, clip)
-                else:
-                    if asset_url.startswith("/api/proxy-"):
-                        from urllib.parse import urlparse, parse_qs
-                        asset_url = parse_qs(urlparse(asset_url).query).get("url", [asset_url])[0]
-                    
-                    local_asset = None
-                    if asset_url.startswith("/api/"):
-                        if "ai-image" in asset_url:
-                            img_id = asset_url.split("/")[-1]
-                            local_asset = UPLOAD_DIR / f"ai_img_{img_id}.jpg"
-                        elif "assets" in asset_url and "stream" in asset_url:
-                            asset_id = asset_url.split("/")[-2]
-                            for ext in [".mp4", ".mov", ".webm", ".avi", ".mkv", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp3", ".wav", ".m4a", ".aac"]:
-                                candidate = UPLOAD_DIR / f"asset_{asset_id}{ext}"
-                                if candidate.exists():
-                                    local_asset = candidate
-                                    break
-                    
-                    dl_path = None
-                    if local_asset and local_asset.exists():
-                        dl_path = local_asset
-                    elif asset_url.startswith("http"):
-                        try:
-                            ext_dl = ".jpg" if asset_kind == "photo" else ".mp4" if asset_kind == "video" else ".mp3"
-                            dl_path = final_clips_dir / f"temp_{idx}{ext_dl}"
-                            request = urllib.request.Request(asset_url, headers={"User-Agent": "Mozilla/5.0"})
-                            with urllib.request.urlopen(request, timeout=10) as response:
-                                dl_path.write_bytes(response.read())
-                        except Exception:
-                            pass
-                    
-                    if dl_path and dl_path.exists():
-                        out_ext_asset = dl_path.suffix if dl_path.suffix else (".jpg" if asset_kind == "photo" else ".mp4")
-                        out_path = final_clips_dir / f"{idx+1:02d}_{safe_title}{out_ext_asset}"
-                        
-                        if asset_kind == "photo":
-                            import shutil
-                            shutil.copy(dl_path, out_path)
-                            return (out_path, out_path.name, clip)
-                        else:
-                            if duration <= 0:
-                                duration = max(0.0, source_end - source_start)
-                            subprocess.run([
-                                "ffmpeg", "-y", "-ss", str(source_start), "-t", str(duration),
-                                "-i", str(dl_path), "-c", "copy", str(out_path)
-                            ], capture_output=True)
-                            if out_path.exists():
-                                return (out_path, out_path.name, clip)
-                return None
-
+        if body.mode == "clips" and not has_video_assets and not audio_clips:
             final_clip_files = []
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [executor.submit(_fast_slice, idx, c) for idx, c in enumerate(body.timeline)]
-                for future in futures:
-                    res = future.result()
-                    if res:
-                        final_clip_files.append(res)
-            
-            if not final_clip_files:
-                raise HTTPException(status_code=400, detail="No valid media could be processed for export.")
-                
-            with zipfile.ZipFile(clips_zip_cache_path, 'w', zipfile.ZIP_STORED) as zipf:
-                for cf, arcname, clip in final_clip_files:
-                    zipf.write(cf, f"Exported_Media/{arcname}")
-                    
-            local_exports_dir = PROJECT_ROOT / "exports"
-            local_exports_dir.mkdir(exist_ok=True)
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            local_copy_path = local_exports_dir / f"autoedit_export_{session_id[:8]}_{timestamp_str}.zip"
-            import shutil
-            shutil.copyfile(clips_zip_cache_path, local_copy_path)
-            print(f"[export-zip] Saved local copy to {local_copy_path}")
 
+            def _copy_source_segment(src_start, duration, out_path):
+                if duration <= 0.05:
+                    return False
+                result = subprocess.run([
+                    "ffmpeg", "-y",
+                    "-ss", str(src_start),
+                    "-t", str(duration),
+                    "-i", str(video_path),
+                    "-c", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    str(out_path)
+                ], capture_output=True, text=True)
+                return result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 1024
+
+            for i, clip in enumerate(top_level_clips):
+                title = clip.get("title", clip.get("name", f"Clip_{i+1}"))
+                safe_title = "".join([c if c.isalnum() or c in " _-" else "_" for c in title])
+                out_path = clips_dir / f"{i+1:02d}_{safe_title}{out_ext}"
+                segments = clip.get("segments") if isinstance(clip.get("segments"), list) and clip.get("segments") else [clip]
+                segment_paths = []
+
+                for j, seg in enumerate(segments):
+                    src_start = float(seg.get("sourceStart", seg.get("start", 0)) or 0)
+                    src_end = float(seg.get("sourceEnd", seg.get("end", 0)) or 0)
+                    duration = float(seg.get("duration") or max(0.0, src_end - src_start))
+                    if duration <= 0.05:
+                        continue
+
+                    if len(segments) == 1:
+                        if _copy_source_segment(src_start, duration, out_path):
+                            segment_paths.append(out_path)
+                    else:
+                        segment_out = temp_dir / f"clip_{i+1:02d}_seg_{j+1:02d}{out_ext}"
+                        if _copy_source_segment(src_start, duration, segment_out):
+                            segment_paths.append(segment_out)
+
+                if len(segments) > 1 and segment_paths:
+                    clip_concat_path = temp_dir / f"clip_{i+1:02d}_concat.txt"
+                    with open(clip_concat_path, "w", encoding="utf-8") as f:
+                        for sp in segment_paths:
+                            f.write(f"file '{sp.absolute().as_posix()}'\n")
+                    subprocess.run([
+                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", str(clip_concat_path), "-c", "copy", str(out_path)
+                    ], capture_output=True, text=True, check=True)
+
+                if out_path.exists() and out_path.stat().st_size > 1024:
+                    final_clip_files.append((out_path, out_path.name))
+
+            if not final_clip_files:
+                raise HTTPException(status_code=400, detail="No clips could be processed for export.")
+
+            with zipfile.ZipFile(clips_zip_cache_path, "w", zipfile.ZIP_STORED) as zipf:
+                for cf, arcname in final_clip_files:
+                    zipf.write(cf, f"Exported_Media/{arcname}")
+
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            download_filename = f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
             return FileResponse(
-                str(clips_zip_cache_path), 
-                media_type="application/zip", 
-                filename=f"autoedit_export_{session_id[:8]}_{timestamp_str}.zip",
+                str(clips_zip_cache_path),
+                media_type="application/zip",
+                filename=download_filename,
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
             )
 
@@ -2670,7 +2697,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         "id": clip.get("id"),
                         "index": len(chapters_meta) + 1,
                         "title": title,
-                        "duration": round(clip_duration, 2),
+                        "duration": clip_duration,
                         "file": f"{len(chapters_meta)+1:02d}_{safe_title}{out_ext}"
                     })
 
@@ -2785,21 +2812,16 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                 raise HTTPException(status_code=400, detail="No clips could be processed for export.")
             shutil.copyfile(main_video_path, whole_video_cache_path)
 
-            local_exports_dir = PROJECT_ROOT / "exports"
-            local_exports_dir.mkdir(exist_ok=True)
             filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            local_copy_path = local_exports_dir / f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}"
-            import shutil
-            shutil.copyfile(whole_video_cache_path, local_copy_path)
-            print(f"[export-zip] Saved local copy to {local_copy_path}")
+            download_filename = f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}"
 
             media_type = mimetypes.guess_type(str(whole_video_cache_path))[0] or "video/mp4"
             filename_prefix = "autoedit_clips" if body.selectedIds else "autoedit_whole"
             return FileResponse(
                 str(whole_video_cache_path),
                 media_type=media_type,
-                filename=f"{filename_prefix}_{session_id[:8]}_{timestamp_str}{out_ext}",
+                filename=download_filename,
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
             )
             
@@ -2857,18 +2879,13 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                 for cf, arcname in final_clip_files:
                     zipf.write(cf, f"Exported_Media/{arcname}")
                     
-            local_exports_dir = PROJECT_ROOT / "exports"
-            local_exports_dir.mkdir(exist_ok=True)
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            local_copy_path = local_exports_dir / f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
-            import shutil
-            shutil.copyfile(clips_zip_cache_path, local_copy_path)
-            print(f"[export-zip] Saved local copy to {local_copy_path}")
+            download_filename = f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip"
 
             return FileResponse(
                 str(clips_zip_cache_path),
                 media_type="application/zip",
-                filename=f"autoedit_clips_{session_id[:8]}_{timestamp_str}.zip",
+                filename=download_filename,
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
             )
 
@@ -3824,7 +3841,8 @@ async def build_composition(session_id: str, body: BuildCompositionRequest):
     
     for i, clip in enumerate(clips):
         # Calculate Remotion start frame based on absolute timeline placement
-        timeline_start = float(clip.get("start", 0))
+        timeline_start = float(seg.get("timelineStart", 0))
+        duration = float(seg.get("duration", 0))
         start_from_frame = int(timeline_start * fps)
         
         # Check if this is a merged clip with multiple segments
@@ -4108,14 +4126,6 @@ async def export_video(session_id: str, body: ExportRequest):
         print(f"[export] Export complete: {output_path}")
 
         # Save a copy to local 'exports' directory
-        local_exports_dir = PROJECT_ROOT / "exports"
-        local_exports_dir.mkdir(exist_ok=True)
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        local_copy_path = local_exports_dir / f"edited_{session_id[:8]}_{timestamp_str}{out_ext}"
-        import shutil
-        shutil.copyfile(output_path, local_copy_path)
-        print(f"[export] Saved local copy to {local_copy_path}")
-
         media_type = mimetypes.guess_type(str(output_path))[0] or "video/mp4"
         return FileResponse(
             path=str(output_path),
@@ -4155,7 +4165,11 @@ async def proxy_image(url: str):
             r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
             content_type = r.headers.get("content-type", "image/jpeg")
-            return Response(content=r.content, media_type=content_type)
+            return Response(
+                content=r.content, 
+                media_type=content_type,
+                headers={"Cache-Control": "public, max-age=31536000"}
+            )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to proxy image: {str(e)}")
 

@@ -5,7 +5,7 @@
 
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { UploadPage, EditorPage, ErrorBoundary } from './components';
-import ShortsPage from './shorts/ShortsPage';
+import ShortsPage from './components/ShortsPage';
 
 
 function AppRoutes() {

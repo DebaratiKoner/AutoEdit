@@ -2438,36 +2438,67 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   // Asset management functions
 
-  const postExportDownload = async (payload: unknown) => {
-    try {
-      const response = await fetch(`/api/videos/${sessionId}/export-zip-download`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `payload=${encodeURIComponent(JSON.stringify(payload))}`
-      });
-      
-      if (!response.ok) throw new Error('Export failed');
-      
-      let filename = `edited_${sessionId.slice(0, 8)}.mp4`;
-      const disposition = response.headers.get('Content-Disposition');
-      if (disposition && disposition.includes('filename=')) {
-        const match = disposition.match(/filename="?([^"]+)"?/);
-        if (match && match[1]) filename = match[1];
+  const filenameFromContentDisposition = (contentDisposition: string | null, fallback: string) => {
+    if (!contentDisposition) return fallback;
+
+    const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match?.[1]) {
+      try {
+        return decodeURIComponent(utf8Match[1].replace(/"/g, ''));
+      } catch {
+        return utf8Match[1].replace(/"/g, '');
       }
-      
+    }
+
+    const filenameMatch = contentDisposition.match(/filename="?([^";]+)"?/i);
+    return filenameMatch?.[1] || fallback;
+  };
+
+  const postExportDownload = async (payload: unknown, mode: 'whole' | 'clips') => {
+    try {
+      const response = await fetch(`/api/videos/${sessionId}/export-zip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        let message = `Export failed with status ${response.status}`;
+        const errorText = await response.text();
+        try {
+          const errorJson = JSON.parse(errorText);
+          if (errorJson.detail) {
+            message = typeof errorJson.detail === 'string'
+              ? errorJson.detail
+              : JSON.stringify(errorJson.detail);
+          }
+        } catch {
+          if (errorText) message = errorText;
+        }
+        throw new Error(message);
+      }
+
       const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
+      const fallbackName = mode === 'clips'
+        ? `autoedit_clips_${sessionId.slice(0, 8)}.zip`
+        : `autoedit_whole_${sessionId.slice(0, 8)}.mp4`;
+      const filename = filenameFromContentDisposition(
+        response.headers.get('Content-Disposition'),
+        fallbackName
+      );
+
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.style.display = 'none';
       a.href = url;
       a.download = filename;
+      a.style.display = 'none';
       document.body.appendChild(a);
       a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (error) {
       console.error('Export error:', error);
-      alert('Failed to export video. Please try again.');
+      alert(error instanceof Error ? error.message : 'Failed to export video. Please try again.');
     } finally {
       setIsExporting(null);
     }
@@ -2506,7 +2537,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       selectedIds,
       transcriptSegments: session.transcriptSegments || [],
       mode
-    });
+    }, mode);
 
     logger.operation(`${mode} export download requested`);
   };

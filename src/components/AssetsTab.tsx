@@ -83,13 +83,6 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     return Number.isFinite(duration) ? Math.max(0, duration) : 0;
   };
 
-  // Single-filter state (video / photo / audio tabs)
-  const [singleItems, setSingleItems] = useState<PixabayAsset[]>([]);
-  const [singlePage, setSinglePage]   = useState(1);
-  const [singleTotal, setSingleTotal] = useState(0);
-  const [singleLoading, setSingleLoading] = useState(false);
-  const [singleError, setSingleError] = useState<string | null>(null);
-
   // All-mode per-section state
   const [videoSec, setVideoSec] = useState<SectionState>(emptySec());
   const [photoSec, setPhotoSec] = useState<SectionState>(emptySec());
@@ -130,59 +123,49 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
   }, []);
 
   // ── Load all three sections ────────────────────────────────────────────────
-  const loadAllSections = useCallback(async (q: string) => {
-    if (!q.trim()) { setVideoSec(emptySec()); setPhotoSec(emptySec()); setAudioSec(emptySec()); return; }
+  const loadAllSections = useCallback((q: string) => {
+    const queryToFetch = q.trim() || 'nature'; // Fallback to ensure instant data availability
     setAllError(null);
     setVideoSec(s => ({ ...s, loading: true }));
     setPhotoSec(s => ({ ...s, loading: true }));
     setAudioSec(s => ({ ...s, loading: true }));
-    try {
-      const [v, ph, au] = await Promise.all([fetchVideos(q, 1), fetchPhotos(q, 1), fetchAudio(q, 1)]);
-      setVideoSec({ items: v.items, page: 1, total: v.total, loading: false });
-      setPhotoSec({ items: ph.items, page: 1, total: ph.total, loading: false });
-      // Front-load only long audio (>= 2 minutes). Load More will append everything.
-      const longAudio = au.items.filter(a => {
-        const dur = (a as FreesoundAudio).duration;
-        return typeof dur === 'number' && dur >= MIN_AUDIO_SECONDS;
+
+    // Fetch independently so the fastest API renders instantly without waiting for the others
+    fetchVideos(queryToFetch, 1)
+      .then(v => setVideoSec({ items: v.items, page: 1, total: v.total, loading: false }))
+      .catch(e => {
+        setAllError(prev => prev ? `${prev} | ${e.message}` : e.message);
+        setVideoSec(s => ({ ...s, loading: false }));
       });
-      setAudioSec({ items: longAudio, page: 1, total: au.total, loading: false });
 
-    } catch (e) {
-      setAllError(e instanceof Error ? e.message : 'Failed to fetch');
-      setVideoSec(s => ({ ...s, loading: false }));
-      setPhotoSec(s => ({ ...s, loading: false }));
-      setAudioSec(s => ({ ...s, loading: false }));
-    }
-  }, [fetchVideos, fetchPhotos, fetchAudio]);
+    fetchPhotos(queryToFetch, 1)
+      .then(ph => setPhotoSec({ items: ph.items, page: 1, total: ph.total, loading: false }))
+      .catch(e => {
+        setAllError(prev => prev ? `${prev} | ${e.message}` : e.message);
+        setPhotoSec(s => ({ ...s, loading: false }));
+      });
 
-  // ── Load single filter ─────────────────────────────────────────────────────
-  const loadSingle = useCallback(async (q: string, f: AssetFilter, pg: number, append = false) => {
-    if (!q.trim()) { setSingleItems([]); setSingleTotal(0); return; }
-    setSingleLoading(true);
-    setSingleError(null);
-    try {
-      let result: { items: PixabayAsset[]; total: number };
-      if (f === 'video') result = await fetchVideos(q, pg);
-      else if (f === 'photo') result = await fetchPhotos(q, pg);
-      else result = await fetchAudio(q, pg);
-      setSingleTotal(result.total);
-      setSingleItems(prev => append ? [...prev, ...result.items] : result.items);
-    } catch (e) {
-      setSingleError(e instanceof Error ? e.message : 'Failed to fetch');
-    } finally {
-      setSingleLoading(false);
-    }
+    fetchAudio(queryToFetch, 1)
+      .then(au => {
+        const longAudio = au.items.filter(a => {
+          const dur = (a as FreesoundAudio).duration;
+          return typeof dur === 'number' && dur >= MIN_AUDIO_SECONDS;
+        });
+        setAudioSec({ items: longAudio, page: 1, total: au.total, loading: false });
+      })
+      .catch(e => {
+        setAllError(prev => prev ? `${prev} | ${e.message}` : e.message);
+        setAudioSec(s => ({ ...s, loading: false }));
+      });
   }, [fetchVideos, fetchPhotos, fetchAudio]);
 
   useEffect(() => {
-    if (filter === 'all') loadAllSections(searchQuery);
-    else loadSingle(searchQuery, filter, 1);
+    loadAllSections(searchQuery);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, filter]);
+  }, [searchQuery]);
 
   const changeFilter = (f: AssetFilter) => {
-    setFilter(f); setSingleItems([]); setSinglePage(1); setSearchQuery(''); setInputValue('');
-    setVideoSec(emptySec()); setPhotoSec(emptySec()); setAudioSec(emptySec());
+    setFilter(f);
   };
 
   const submit = (e: React.FormEvent) => { e.preventDefault(); setSearchQuery(inputValue); };
@@ -302,7 +285,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const next = videoSec.page + 1;
     setVideoSec(s => ({ ...s, loading: true }));
     try {
-      const r = await fetchVideos(searchQuery, next);
+      const r = await fetchVideos(searchQuery.trim() || 'nature', next);
       setVideoSec(s => ({ ...s, items: [...s.items, ...r.items], page: next, total: r.total, loading: false }));
     } catch { setVideoSec(s => ({ ...s, loading: false })); }
   };
@@ -310,7 +293,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const next = photoSec.page + 1;
     setPhotoSec(s => ({ ...s, loading: true }));
     try {
-      const r = await fetchPhotos(searchQuery, next);
+      const r = await fetchPhotos(searchQuery.trim() || 'nature', next);
       setPhotoSec(s => ({ ...s, items: [...s.items, ...r.items], page: next, total: r.total, loading: false }));
     } catch { setPhotoSec(s => ({ ...s, loading: false })); }
   };
@@ -318,7 +301,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const next = audioSec.page + 1;
     setAudioSec(s => ({ ...s, loading: true }));
     try {
-      const r = await fetchAudio(searchQuery, next);
+      const r = await fetchAudio(searchQuery.trim() || 'nature', next);
       setAudioSec(s => ({ ...s, items: [...s.items, ...r.items], page: next, total: r.total, loading: false }));
     } catch { setAudioSec(s => ({ ...s, loading: false })); }
   };
@@ -391,27 +374,16 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
         {/* Single-filter mode */}
         {filter !== 'all' && (
           <>
-            {singleLoading && singleItems.length === 0 && (
-              <div className="assets-loading"><div className="assets-spinner"/><span>Searching...</span></div>
-            )}
-            {singleError && <div className="assets-error" style={{ padding: '1rem', color: '#e74c3c', fontSize: '0.8rem' }}>Warning: {singleError}</div>}
-            {!singleLoading && !singleError && singleItems.length === 0 && (
+            {allError && <div style={{ color: '#e74c3c', fontSize: '0.78rem', padding: '0.5rem 0' }}>{allError}</div>}
+            {!searchQuery && (
               <div className="assets-empty">
                 <p>Search for {filter === 'photo' ? 'photos' : filter === 'video' ? 'videos' : 'audio'}</p>
                 <p className="assets-empty-hint">Type a keyword above or tap a topic</p>
               </div>
             )}
-            {singleItems.length > 0 && (
-              <div className="assets-grid">{singleItems.map(renderCard)}</div>
-            )}
-            {singleItems.length > 0 && singleItems.length < singleTotal && (
-              <button className="assets-load-more" onClick={() => {
-                const next = singlePage + 1; setSinglePage(next);
-                loadSingle(searchQuery, filter, next, true);
-              }} disabled={singleLoading}>
-                {singleLoading ? 'Loading…' : `Load More (${singleItems.length} / ${singleTotal})`}
-              </button>
-            )}
+            {searchQuery && filter === 'video' && renderSection('Videos', videoSec, loadMoreVideos, 'No videos found')}
+            {searchQuery && filter === 'photo' && renderSection('Photos', photoSec, loadMorePhotos, 'No photos found')}
+            {searchQuery && filter === 'audio' && renderSection('Audio', audioSec, loadMoreAudio, 'No audio found')}
           </>
         )}
 
