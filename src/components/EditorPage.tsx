@@ -2456,7 +2456,9 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   const postExportDownload = async (payload: unknown, mode: 'whole' | 'clips') => {
     try {
-      const response = await fetch(`/api/videos/${sessionId}/export-zip`, {
+      const endpoint = mode === 'whole' ? `/api/videos/${sessionId}/fast-export` : `/api/videos/${sessionId}/export-zip`;
+      
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -2523,7 +2525,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
           try {
             const urlObj = new URL(url, window.location.origin);
             const originalUrl = urlObj.searchParams.get('url');
-            if (originalUrl) url = decodeURIComponent(originalUrl);
+            if (originalUrl) url = originalUrl;
           } catch (e) {
             // ignore
           }
@@ -2533,10 +2535,14 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
     });
 
     await postExportDownload({
+      videoUrl: session.videoUrl,
       timeline: decodedFullTimeline,
+      clips: decodedFullTimeline,
       selectedIds,
       transcriptSegments: session.transcriptSegments || [],
-      mode
+      mode,
+      preset: 'ultrafast',
+      timestamp_str: new Date().toISOString().replace(/[-T:\.Z]/g, '')
     }, mode);
 
     logger.operation(`${mode} export download requested`);
@@ -2620,7 +2626,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                       top: '100%',
                       right: 0,
                       marginTop: '0.5rem',
-                      background: '#1e2a3a',
+                      backgroundColor: '#1e2a3a',
                       border: '1px solid #4a9eff',
                       borderRadius: '6px',
                       overflow: 'hidden',

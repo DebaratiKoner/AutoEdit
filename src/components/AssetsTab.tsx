@@ -47,7 +47,6 @@ export interface AssetsTabProps {
 }
 
 const PER_PAGE = 8;
-const MIN_AUDIO_SECONDS = 120; // 2 minutes
 const TOPICS: Record<string, string[]> = {
 
   all:   ['nature', 'city', 'technology', 'travel', 'food', 'sports', 'music', 'animals'],
@@ -124,34 +123,37 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
 
   // ── Load all three sections ────────────────────────────────────────────────
   const loadAllSections = useCallback((q: string) => {
-    const queryToFetch = q.trim() || 'nature'; // Fallback to ensure instant data availability
     setAllError(null);
-    setVideoSec(s => ({ ...s, loading: true }));
-    setPhotoSec(s => ({ ...s, loading: true }));
-    setAudioSec(s => ({ ...s, loading: true }));
+
+    if (!q.trim()) {
+      setVideoSec({ items: [], page: 1, total: 0, loading: false });
+      setPhotoSec({ items: [], page: 1, total: 0, loading: false });
+      setAudioSec({ items: [], page: 1, total: 0, loading: false });
+      return;
+    }
+
+    setVideoSec({ items: [], page: 1, total: 0, loading: true });
+    setPhotoSec({ items: [], page: 1, total: 0, loading: true });
+    setAudioSec({ items: [], page: 1, total: 0, loading: true });
 
     // Fetch independently so the fastest API renders instantly without waiting for the others
-    fetchVideos(queryToFetch, 1)
+    fetchVideos(q.trim(), 1)
       .then(v => setVideoSec({ items: v.items, page: 1, total: v.total, loading: false }))
       .catch(e => {
         setAllError(prev => prev ? `${prev} | ${e.message}` : e.message);
         setVideoSec(s => ({ ...s, loading: false }));
       });
 
-    fetchPhotos(queryToFetch, 1)
+    fetchPhotos(q.trim(), 1)
       .then(ph => setPhotoSec({ items: ph.items, page: 1, total: ph.total, loading: false }))
       .catch(e => {
         setAllError(prev => prev ? `${prev} | ${e.message}` : e.message);
         setPhotoSec(s => ({ ...s, loading: false }));
       });
 
-    fetchAudio(queryToFetch, 1)
+    fetchAudio(q.trim(), 1)
       .then(au => {
-        const longAudio = au.items.filter(a => {
-          const dur = (a as FreesoundAudio).duration;
-          return typeof dur === 'number' && dur >= MIN_AUDIO_SECONDS;
-        });
-        setAudioSec({ items: longAudio, page: 1, total: au.total, loading: false });
+        setAudioSec({ items: au.items, page: 1, total: au.total, loading: false });
       })
       .catch(e => {
         setAllError(prev => prev ? `${prev} | ${e.message}` : e.message);
@@ -285,7 +287,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const next = videoSec.page + 1;
     setVideoSec(s => ({ ...s, loading: true }));
     try {
-      const r = await fetchVideos(searchQuery.trim() || 'nature', next);
+      const r = await fetchVideos(searchQuery.trim(), next);
       setVideoSec(s => ({ ...s, items: [...s.items, ...r.items], page: next, total: r.total, loading: false }));
     } catch { setVideoSec(s => ({ ...s, loading: false })); }
   };
@@ -293,7 +295,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const next = photoSec.page + 1;
     setPhotoSec(s => ({ ...s, loading: true }));
     try {
-      const r = await fetchPhotos(searchQuery.trim() || 'nature', next);
+      const r = await fetchPhotos(searchQuery.trim(), next);
       setPhotoSec(s => ({ ...s, items: [...s.items, ...r.items], page: next, total: r.total, loading: false }));
     } catch { setPhotoSec(s => ({ ...s, loading: false })); }
   };
@@ -301,7 +303,7 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
     const next = audioSec.page + 1;
     setAudioSec(s => ({ ...s, loading: true }));
     try {
-      const r = await fetchAudio(searchQuery.trim() || 'nature', next);
+      const r = await fetchAudio(searchQuery.trim(), next);
       setAudioSec(s => ({ ...s, items: [...s.items, ...r.items], page: next, total: r.total, loading: false }));
     } catch { setAudioSec(s => ({ ...s, loading: false })); }
   };
@@ -351,42 +353,29 @@ export function AssetsTab({ onAddToTimeline }: AssetsTabProps) {
 
       {/* Results */}
       <div className="assets-results" style={{ flex: 1, overflowY: 'auto', paddingRight: '4px' }}>
-        {/* ALL mode — three sections */}
-        {filter === 'all' && (
+        {searchQuery.trim() !== '' && (
           <>
-            {allError && <div style={{ color: '#e74c3c', fontSize: '0.78rem', padding: '0.5rem 0' }}>{allError}</div>}
-            {!searchQuery && (
-              <div className="assets-empty">
-                <p>Search for videos, photos & audio</p>
-                <p className="assets-empty-hint">Type a keyword above or tap a topic</p>
-              </div>
-            )}
-            {searchQuery && (
+            {/* ALL mode — three sections */}
+            {filter === 'all' && (
               <>
+                {allError && <div style={{ color: '#e74c3c', fontSize: '0.78rem', padding: '0.5rem 0' }}>{allError}</div>}
                 {renderSection('Videos', videoSec, loadMoreVideos, 'No videos found')}
                 {renderSection('Photos', photoSec, loadMorePhotos, 'No photos found')}
                 {renderSection('Audio', audioSec, loadMoreAudio, 'No audio found')}
               </>
             )}
-          </>
-        )}
 
-        {/* Single-filter mode */}
-        {filter !== 'all' && (
-          <>
-            {allError && <div style={{ color: '#e74c3c', fontSize: '0.78rem', padding: '0.5rem 0' }}>{allError}</div>}
-            {!searchQuery && (
-              <div className="assets-empty">
-                <p>Search for {filter === 'photo' ? 'photos' : filter === 'video' ? 'videos' : 'audio'}</p>
-                <p className="assets-empty-hint">Type a keyword above or tap a topic</p>
-              </div>
+            {/* Single-filter mode */}
+            {filter !== 'all' && (
+              <>
+                {allError && <div style={{ color: '#e74c3c', fontSize: '0.78rem', padding: '0.5rem 0' }}>{allError}</div>}
+                {filter === 'video' && renderSection('Videos', videoSec, loadMoreVideos, 'No videos found')}
+                {filter === 'photo' && renderSection('Photos', photoSec, loadMorePhotos, 'No photos found')}
+                {filter === 'audio' && renderSection('Audio', audioSec, loadMoreAudio, 'No audio found')}
+              </>
             )}
-            {searchQuery && filter === 'video' && renderSection('Videos', videoSec, loadMoreVideos, 'No videos found')}
-            {searchQuery && filter === 'photo' && renderSection('Photos', photoSec, loadMorePhotos, 'No photos found')}
-            {searchQuery && filter === 'audio' && renderSection('Audio', audioSec, loadMoreAudio, 'No audio found')}
           </>
         )}
-
       </div>
 
       {/* Media preview modal */}

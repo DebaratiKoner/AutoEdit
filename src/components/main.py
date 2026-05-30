@@ -2108,13 +2108,13 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                                         "ffmpeg", "-loop", "1", "-i", str(local_asset),
                                         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                                         "-t", str(duration), "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                                        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-pix_fmt", "yuv420p",
                                         "-c:a", "aac", "-b:a", "96k", "-shortest", "-y", str(segment_out)
                                     ], capture_output=True, text=True, check=True)
                                 else:
                                     subprocess.run([
                                         "ffmpeg", "-ss", "0", "-t", str(duration), "-i", str(local_asset),
-                                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-y", str(segment_out)
+                                        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-y", str(segment_out)
                                     ], capture_output=True, text=True, check=True)
                             else:
                                 print(f"Local asset not found: {asset_url}")
@@ -2133,13 +2133,13 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                                     "ffmpeg", "-loop", "1", "-i", str(dl_path), "-t", str(duration),
                                     "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                                     "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                                    "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-pix_fmt", "yuv420p",
                                     "-c:a", "aac", "-b:a", "96k", "-shortest", "-y", str(segment_out)
                                 ], capture_output=True, text=True, check=True)
                             else:
                                 subprocess.run([
                                     "ffmpeg", "-i", str(dl_path), "-t", str(duration),
-                                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-y", str(segment_out)
+                                    "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-y", str(segment_out)
                                 ], capture_output=True, text=True, check=True)
                     else:
                         # Try a fast stream-copy cut for the source video first.
@@ -2157,7 +2157,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                             subprocess.run([
                                 "ffmpeg", "-ss", str(src_start), "-t", str(duration),
                                 "-i", str(video_path),
-                                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-y", str(segment_out)
+                                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-y", str(segment_out)
                             ], capture_output=True, text=True, check=True)
 
                     if segment_out.exists():
@@ -2269,6 +2269,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         "-c:v", "copy",
                         "-c:a", "aac",
                         "-b:a", "192k",
+                        "-threads", "0",
                         str(mixed_video_path)
                     ])
                 elif inputs_count == 1 and not main_has_audio:
@@ -2280,6 +2281,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         "-c:v", "copy",
                         "-c:a", "aac",
                         "-b:a", "192k",
+                        "-threads", "0",
                         str(mixed_video_path)
                     ])
                 subprocess.run(cmd, capture_output=True, text=True, check=True)
