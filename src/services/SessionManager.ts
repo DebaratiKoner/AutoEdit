@@ -89,33 +89,31 @@ export class SessionManager {
    */
   async loadSession(sessionId: string): Promise<SessionData | null> {
     try {
+      const db = await this.initDB();
+      const transaction = db.transaction([STORE_NAME], 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+
+      const data = await new Promise<SessionData | null>((resolve, reject) => {
+        const request = store.get(sessionId);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+      });
+
+      if (data) {
+        return data;
+      }
+    } catch (error) {
+      console.warn('IndexedDB load failed, trying localStorage:', error);
+    }
+
+    try {
       const key = `${STORAGE_PREFIX}${sessionId}`;
       const stored = localStorage.getItem(key);
       if (stored != null) {
         return JSON.parse(stored);
       }
     } catch (error) {
-      console.warn('localStorage hot-cache load failed, trying IndexedDB:', error);
-    }
-
-    try {
-      // Try IndexedDB first
-      const db = await this.initDB();
-        const transaction = db.transaction([STORE_NAME], 'readonly');
-        const store = transaction.objectStore(STORE_NAME);
-
-        const data = await new Promise<SessionData | null>((resolve, reject) => {
-          const request = store.get(sessionId);
-          request.onsuccess = () => resolve((request as any).result || null);
-          request.onerror = () => reject((request as any).error);
-        });
-
-      
-      if (data) {
-        return data;
-      }
-    } catch (error) {
-      console.warn('IndexedDB load failed, trying localStorage:', error);
+      console.warn('localStorage load failed, trying in-memory storage:', error);
     }
 
     // Final fallback to in-memory storage

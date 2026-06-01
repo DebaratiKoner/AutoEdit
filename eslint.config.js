@@ -9,7 +9,7 @@ import tsParser from '@typescript-eslint/parser';
 export default [
   js.configs.recommended,
   {
-    ignores: ['dist'],
+    ignores: ['dist/**', 'node_modules/**'],
     languageOptions: {
       parser: tsParser,
       ecmaVersion: 2020,

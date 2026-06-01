@@ -7,6 +7,6 @@ export { EditorPage } from './EditorPage';
 export { RemotionPreview } from './RemotionPreview';
 export { ErrorBoundary } from './ErrorBoundary';
 export { AssetsTab } from './AssetsTab';
-export { default as ShortsPage } from './ShortsPage';
-
+export { BrandLogo } from './BrandLogo';
+export { Dashboard } from './Dashboard';
 

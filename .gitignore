@@ -49,6 +49,7 @@ backend/ENV/
 
 # Backend uploads and media
 backend/uploads/
+exports/
 *.mp4
 *.mov
 *.webm
