@@ -4,6 +4,7 @@ import {
   EditorPage,
   ErrorBoundary,
   UploadPage,
+  DropboxPage,
 } from './components';
 import ShortsPage from './shorts/ShortsPage';
 import { AuthPage, AuthProvider, useAuth } from './auth/Auth';
@@ -27,6 +28,7 @@ function AppRoutes() {
       <Route path="/signup" element={<Navigate to="/auth?mode=signup" replace />} />
       <Route element={<ProtectedRoute />}>
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/dropbox" element={<DropboxPage />} />
         <Route path="/upload" element={<UploadPage onUploadComplete={handleUploadComplete} />} />
         <Route path="/editor/:sessionId" element={<EditorPageWrapper onReset={handleReset} />} />
         <Route path="/shorts" element={<ShortsPage />} />

@@ -31,7 +31,10 @@ import subprocess
 import mimetypes
 from datetime import datetime
 import socket
-
+import sqlite3
+import hashlib
+import secrets
+import bcrypt
 app = FastAPI(title="Video Editor API")
 
 # Register routers AFTER app is created
@@ -39,6 +42,80 @@ from routes.pixabay import router as pixabay_router
 from routes.freesound import router as freesound_router
 app.include_router(pixabay_router)
 app.include_router(freesound_router)
+
+# ============================================================================
+# DATABASE & AUTHENTICATION SETUP
+# ============================================================================
+
+# Initialize SQLite database for authentication
+DB_PATH = Path(__file__).parent.parent / 'autoedit.db'
+
+def get_db_connection():
+    """Create a SQLite database connection"""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initialize the database with users table"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Drop existing table and recreate with new schema
+    cursor.execute('DROP TABLE IF EXISTS users')
+    # Create table if it doesn't exist (prevent data loss on restarts)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print("[AUTH] Database initialized successfully")
+
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt"""
+    # Pre-hash with SHA-256 to completely bypass bcrypt's 72-byte limit
+    sha256_hash = hashlib.sha256(password.encode('utf-8')).hexdigest().encode('utf-8')
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(sha256_hash, salt).decode('utf-8')
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a password against its hash"""
+    # Hash input exactly as during signup to verify
+    sha256_hash = hashlib.sha256(password.encode('utf-8')).hexdigest().encode('utf-8')
+    return bcrypt.checkpw(sha256_hash, password_hash.encode('utf-8'))
+
+# Initialize database on startup
+init_db()
+
+# ============================================================================
+# PYDANTIC MODELS FOR AUTH
+# ============================================================================
+
+
+class SignupRequest(BaseModel):
+    first_name: str
+    last_name: str
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    first_name: str
+    last_name: str
+    email: str
+    created_at: str
+
 
 # Global fallback — ensures no unhandled exception leaks a raw 500 without a message
 from fastapi import Request
@@ -282,6 +359,122 @@ def _apply_advanced_operations(clips: list, actions: list) -> list:
 @app.get("/")
 async def root():
     return {"message": "Video Editor API", "status": "running"}
+
+
+# ============================================================================
+# AUTHENTICATION ENDPOINTS
+# ============================================================================
+
+@app.post("/api/signup")
+async def signup(request: SignupRequest):
+    """User registration endpoint"""
+    try:
+        # Validate input
+        if not request.email or not request.password or not request.first_name or not request.last_name:
+            return {"success": False, "message": "First name, last name, email, and password are required"}
+        
+        # Hash the password (no restrictions on password format)
+        password_hash = hash_password(request.password)
+        
+        # Insert into database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                'INSERT INTO users (first_name, last_name, email, password_hash) VALUES (?, ?, ?, ?)',
+                (request.first_name, request.last_name, request.email, password_hash)
+            )
+            conn.commit()
+            
+            # Fetch all users to return
+            cursor.execute('SELECT id, first_name, last_name, email, created_at FROM users ORDER BY id ASC')
+            users = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            
+            # Retrieve the newly created user to allow auto-login
+            new_user = None
+            for u in users:
+                if u['email'] == request.email:
+                    new_user = u
+                    break
+
+            print(f"[AUTH] New user registered: {request.email}")
+            return {
+                "success": True, 
+                "message": "Account created successfully", 
+                "users": users,
+                "user": {
+                    "id": new_user['id'],
+                    "name": f"{new_user['first_name']} {new_user['last_name']}",
+                    "first_name": new_user['first_name'],
+                    "last_name": new_user['last_name'],
+                    "email": new_user['email']
+                } if new_user else None
+            }
+            
+        except sqlite3.IntegrityError:
+            conn.close()
+            return {"success": False, "message": "An account with this email already exists"}
+            
+    except Exception as e:
+        print(f"[AUTH] Signup error: {str(e)}")
+        return {"success": False, "message": f"Registration failed: {str(e)}"}
+
+
+@app.post("/api/login")
+async def login(request: LoginRequest):
+    """User login endpoint"""
+    try:
+        # Validate input
+        if not request.email or not request.password:
+            return {"success": False, "message": "Email and password are required"}
+        
+        # Query database for user
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, first_name, last_name, email, password_hash FROM users WHERE email = ?', (request.email,))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if not user:
+            return {"success": False, "message": "Invalid email or password"}
+        
+        # Verify password
+        if not verify_password(request.password, user['password_hash']):
+            return {"success": False, "message": "Invalid email or password"}
+        
+        print(f"[AUTH] User logged in: {request.email}")
+        return {
+            "success": True,
+            "message": "Login successful",
+            "user": {
+                "id": user['id'],
+                "name": f"{user['first_name']} {user['last_name']}",
+                "first_name": user['first_name'],
+                "last_name": user['last_name'],
+                "email": user['email']
+            }
+        }
+        
+    except Exception as e:
+        print(f"[AUTH] Login error: {str(e)}")
+        return {"success": False, "message": f"Login failed: {str(e)}"}
+
+
+@app.get("/api/users")
+async def get_users():
+    """Fetch all registered users (for admin/debug purposes)"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, first_name, last_name, email, created_at FROM users ORDER BY id ASC')
+        users = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return {"users": users}
+    except Exception as e:
+        print(f"[AUTH] Get users error: {str(e)}")
+        return {"users": [], "error": str(e)}
 
 
 class GenerateImageRequest(BaseModel):

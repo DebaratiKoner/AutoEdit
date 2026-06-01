@@ -9,4 +9,5 @@ export { ErrorBoundary } from './ErrorBoundary';
 export { AssetsTab } from './AssetsTab';
 export { BrandLogo } from './BrandLogo';
 export { Dashboard } from './Dashboard';
+export { DropboxPage } from './DropboxPage';
 

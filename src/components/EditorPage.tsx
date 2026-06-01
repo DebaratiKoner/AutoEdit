@@ -11,6 +11,7 @@ import type { SessionData, TimelineSegment, CompositionSchema } from '../types';
 import { RemotionPreview } from './RemotionPreview';
 import { AssetsTab } from './AssetsTab';
 import { SessionManager, CompositionBuilder } from '../services';
+import { useAuth } from '../auth/Auth';
 import './EditorPage.css';
 
 const TRANSCRIBE_MAX_ATTEMPTS = 2;
@@ -150,6 +151,7 @@ async function fetchWithTranscribeRetry(input: RequestInfo | URL, init: RequestI
 
 export function EditorPage({ sessionId, onReset }: EditorPageProps) {
   const navigate = useNavigate();
+  const { isAuthenticated, logout } = useAuth();
   const [session, setSession] = useState<SessionData | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [activeAssetClip, setActiveAssetClip] = useState<TimelineSegment | null>(null);
@@ -2596,6 +2598,11 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <h1>AutoEdit</h1>
           </div>
           <div className="header-right">
+            {isAuthenticated ? (
+              <button className="btn btn-secondary" onClick={() => { logout(); navigate('/auth?mode=login'); }}>Log out</button>
+            ) : (
+              <button className="btn btn-secondary" style={{ background: '#4a9eff', color: '#fff', border: 'none' }} onClick={() => navigate('/auth?mode=login')}>Log in</button>
+            )}
             <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
               Reset
             </button>

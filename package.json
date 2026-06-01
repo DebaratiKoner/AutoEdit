@@ -43,11 +43,14 @@
     "clean": "rm -rf dist node_modules/.vite",
     "docker:build": "docker build -t autoedit .",
     "docker:run": "docker-compose up",
-    "prepare": "husky install || true"
+    "prepare": "husky install || true",
+    "server": "npx tsx src/auth/server.ts"
   },
   "dependencies": {
     "@remotion/cli": "^4.0.454",
     "@remotion/player": "^4.0.454",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
     "lz-string": "^1.5.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

@@ -52,8 +52,24 @@ export class SessionManager {
     try {
       const key = `${STORAGE_PREFIX}${sessionId}`;
       localStorage.setItem(key, JSON.stringify(data));
-    } catch (storageError) {
+    } catch (storageError: any) {
       console.warn('localStorage hot-cache save failed:', storageError);
+      // Self-healing: if localStorage is full, clear out old autoedit keys
+      if (storageError.name === 'QuotaExceededError' || storageError.message?.includes('exceeded the quota')) {
+        console.warn('Attempting to clear old autoedit keys to free up space...');
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const k = localStorage.key(i);
+          if (k && (k.startsWith(STORAGE_PREFIX) || k.includes('autoedit'))) {
+            localStorage.removeItem(k);
+          }
+        }
+        try {
+          const key = `${STORAGE_PREFIX}${sessionId}`;
+          localStorage.setItem(key, JSON.stringify(data));
+        } catch (e) {
+          console.error('LocalStorage is still full after cleanup', e);
+        }
+      }
     }
 
     try {
@@ -74,10 +90,26 @@ export class SessionManager {
         // Fallback to localStorage
         const key = `${STORAGE_PREFIX}${sessionId}`;
         localStorage.setItem(key, JSON.stringify(data));
-      } catch (storageError) {
+      } catch (storageError: any) {
         console.warn('localStorage save failed, using in-memory storage:', storageError);
+        if (storageError.name === 'QuotaExceededError' || storageError.message?.includes('exceeded the quota')) {
+          for (let i = localStorage.length - 1; i >= 0; i--) {
+            const k = localStorage.key(i);
+            if (k && (k.startsWith(STORAGE_PREFIX) || k.includes('autoedit'))) {
+              localStorage.removeItem(k);
+            }
+          }
+          try {
+            const key = `${STORAGE_PREFIX}${sessionId}`;
+            localStorage.setItem(key, JSON.stringify(data));
+          } catch (e) {
+            // Final fallback to in-memory storage
+            this.inMemoryStorage.set(sessionId, data);
+          }
+        } else {
         // Final fallback to in-memory storage
         this.inMemoryStorage.set(sessionId, data);
+        }
       }
     }
   }

@@ -32,6 +32,20 @@ const capabilities = [
     detail: 'B-roll and visual fallback sourcing keeps edits moving when local media needs extra coverage.',
     tone: 'green',
   },
+  {
+    icon: 'bolt',
+    tag: 'AI Repurposing',
+    title: 'Shorts Creation',
+    detail: 'Turn long-form videos into engaging 9:16 vertical shorts with auto-captions and smart reframing.',
+    tone: 'blue',
+  },
+  {
+    icon: 'export',
+    tag: 'Delivery',
+    title: 'Multi-Format Export',
+    detail: 'Render full timelines or extract individual clips directly to your local machine or connected cloud storage.',
+    tone: 'amber',
+  },
 ];
 
 const pipelineNodes = [
@@ -103,12 +117,6 @@ const metrics = [
   ['↑', '2-3x', 'Output Capacity Increase', 'Teams produce more content at the same headcount with zero quality compromise.', 'amber'],
 ];
 
-const jobs = [
-  ['product-launch-v3.mp4', 'Scene Segmentation', '99%', 'blue'],
-  ['brand-reel-raw.mov', 'PRISM Gate Scoring', '99%', 'amber'],
-  ['webinar-recording.mkv', 'Subtitle Sync', '99%', 'green'],
-];
-
 const completed = [
   ['q1-campaign-cut.mp4', '18:32 -> 04:11', '77% saved'],
   ['tutorial-series-ep4.mov', '42:07 -> 09:53', '76% saved'],
@@ -123,23 +131,65 @@ function CapabilityIcon({ name }: { name: string }) {
   if (name === 'play') return <span aria-hidden="true">▶</span>;
   if (name === 'wand') return <span aria-hidden="true">⌁</span>;
   if (name === 'grid') return <span aria-hidden="true">▦</span>;
+  if (name === 'bolt') return <span aria-hidden="true">⚡</span>;
+  if (name === 'export') return <span aria-hidden="true">↓</span>;
   return <BrandLogo size="sm" animated={false} />;
 }
 
 export function Dashboard() {
   const navigate = useNavigate();
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, logout } = useAuth();
   const [activeFeature, setActiveFeature] = useState(0);
   const [activeNode, setActiveNode] = useState(0);
+  const [isPlayingPipeline, setIsPlayingPipeline] = useState(false);
   const node = pipelineNodes[activeNode];
+  const launchTarget = useMemo(() => (isAuthenticated ? '/upload' : '/auth?mode=login'), [isAuthenticated]);
 
   useEffect(() => {
-    if (!isAuthenticated) {
-      navigate('/auth');
+    let timer: ReturnType<typeof setTimeout>;
+    if (isPlayingPipeline) {
+      if (activeNode < pipelineNodes.length - 1) {
+        timer = setTimeout(() => setActiveNode(prev => prev + 1), 1500); // Advance every 1.5 seconds
+      } else {
+        setIsPlayingPipeline(false);
+      }
     }
-  }, [isAuthenticated, navigate]);
+    return () => clearTimeout(timer);
+  }, [isPlayingPipeline, activeNode]);
 
-  const launchTarget = useMemo(() => (isAuthenticated ? '/upload' : '/auth?mode=signup'), [isAuthenticated]);
+  const handleRunFullPipeline = () => {
+    setActiveNode(0);
+    setIsPlayingPipeline(true);
+  };
+
+  const handleResetPipeline = () => {
+    setIsPlayingPipeline(false);
+    setActiveNode(0);
+  };
+
+  // Dynamic Mock State for Live Engine Activity
+  const [engineStats, setEngineStats] = useState([
+    { label: 'GPU Utilisation', value: 75, tone: 'green' },
+    { label: 'CLIP Inference', value: 91, tone: 'blue' },
+    { label: 'Export Queue', value: 35, tone: 'amber' },
+  ]);
+
+  const [activeJobs, setActiveJobs] = useState([
+    { name: 'product-launch-v3.mp4', phase: 'Scene Segmentation', progress: 42, tone: 'blue' },
+    { name: 'brand-reel-raw.mov', phase: 'PRISM Gate Scoring', progress: 18, tone: 'amber' },
+    { name: 'webinar-recording.mkv', phase: 'Subtitle Sync', progress: 87, tone: 'green' },
+  ]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setEngineStats(prev => prev.map(stat => ({
+        ...stat,
+        value: Math.min(100, Math.max(5, stat.value + (Math.random() * 10 - 5)))
+      })));
+      setActiveJobs(prev => prev.map(job => ({ ...job, progress: job.progress >= 99 ? 0 : Math.min(99, job.progress + Math.random() * 5) })));
+    }, 2500);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <main className="dashboard-screen ae-page" style={{ paddingTop: '70px' }}>
@@ -154,7 +204,16 @@ export function Dashboard() {
           <button onClick={() => scrollToSection('metrics')}>Metrics</button>
           <button onClick={() => scrollToSection('enterprise-cta')}>Enterprise</button>
           <span className="ae-status-dot">Engine Online</span>
-          <button className="ae-primary-button" onClick={() => navigate(launchTarget)}>Launch App</button>
+          {isAuthenticated ? (
+            <>
+              <button className="ae-ghost-button" onClick={() => { logout(); navigate('/auth?mode=login'); }}>Log out</button>
+              <button className="ae-primary-button" onClick={() => navigate('/upload')}>Launch App</button>
+            </>
+          ) : (
+            <>
+              <button className="ae-primary-button" onClick={() => navigate('/auth?mode=login')}>Log in</button>
+            </>
+          )}
         </nav>
       </header>
 
@@ -172,7 +231,7 @@ export function Dashboard() {
             and enterprise studios can scale output without scaling headcount.
           </p>
           <div className="dashboard-actions">
-            <button className="ae-primary-button" onClick={() => navigate(launchTarget)}>Start Free Trial</button>
+            <button className="ae-primary-button" onClick={() => navigate(launchTarget)}>Launch App</button>
             <button className="ae-ghost-button" onClick={() => scrollToSection('pipeline')}>View Pipeline</button>
           </div>
         </div>
@@ -183,23 +242,19 @@ export function Dashboard() {
             <strong>PRISM Engine - Active Session</strong>
             <small>Uptime 99.98% - 3 workers</small>
           </div>
-          {[
-            ['GPU Utilisation', '75%', 'green'],
-            ['CLIP Inference', '91%', 'blue'],
-            ['Export Queue', '35%', 'amber'],
-          ].map(([label, value, tone]) => (
-            <div className="ae-progress-row" key={label}>
-              <span>{label}</span>
-              <div><i className={`tone-${tone}`} style={{ width: value }} /></div>
-              <b className={`tone-text-${tone}`}>{value}</b>
+          {engineStats.map((stat) => (
+            <div className="ae-progress-row" key={stat.label}>
+              <span>{stat.label}</span>
+              <div><i className={`tone-${stat.tone}`} style={{ width: `${Math.round(stat.value)}%` }} /></div>
+              <b className={`tone-text-${stat.tone}`}>{Math.round(stat.value)}%</b>
             </div>
           ))}
           <div className="job-list">
             <p>Active Processing Jobs</p>
-            {jobs.map(([name, phase, value, tone]) => (
-              <div className="job-row" key={name}>
-                <span><b>{name}</b><small>{phase}</small></span>
-                <strong className={`tone-text-${tone}`}>{value}</strong>
+            {activeJobs.map((job) => (
+              <div className="job-row" key={job.name}>
+                <span><b>{job.name}</b><small>{job.phase}</small></span>
+                <strong className={`tone-text-${job.tone}`}>{Math.round(job.progress)}%</strong>
               </div>
             ))}
           </div>
@@ -255,7 +310,7 @@ export function Dashboard() {
               <button
                 className={`pipeline-step ${activeNode === index ? 'is-active' : ''}`}
                 key={item.title}
-                onClick={() => setActiveNode(index)}
+                onClick={() => { setIsPlayingPipeline(false); setActiveNode(index); }}
               >
                 <span className="pipeline-orb">{index === 0 ? '↑' : index === 1 ? '△' : index === 2 ? '⬡' : '✦'}</span>
                 <span className="pipeline-copy">
@@ -282,11 +337,13 @@ export function Dashboard() {
             <label className="confidence-meter">
               <span>CLIP Confidence Score</span>
               <input type="range" min="0" max="100" defaultValue="90" aria-label="CLIP confidence score" />
-              <small>Pass threshold: 0.9</small>
+              <small>Pass threshold : 0.9</small>
             </label>
             <div className="pipeline-actions">
-              <button className="ae-primary-button" onClick={() => navigate(launchTarget)}>▶ Run Full Pipeline</button>
-              <button className="ae-ghost-button" onClick={() => setActiveNode(0)}>↻ Reset</button>
+              <button className="ae-primary-button" onClick={handleRunFullPipeline} disabled={isPlayingPipeline}>
+                {isPlayingPipeline ? '▶ Running Pipeline...' : '▶ Run Full Pipeline'}
+              </button>
+              <button className="ae-ghost-button" onClick={handleResetPipeline}>↻ Reset</button>
             </div>
           </article>
         </div>
@@ -316,8 +373,8 @@ export function Dashboard() {
           <p>Join 500+ studios already using AutoEdit to ship content 3x faster.</p>
         </div>
         <div className="dashboard-actions">
-          <button className="ae-primary-button" onClick={() => navigate(launchTarget)}>▶ Start Free Trial</button>
-          <button className="ae-ghost-button" onClick={() => navigate('/auth?mode=signup')}>Talk to Sales →</button>
+          <button className="ae-primary-button" onClick={() => navigate(launchTarget)}>▶ Launch App</button>
+          <button className="ae-ghost-button" onClick={() => navigate('/auth?mode=login')}>Talk to Sales →</button>
         </div>
       </section>
 

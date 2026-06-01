@@ -4,9 +4,10 @@
  */
 
 import { useState, useRef, DragEvent, ChangeEvent } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { FileValidator, APIClient } from '../services';
 import { logger } from '../utils';
+import { useAuth } from '../auth/Auth';
 import './UploadPage.css';
 
 interface UploadPageProps {
@@ -17,6 +18,8 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const { isAuthenticated, logout } = useAuth();
+  const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const fileValidator = new FileValidator();
   const apiClient = new APIClient();
@@ -129,8 +132,15 @@ export function UploadPage({ onUploadComplete }: UploadPageProps) {
 
   return (
     <div className="upload-page">
-      <header className="upload-header">
-        <h1>AutoEdit</h1>
+      <header className="upload-header" style={{ display: 'flex', justifyContent: 'space-between', padding: '1rem 2rem', alignItems: 'center', width: '100%', boxSizing: 'border-box' }}>
+        <h1 style={{ margin: 0 }}>AutoEdit</h1>
+        <div>
+          {isAuthenticated ? (
+            <button onClick={() => { logout(); navigate('/auth?mode=login'); }} style={{ background: 'transparent', color: '#fff', border: '1px solid #4a9eff', padding: '0.5rem 1rem', borderRadius: '4px', cursor: 'pointer' }}>Log out</button>
+          ) : (
+            <button onClick={() => navigate('/auth?mode=login')} style={{ background: '#4a9eff', color: '#fff', border: 'none', padding: '0.5rem 1rem', borderRadius: '4px', cursor: 'pointer' }}>Log in</button>
+          )}
+        </div>
       </header>
 
       <main className="upload-main">
