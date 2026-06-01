@@ -57,7 +57,7 @@ export function AuthPage() {
     event.preventDefault();
     login(email);
     const from = (location.state as { from?: string } | null)?.from;
-    navigate(from && !from.startsWith('/auth') ? from : '/dashboard');
+    navigate(from && !from.startsWith('/auth') ? from : '/');
   };
 
   return (

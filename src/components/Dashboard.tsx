@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/Auth';
 import { BrandLogo } from './BrandLogo';
@@ -133,11 +133,17 @@ export function Dashboard() {
   const [activeNode, setActiveNode] = useState(0);
   const node = pipelineNodes[activeNode];
 
+  useEffect(() => {
+    if (!isAuthenticated) {
+      navigate('/auth');
+    }
+  }, [isAuthenticated, navigate]);
+
   const launchTarget = useMemo(() => (isAuthenticated ? '/upload' : '/auth?mode=signup'), [isAuthenticated]);
 
   return (
-    <main className="dashboard-screen ae-page">
-      <header className="ae-topbar">
+    <main className="dashboard-screen ae-page" style={{ paddingTop: '70px' }}>
+      <header className="ae-topbar" style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 1000, backgroundColor: 'rgba(13, 13, 26, 0.95)', backdropFilter: 'blur(8px)' }}>
         <button className="ae-brand" onClick={() => scrollToSection('hero')} aria-label="AutoEdit home">
           <BrandLogo size="sm" animated />
           <span>Auto<span>Edit</span></span>
