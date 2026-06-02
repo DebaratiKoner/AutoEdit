@@ -60,7 +60,7 @@ app.post('/api/login', (req, res) => {
 
 /* USERS */
 
-app.get('/api/users', (req, res) => {
+app.get('/api/users', (_req, res) => {
   res.json({
     users: getAllUsers()
   });

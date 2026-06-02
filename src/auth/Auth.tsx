@@ -7,6 +7,44 @@ interface AuthUser {
   email: string;
 }
 
+const AUTH_STORAGE_KEY = 'autoedit_user';
+
+function normalizeAuthUser(user: Partial<AuthUser> | null | undefined): AuthUser | null {
+  const email = typeof user?.email === 'string' ? user.email.trim().toLowerCase() : '';
+  if (!email) return null;
+
+  const name =
+    typeof user?.name === 'string' && user.name.trim()
+      ? user.name.trim()
+      : email.split('@')[0] || 'AutoEdit User';
+
+  return { name, email };
+}
+
+function saveAuthUser(user: AuthUser) {
+  const serializedUser = JSON.stringify(user);
+
+  try {
+    localStorage.setItem(AUTH_STORAGE_KEY, serializedUser);
+    return;
+  } catch (error) {
+    console.warn('Auth localStorage save failed, clearing old AutoEdit session cache:', error);
+  }
+
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (key?.startsWith('autoedit_session_')) {
+        localStorage.removeItem(key);
+      }
+    }
+
+    localStorage.setItem(AUTH_STORAGE_KEY, serializedUser);
+  } catch (error) {
+    console.warn('Auth localStorage save failed after cleanup. Continuing with in-memory login:', error);
+  }
+}
+
 interface AuthContextValue {
   user: AuthUser | null;
   isAuthenticated: boolean;
@@ -19,9 +57,10 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(() => {
     try {
-      const savedUser = localStorage.getItem('autoedit_user');
-      return savedUser ? JSON.parse(savedUser) : null;
+      const savedUser = localStorage.getItem(AUTH_STORAGE_KEY);
+      return savedUser ? normalizeAuthUser(JSON.parse(savedUser)) : null;
     } catch {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
       return null;
     }
   });
@@ -31,13 +70,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       isAuthenticated: user !== null,
       login: (email = 'user@autoedit.ai', name?: string) => {
-        const authUser = { name: name || email.split('@')[0] || 'AutoEdit User', email };
+        const authUser = normalizeAuthUser({ name, email }) || {
+          name: 'AutoEdit User',
+          email: 'user@autoedit.ai',
+        };
         setUser(authUser);
-        localStorage.setItem('autoedit_user', JSON.stringify(authUser));
+        saveAuthUser(authUser);
       },
       logout: () => {
         setUser(null);
-        localStorage.removeItem('autoedit_user');
+        localStorage.removeItem(AUTH_STORAGE_KEY);
       },
     }),
     [user],

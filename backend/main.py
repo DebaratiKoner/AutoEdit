@@ -60,10 +60,9 @@ def init_db():
     """Initialize the database with users table"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Drop existing table and recreate with new schema
-    cursor.execute('DROP TABLE IF EXISTS users')
-    # Create table if it doesn't exist (prevent data loss on restarts)
+
+    # Create table if it doesn't exist. Never drop it here, because users must
+    # remain available after the backend is restarted.
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
