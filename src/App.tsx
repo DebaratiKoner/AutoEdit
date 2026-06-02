@@ -17,7 +17,7 @@ function AppRoutes() {
   };
 
   const handleReset = () => {
-    navigate('/dashboard');
+    navigate('/upload');
   };
 
   return (
