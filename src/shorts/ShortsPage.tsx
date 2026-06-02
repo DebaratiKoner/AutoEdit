@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useAuth } from "../auth/Auth";
 
 export type CaptionStyle = "bold_yellow_pop" | "clean_white" | "minimal_bottom" | "off";
 
@@ -108,6 +109,8 @@ const panelStyle = {
 
 export default function ShortsPage() {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { logout, isAuthenticated } = useAuth();
   const editorState = (location.state || null) as ShortsLocationState | null;
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -311,7 +314,15 @@ export default function ShortsPage() {
           {isGenerating ? "< New short" : "AutoEdit - Shorts Creator"}
         </button>
         <div style={{ display: "flex", alignItems: "center", gap: "1rem", color: "#aaa", fontSize: "0.86rem" }}>
-          <Link to="/" style={{ textDecoration: "none", color: "#ddd" }}>AI Editor</Link>
+          <Link to="/upload" style={{ textDecoration: "none", color: "#ddd" }}>AI Editor</Link>
+          {isAuthenticated && (
+            <button 
+              onClick={() => { logout(); navigate('/auth?mode=login'); }} 
+              style={{ background: "transparent", border: "none", color: "#ddd", cursor: "pointer", fontSize: "inherit", padding: 0 }}
+            >
+              Log out
+            </button>
+          )}
         </div>
       </header>
 

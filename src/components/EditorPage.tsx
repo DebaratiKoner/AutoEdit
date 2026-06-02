@@ -2598,11 +2598,6 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
             <h1>AutoEdit</h1>
           </div>
           <div className="header-right">
-            {isAuthenticated ? (
-              <button className="btn btn-secondary" onClick={() => { logout(); navigate('/auth?mode=login'); }}>Log out</button>
-            ) : (
-              <button className="btn btn-secondary" style={{ background: '#4a9eff', color: '#fff', border: 'none' }} onClick={() => navigate('/auth?mode=login')}>Log in</button>
-            )}
             <button className="btn btn-secondary" onClick={() => setShowResetDialog(true)}>
               Reset
             </button>
@@ -2667,6 +2662,11 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
                 </>
               )}
             </div>
+            {isAuthenticated ? (
+              <button className="btn btn-secondary" onClick={() => { logout(); navigate('/auth?mode=login'); }}>Log out</button>
+            ) : (
+              <button className="btn btn-secondary" style={{ background: '#4a9eff', color: '#fff', border: 'none' }} onClick={() => navigate('/auth?mode=login')}>Log in</button>
+            )}
           </div>
         </header>
 
