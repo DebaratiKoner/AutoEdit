@@ -38,12 +38,13 @@ export class CompositionBuilder {
     // Step 1: Sort timeline segments by order
     const sortedSegments = [...session.timeline].sort((a, b) => a.order - b.order);
 
-    // Step 2: Calculate cumulative frame offsets and map to ClipDefinitions
-    let cumulativeFrames = 0;
+    // Step 2: Calculate frame offsets from absolute timeline positions and map to ClipDefinitions
     const clips: ClipDefinition[] = [];
+    let maxEndFrame = 0;
 
     for (const segment of sortedSegments) {
       const durationInFrames = Math.floor(segment.duration * fps);
+      const startFrom = Math.floor((segment.timelineStart ?? 0) * fps);
 
       const assetKind = segment.assetKind ?? (segment.assetUrl ? 'video' : 'video');
       const src = assetKind === 'photo'
@@ -53,7 +54,7 @@ export class CompositionBuilder {
       clips.push({
         id: segment.id,
         src,
-        startFrom: cumulativeFrames,
+        startFrom,
         durationInFrames,
         sourceStart: segment.sourceStart,
         sourceEnd: segment.sourceEnd,
@@ -63,7 +64,7 @@ export class CompositionBuilder {
         assetKind,
       });
 
-      cumulativeFrames += durationInFrames;
+      maxEndFrame = Math.max(maxEndFrame, startFrom + durationInFrames);
     }
 
     // Step 3: Map transcript segments to subtitles
@@ -104,7 +105,7 @@ export class CompositionBuilder {
       fps,
       width: session.resolution.width,
       height: session.resolution.height,
-      durationInFrames: cumulativeFrames,
+      durationInFrames: maxEndFrame,
       clips,
       subtitles,
       transitions,
@@ -162,6 +163,7 @@ export class CompositionBuilder {
     }
 
     let totalClipDuration = 0;
+    let maxClipEndFrame = 0;
     for (let i = 0; i < schema.clips.length; i++) {
       const clip = schema.clips[i];
       const prefix = `clips[${i}]`;
@@ -195,12 +197,18 @@ export class CompositionBuilder {
       }
 
       totalClipDuration += clip.durationInFrames;
+      maxClipEndFrame = Math.max(maxClipEndFrame, clip.startFrom + clip.durationInFrames);
     }
 
-    // Validate total duration matches sum of clips
-    if (totalClipDuration !== schema.durationInFrames) {
+    if (maxClipEndFrame !== schema.durationInFrames) {
       errors.push(
-        `Total clip duration (${totalClipDuration}) does not match composition duration (${schema.durationInFrames})`
+        `Composition duration (${schema.durationInFrames}) does not match final clip end frame (${maxClipEndFrame})`
+      );
+    }
+
+    if (totalClipDuration > schema.durationInFrames) {
+      errors.push(
+        `Total clip duration (${totalClipDuration}) exceeds composition duration (${schema.durationInFrames})`
       );
     }
 

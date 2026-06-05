@@ -108,7 +108,7 @@ export function DropboxPage() {
       </section>
 
       <footer className="ae-footer">
-        <p>© 2025 AutoEdit AI - Autonomous Video Post-Production</p>
+        <p>© 2026 AutoEdit AI - Autonomous Video Post-Production</p>
       </footer>
     </main>
   );

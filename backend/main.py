@@ -2152,11 +2152,19 @@ def _export_signature(session_id: str, timeline: list) -> str:
         start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
         duration = clip.get("duration")
         end = clip.get("end")
+        timeline_start = float(clip.get("timelineStart", 0) or 0)
         if duration is None and end is not None:
             duration = float(end) - start
         if duration is None:
             duration = float(clip.get("duration", 0) or 0)
-        normalized.append({"i": i, "start": round(start, 3), "duration": round(float(duration), 3)})
+        normalized.append({
+            "i": i,
+            "start": round(start, 3),
+            "timelineStart": round(timeline_start, 3),
+            "duration": round(float(duration), 3),
+            "assetUrl": clip.get("assetUrl"),
+            "assetKind": clip.get("assetKind"),
+        })
 
     material = {"session_id": session_id, "timeline": normalized}
     return hashlib.md5(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()[:12]
@@ -2200,8 +2208,16 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
 
         try:
             track0_clips = [c for c in timeline if c.get("track", 0) == 0]
-            track0_clips.sort(key=lambda c: (int(c.get("order", 0)), float(c.get("timelineStart", c.get("start", 0)))))
+            track0_clips.sort(key=lambda c: (float(c.get("timelineStart", c.get("start", 0)) or 0), int(c.get("order", 0))))
             
+            timeline_end = max(
+                [
+                    float(c.get("timelineStart", 0) or 0) + float(c.get("duration", 0) or 0)
+                    for c in track0_clips
+                ],
+                default=0.0,
+            )
+
             flattened_track0 = []
             for clip in track0_clips:
                 if clip.get("segments"):
@@ -2214,7 +2230,9 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                 else:
                     flattened_track0.append(clip)
 
+            current_timeline_pos = 0.0
             for i, clip in enumerate(flattened_track0):
+                clip_timeline_start = float(clip.get("timelineStart", clip.get("start", 0)) or 0)
                 start = float(clip.get("sourceStart", clip.get("start", 0)) or 0)
                 end = float(clip.get("sourceEnd", clip.get("end", 0)) or 0)
                 duration = float(clip.get("duration") or 0)
@@ -2222,6 +2240,23 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                     duration = max(0.0, end - start)
                 if duration <= 0.05:
                     continue
+
+                if clip_timeline_start > current_timeline_pos + 0.049:
+                    gap_duration = clip_timeline_start - current_timeline_pos
+                    blank_path = temp_dir / f"blank_{i}.mp4"
+                    subprocess.run([
+                        "ffmpeg", "-y",
+                        "-f", "lavfi", "-i", f"color=c=black:s=1920x1080:r=30",
+                        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                        "-t", str(gap_duration),
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-r", "30",
+                        "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2",
+                        "-shortest",
+                        "-movflags", "+faststart",
+                        "-y", str(blank_path)
+                    ], check=True, capture_output=True, text=True)
+                    clip_files.append(blank_path)
+                    current_timeline_pos = clip_timeline_start
 
                 asset_url = clip.get("assetUrl")
                 input_path = video_path
@@ -2264,6 +2299,11 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                             (content[:4] == b'RIFF' and content[8:12] == b'WEBP') or
                             content[:3] == b'GIF'
                         )
+                        
+                        if input_path.suffix.lower() == ".tmp":
+                            new_dest = input_path.with_suffix(".jpg" if is_image else ".mp4")
+                            input_path.rename(new_dest)
+                            input_path = new_dest
 
                 clip_path = temp_dir / f"clip_{i}.mp4"
                 clip_files.append(clip_path)
@@ -2286,8 +2326,8 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                         "ffmpeg", "-ss", str(start), "-t", str(duration), "-i", str(input_path),
                         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                         "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1:1",
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "96k", "-shortest",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-r", "30",
+                        "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2", "-shortest",
                         "-movflags", "+faststart", "-y", str(clip_path)
                     ]
                     if is_image:
@@ -2296,24 +2336,41 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                             "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                             "-t", str(duration),
                             "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1:1",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-                            "-c:a", "aac", "-b:a", "96k", "-shortest",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-r", "30",
+                            "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2", "-shortest",
                             "-movflags", "+faststart", "-y", str(clip_path)
                         ]
                 else:
                     cmd = [
                         "ffmpeg", "-ss", str(start), "-t", str(duration), "-i", str(input_path),
                         "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1:1",
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-r", "30",
                         "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2",
                         "-movflags", "+faststart", "-y", str(clip_path)
                     ]
                 
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
                 valid_clip_count += 1
+                current_timeline_pos = max(current_timeline_pos, clip_timeline_start + duration)
 
             if valid_clip_count == 0:
                 raise HTTPException(status_code=400, detail="No valid clips to export.")
+
+            if current_timeline_pos < timeline_end - 0.049:
+                gap_duration = timeline_end - current_timeline_pos
+                blank_path = temp_dir / f"blank_tail.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", f"color=c=black:s=1920x1080:r=30",
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-t", str(gap_duration),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p", "-r", "30",
+                    "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2",
+                    "-shortest",
+                    "-movflags", "+faststart",
+                    "-y", str(blank_path)
+                ], check=True, capture_output=True, text=True)
+                clip_files.append(blank_path)
 
             with open(concat_txt_path, "w", encoding="utf-8") as f:
                 for c in clip_files:
@@ -2353,7 +2410,7 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
                             async with httpx.AsyncClient(timeout=30.0) as hc:
                                 r = await hc.get(a_url, headers={"User-Agent": "Mozilla/5.0"})
                                 r.raise_for_status()
-                                dest = temp_dir / f"dl_aud_{idx}.tmp"
+                                dest = temp_dir / f"dl_aud_{idx}.mp3"
                                 dest.write_bytes(r.content)
                                 return dest
                         a_path = await _dl_a()
@@ -2445,10 +2502,14 @@ async def fast_export_endpoint(session_id: str, body: FastExportRequest):
             err_tail = (stderr[-2000:] if isinstance(stderr, str) else str(stderr))
             raise HTTPException(status_code=500, detail=f"ffmpeg failed: {err_tail}")
 
-def _export_zip_signature(session_id: str, timeline: list, transcript_segments: list, selected_ids: list = None) -> str:
+EXPORT_ZIP_RENDER_VERSION = "timeline_full_assets_v2"
+
+def _export_zip_signature(session_id: str, timeline: list, transcript_segments: list, selected_ids: list = None, mode: str = "clips") -> str:
     import json
     import hashlib
     material = {
+        "rendererVersion": EXPORT_ZIP_RENDER_VERSION,
+        "mode": mode,
         "session_id": session_id,
         "timeline": timeline or [],
         "transcriptSegments": transcript_segments or [],
@@ -2463,6 +2524,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
     import json
     import shutil
     import zipfile
+    import asyncio
     from urllib.parse import urlparse, parse_qs
     from datetime import datetime
 
@@ -2481,12 +2543,63 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         clip for clip in body.timeline
         if clip.get("track", 0) == 0 and (selected_id_set is None or clip.get("id") in selected_id_set)
     ]
-    # Maintain strict timeline order
-    top_level_clips.sort(key=lambda c: (int(c.get("order", 0)), float(c.get("timelineStart", c.get("start", 0)))))
+    # Maintain strict timeline order by actual timeline position
+    top_level_clips.sort(key=lambda c: (float(c.get("timelineStart", c.get("start", 0)) or 0), int(c.get("order", 0))))
+
+    selected_timeline_start = min(
+        [float(c.get("timelineStart", 0) or 0) for c in top_level_clips],
+        default=0.0,
+    )
+    selected_timeline_end = max(
+        [
+            float(c.get("timelineStart", 0) or 0) + float(c.get("duration", 0) or 0)
+            for c in top_level_clips
+        ],
+        default=0.0,
+    )
+
+    def _audio_belongs_to_export(clip):
+        if clip.get("assetKind") != "audio" or not (clip.get("assetUrl") or "").strip():
+            return False
+        if selected_id_set is None or clip.get("id") in selected_id_set:
+            return True
+        clip_start = float(clip.get("timelineStart", 0) or 0)
+        clip_end = clip_start + float(clip.get("duration", 0) or 0)
+        return (
+            selected_timeline_end > selected_timeline_start
+            and clip_start < selected_timeline_end
+            and clip_end > selected_timeline_start
+        )
+
+    def _clip_belongs_to_export_window(clip):
+        if selected_id_set is None or clip.get("id") in selected_id_set:
+            return True
+        clip_start = float(clip.get("timelineStart", 0) or 0)
+        clip_end = clip_start + float(clip.get("duration", 0) or 0)
+        return (
+            selected_timeline_end > selected_timeline_start
+            and clip_start < selected_timeline_end
+            and clip_end > selected_timeline_start
+        )
+
+    timeline_end = max(
+        [
+            float(c.get("timelineStart", 0) or 0) + float(c.get("duration", 0) or 0)
+            for c in body.timeline
+            if _clip_belongs_to_export_window(c)
+        ],
+        default=selected_timeline_end,
+    )
+
     has_video_assets = any(
         (clip.get("assetUrl") or (isinstance(seg, dict) and seg.get("assetUrl")))
         for clip in top_level_clips
         for seg in (clip.get("segments") if isinstance(clip.get("segments"), list) and clip.get("segments") else [clip])
+    ) or any(
+        clip.get("assetKind") in ["video", "photo"]
+        and (clip.get("assetUrl") or "").strip()
+        and _clip_belongs_to_export_window(clip)
+        for clip in body.timeline
     )
     
     out_ext = video_path.suffix.lower()
@@ -2495,7 +2608,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
 
     export_cache_dir = UPLOAD_DIR / "export_cache"
     export_cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_signature = _export_zip_signature(session_id, body.timeline, body.transcriptSegments, body.selectedIds)
+    cache_signature = _export_zip_signature(session_id, body.timeline, body.transcriptSegments, body.selectedIds, body.mode)
     clips_zip_cache_path = export_cache_dir / f"{session_id}_{cache_signature}_clips.zip"
     whole_video_cache_path = export_cache_dir / f"{session_id}_{cache_signature}_whole{out_ext}"
 
@@ -2610,7 +2723,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         ], capture_output=True)
                         if out_path.exists(): final_clip_files.append((out_path, out_path.name))
 
-            audio_clips_sel = [clip for clip in body.timeline if clip.get("assetKind") == "audio"]
+            audio_clips_sel = [clip for clip in body.timeline if _audio_belongs_to_export(clip)]
             for i, clip in enumerate(audio_clips_sel):
                 asset_url = clip.get("assetUrl")
                 if asset_url:
@@ -2639,27 +2752,6 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         clip_files = []
         chapters_meta = []
 
-        selected_timeline_start = min(
-            [float(c.get("timelineStart", 0) or 0) for c in top_level_clips],
-            default=0.0,
-        )
-        selected_timeline_end = max(
-            [
-                float(c.get("timelineStart", 0) or 0) + float(c.get("duration", 0) or 0)
-                for c in top_level_clips
-            ],
-            default=0.0,
-        )
-
-        def _audio_belongs_to_export(clip):
-            if clip.get("assetKind") != "audio" or not (clip.get("assetUrl") or "").strip():
-                return False
-            if selected_id_set is None or clip.get("id") in selected_id_set:
-                return True
-            clip_start = float(clip.get("timelineStart", 0) or 0)
-            clip_end = clip_start + float(clip.get("duration", 0) or 0)
-            return selected_timeline_end > selected_timeline_start and clip_start < selected_timeline_end and clip_end > selected_timeline_start
-
         audio_clips = [clip for clip in body.timeline if _audio_belongs_to_export(clip)]
         audio_clips.sort(key=lambda c: float(c.get("timelineStart", 0)))
         audio_inputs = []
@@ -2675,7 +2767,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         probe_cmd = [
             "ffprobe", "-v", "error", 
             "-select_streams", "v:0", 
-            "-show_entries", "stream=width,height,r_frame_rate,sample_aspect_ratio,pix_fmt", 
+            "-show_entries", "stream=width,height,r_frame_rate,sample_aspect_ratio,pix_fmt,codec_name", 
             "-of", "json", str(video_path)
         ]
         probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
@@ -2694,12 +2786,33 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         
         probe_audio = subprocess.run([
             "ffprobe", "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=sample_rate,channels", "-of", "json", str(video_path)
+            "-show_entries", "stream=sample_rate,channels,codec_name", "-of", "json", str(video_path)
         ], capture_output=True, text=True)
         aud_props = json.loads(probe_audio.stdout)
         a_stream = aud_props.get("streams", [{}])[0] if aud_props.get("streams") else {}
         ar = a_stream.get("sample_rate", "44100")
         ac = a_stream.get("channels", "2")
+
+        c_v = v_stream.get("codec_name", "libx264")
+        if c_v == "h264": c_v = "libx264"
+        elif c_v == "hevc": c_v = "libx265"
+        elif c_v == "vp9": c_v = "libvpx-vp9"
+        elif c_v == "vp8": c_v = "libvpx"
+        else: c_v = "libx264"
+
+        has_audio = bool(aud_props.get("streams"))
+        c_a = a_stream.get("codec_name", "aac") if has_audio else "aac"
+        if c_a != "aac": c_a = "aac"
+
+        def _path_has_audio(path):
+            try:
+                probe = subprocess.run([
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name", "-of", "json", str(path)
+                ], capture_output=True, text=True)
+                return bool(json.loads(probe.stdout or "{}").get("streams"))
+            except Exception:
+                return False
 
         def _process_zip_asset(clip_idx, seg_idx, asset_url, duration, src_start=0.0):
             if duration <= 0.05:
@@ -2745,6 +2858,10 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         (content[:4] == b'RIFF' and content[8:12] == b'WEBP') or
                         content[:3] == b'GIF'
                     )
+                    if src_path.suffix.lower() == ".tmp":
+                        new_dest = src_path.with_suffix(".jpg" if is_image else ".mp4")
+                        src_path.rename(new_dest)
+                        src_path = new_dest
                 except Exception as e:
                     print(f"[export-zip] Failed to DL asset {asset_url}: {e}")
                     return None
@@ -2754,27 +2871,14 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             if not src_path:
                 return None
 
-            c_v = v_stream.get("codec_name", "libx264")
-            if c_v == "h264": c_v = "libx264"
-            elif c_v == "hevc": c_v = "libx265"
-            elif c_v == "vp9": c_v = "libvpx-vp9"
-            elif c_v == "vp8": c_v = "libvpx"
-            else: c_v = "libx264"
-
-            has_audio = bool(aud_props.get("streams"))
-            c_a = a_stream.get("codec_name", "aac") if has_audio else "aac"
-            if c_a != "aac": c_a = "aac"
-
             v_args = ["-c:v", c_v, "-pix_fmt", pix_fmt]
             if c_v in ["libx264", "libx265"]:
                 v_args.extend(["-preset", "ultrafast", "-tune", "fastdecode", "-crf", "28", "-threads", "0", "-video_track_timescale", "90000"])
             elif c_v in ["libvpx-vp9", "libvpx"]:
                 v_args.extend(["-deadline", "realtime", "-cpu-used", "8", "-crf", "35", "-b:v", "0", "-threads", "0"])
 
-            if has_audio:
-                a_args = ["-c:a", c_a, "-ar", str(ar), "-ac", str(ac), "-b:a", "128k"]
-            else:
-                a_args = ["-an"]
+            input_has_audio = (not is_image) and _path_has_audio(src_path)
+            a_args = ["-c:a", c_a, "-ar", str(ar), "-ac", str(ac), "-b:a", "128k"]
 
             if is_image:
                 # PRE-SCALE image ONCE to prevent massive cpu bottlenecks mapping scale across 30fps frames
@@ -2789,27 +2893,31 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                 img_to_use = str(resized_img_path) if resized_img_path.exists() else str(src_path)
 
                 cmd = ["ffmpeg", "-loop", "1", "-framerate", str(fps), "-i", img_to_use]
-                if has_audio:
-                    cmd.extend(["-f", "lavfi", "-i", f"anullsrc=r={ar}:cl=stereo"])
+                cmd.extend(["-f", "lavfi", "-i", f"anullsrc=r={ar}:cl=stereo"])
                 cmd.extend(["-t", str(duration)])
                 cmd.extend(["-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar}"])
                 cmd.extend(v_args)
                 cmd.extend(a_args)
-                if has_audio:
-                    cmd.append("-shortest")
+                cmd.append("-shortest")
                 cmd.extend(["-y", str(clip_path)])
             else:
-                cmd = ["ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
-                       "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"]
-                if asset_url:
-                    cmd = ["ffmpeg", "-ss", "0", "-i", str(src_path), "-t", str(duration),
-                           "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"]
+                if not input_has_audio:
+                    cmd = [
+                        "ffmpeg", "-ss", str(src_start), "-i", str(src_path),
+                        "-f", "lavfi", "-i", f"anullsrc=r={ar}:cl=stereo",
+                        "-t", str(duration),
+                        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"
+                    ]
                 else:
-                    cmd = ["ffmpeg", "-ss", str(src_start), "-i", str(src_path), "-t", str(duration),
-                           "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"]
+                    cmd = [
+                        "ffmpeg", "-ss", str(src_start), "-i", str(src_path), "-t", str(duration),
+                        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar={sar},fps={fps}"
+                    ]
                 
                 cmd.extend(v_args)
                 cmd.extend(a_args)
+                if not input_has_audio:
+                    cmd.append("-shortest")
                 cmd.extend(["-y", str(clip_path)])
                 
             res = subprocess.run(cmd, capture_output=True, text=True)
@@ -2832,8 +2940,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     src_end = float(segment.get("sourceEnd", segment.get("end", 0)) or 0)
                     duration = float(segment.get("duration") or max(0.0, src_end - src_start))
                     if duration > 0.05:
-                        if asset_url:
-                            futures.append(executor.submit(_process_zip_asset, i, j, asset_url, duration, src_start))
+                        futures.append(executor.submit(_process_zip_asset, i, j, asset_url, duration, src_start))
             for f in futures:
                 res = f.result()
                 if res:
@@ -2842,8 +2949,32 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
         concat_txt_path = temp_dir / "main_concat.txt"
         valid_clip_count = 0
         
+        current_timeline_pos = 0.0
         with open(concat_txt_path, "w", encoding="utf-8") as f:
             for i, clip in enumerate(top_level_clips):
+                clip_timeline_start = float(clip.get("timelineStart", clip.get("start", 0)) or 0)
+                if clip_timeline_start > current_timeline_pos + 0.049:
+                    gap_duration = clip_timeline_start - current_timeline_pos
+                    blank_gap_path = temp_dir / f"blank_gap_{i}.mp4"
+                    gap_cmd = [
+                        "ffmpeg", "-y",
+                        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}",
+                        "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}",
+                        "-t", str(gap_duration),
+                        "-c:v", c_v, "-pix_fmt", pix_fmt
+                    ]
+                    if c_v in ["libx264", "libx265"]:
+                        gap_cmd.extend(["-preset", "ultrafast", "-crf", "28"])
+                    gap_cmd.extend([
+                        "-c:a", c_a, "-b:a", "96k",
+                        "-shortest",
+                        "-movflags", "+faststart",
+                        "-y", str(blank_gap_path)
+                    ])
+                    subprocess.run(gap_cmd, check=True, capture_output=True, text=True)
+                    f.write(f"file '{blank_gap_path.absolute().as_posix()}'\n")
+                    current_timeline_pos = clip_timeline_start
+
                 title = clip.get("title", clip.get("name", f"Clip_{i+1}"))
                 segments = clip.get("segments") if isinstance(clip.get("segments"), list) and clip.get("segments") else [clip]
                 clip_duration = 0.0
@@ -2855,22 +2986,13 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                     if duration <= 0: continue
                     
                     key = (i, j)
-                    current_asset_url = seg.get("assetUrl") or clip.get("assetUrl")
-                    if current_asset_url:
-                        if key in processed_clips:
-                            escaped_path = str(processed_clips[key].absolute()).replace("'", r"\'").replace("\\", "/")
-                            f.write(f"file '{escaped_path}'\n")
-                            valid_clip_count += 1
-                            clip_duration += duration
-                        else:
-                            print(f"[export-zip] WARNING: clip {key} missing from processed_clips!")
-                    else:
-                        escaped_path = str(video_path.absolute()).replace("'", r"\'").replace("\\", "/")
+                    if key in processed_clips:
+                        escaped_path = str(processed_clips[key].absolute()).replace("'", r"\'").replace("\\", "/")
                         f.write(f"file '{escaped_path}'\n")
-                        f.write(f"inpoint {src_start}\n")
-                        f.write(f"outpoint {src_start + duration}\n")
                         valid_clip_count += 1
                         clip_duration += duration
+                    else:
+                        print(f"[export-zip] WARNING: clip {key} missing from processed_clips!")
                 
                 if clip_duration > 0:
                     safe_title = "".join([c if c.isalnum() or c in " _-" else "_" for c in title])
@@ -2881,6 +3003,28 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         "duration": clip_duration,
                         "file": f"{len(chapters_meta)+1:02d}_{safe_title}{out_ext}"
                     })
+                    current_timeline_pos = max(current_timeline_pos, clip_timeline_start + clip_duration)
+        if current_timeline_pos < timeline_end - 0.049:
+            gap_duration = timeline_end - current_timeline_pos
+            blank_gap_path = temp_dir / "blank_tail.mp4"
+            gap_cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}",
+                "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate={ar}",
+                "-t", str(gap_duration),
+                "-c:v", c_v, "-pix_fmt", pix_fmt
+            ]
+            if c_v in ["libx264", "libx265"]:
+                gap_cmd.extend(["-preset", "ultrafast", "-crf", "28"])
+            gap_cmd.extend([
+                "-c:a", c_a, "-b:a", "96k",
+                "-shortest",
+                "-movflags", "+faststart",
+                "-y", str(blank_gap_path)
+            ])
+            subprocess.run(gap_cmd, check=True, capture_output=True, text=True)
+            with open(concat_txt_path, "a", encoding="utf-8") as f:
+                f.write(f"file '{blank_gap_path.absolute().as_posix()}'\n")
 
         if valid_clip_count > 0:
             cmd = [
@@ -2894,9 +3038,176 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
             #     cmd.extend(["-movflags", "+faststart"])
             cmd.append(str(main_video_path))
             subprocess.run(cmd, capture_output=True, text=True, check=True)
+        elif timeline_end > 0:
+            gap_cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={fps}",
+                "-f", "lavfi", "-i", f"anullsrc=r={ar}:cl=stereo",
+                "-t", str(timeline_end),
+                "-c:v", c_v, "-pix_fmt", pix_fmt
+            ]
+            if c_v in ["libx264", "libx265"]:
+                gap_cmd.extend(["-preset", "ultrafast", "-crf", "28"])
+            gap_cmd.extend([
+                "-c:a", c_a, "-b:a", "128k",
+                str(main_video_path)
+            ])
+            subprocess.run(gap_cmd, capture_output=True, text=True, check=True)
+
+        def _media_duration(path):
+            try:
+                res = subprocess.run([
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(path)
+                ], capture_output=True, text=True, check=True)
+                return float((res.stdout or "0").strip() or 0)
+            except Exception:
+                return 0.0
+
+        def _main_has_audio(path):
+            try:
+                probe = subprocess.run([
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name", "-of", "json", str(path)
+                ], capture_output=True, text=True)
+                return bool(json.loads(probe.stdout or "{}").get("streams"))
+            except Exception:
+                return False
+
+        def _extend_video_to_duration(input_path, target_duration):
+            current_duration = _media_duration(input_path)
+            if abs(target_duration - current_duration) <= 0.05:
+                return input_path
+
+            extended_path = temp_dir / "main_edited_video_extended.mp4"
+            if target_duration < current_duration:
+                trim_cmd = [
+                    "ffmpeg", "-y", "-i", str(input_path),
+                    "-t", str(target_duration),
+                    "-c", "copy",
+                    str(extended_path)
+                ]
+                subprocess.run(trim_cmd, capture_output=True, text=True, check=True)
+                return extended_path if extended_path.exists() else input_path
+
+            stop_duration = max(0.0, target_duration - current_duration)
+            if _main_has_audio(input_path):
+                ext_cmd = [
+                    "ffmpeg", "-y", "-i", str(input_path),
+                    "-filter_complex",
+                    f"[0:v]tpad=stop_mode=clone:stop_duration={stop_duration}[v];[0:a]apad=pad_dur={stop_duration}[a]",
+                    "-map", "[v]", "-map", "[a]",
+                    "-t", str(target_duration),
+                    "-c:v", c_v, "-pix_fmt", pix_fmt
+                ]
+                if c_v in ["libx264", "libx265"]:
+                    ext_cmd.extend(["-preset", "ultrafast", "-crf", "28"])
+                ext_cmd.extend(["-c:a", c_a, "-b:a", "128k", str(extended_path)])
+                subprocess.run(ext_cmd, capture_output=True, text=True, check=True)
+            else:
+                ext_cmd = [
+                    "ffmpeg", "-y", "-i", str(input_path),
+                    "-vf", f"tpad=stop_mode=clone:stop_duration={stop_duration}",
+                    "-t", str(target_duration),
+                    "-c:v", c_v, "-pix_fmt", pix_fmt
+                ]
+                if c_v in ["libx264", "libx265"]:
+                    ext_cmd.extend(["-preset", "ultrafast", "-crf", "28"])
+                ext_cmd.extend(["-an", str(extended_path)])
+                subprocess.run(ext_cmd, capture_output=True, text=True, check=True)
+            return extended_path if extended_path.exists() else input_path
+
+        if main_video_path.exists():
+            main_video_path = _extend_video_to_duration(main_video_path, timeline_end)
+
+        overlay_clips = [
+            clip for clip in body.timeline
+            if clip.get("track", 0) != 0
+            and clip.get("assetKind") in ["video", "photo"]
+            and (clip.get("assetUrl") or "").strip()
+            and _clip_belongs_to_export_window(clip)
+        ]
+
+        if overlay_clips and main_video_path.exists():
+            overlay_inputs = []
+            for idx, overlay_clip in enumerate(overlay_clips):
+                overlay_start = float(overlay_clip.get("timelineStart", 0) or 0)
+                overlay_duration = float(overlay_clip.get("duration", 0) or 0)
+                if selected_id_set is not None:
+                    offset = selected_timeline_start - overlay_start
+                    if offset > 0:
+                        overlay_duration = max(0.0, overlay_duration - offset)
+                        overlay_start = 0.0
+                    else:
+                        overlay_start = abs(offset)
+                if overlay_duration <= 0.05:
+                    continue
+
+                processed = await asyncio.to_thread(
+                    _process_zip_asset,
+                    9000 + idx,
+                    0,
+                    overlay_clip.get("assetUrl"),
+                    overlay_duration,
+                    float(overlay_clip.get("sourceStart", overlay_clip.get("start", 0)) or 0),
+                )
+                if processed:
+                    overlay_inputs.append((processed[1], overlay_start, overlay_duration))
+                    if overlay_clip.get("assetKind") == "video" and _main_has_audio(processed[1]):
+                        audio_inputs.append((
+                            processed[1],
+                            {
+                                **overlay_clip,
+                                "sourceStart": 0,
+                                "timelineStart": overlay_start,
+                                "duration": overlay_duration,
+                            }
+                        ))
+
+            if overlay_inputs:
+                composited_video_path = temp_dir / "main_edited_video_composited.mp4"
+                cmd = ["ffmpeg", "-y", "-i", str(main_video_path)]
+                for overlay_path, _start, _duration in overlay_inputs:
+                    cmd.extend(["-i", str(overlay_path)])
+
+                filter_parts = ["[0:v]setpts=PTS-STARTPTS[base0]"]
+                current_label = "base0"
+                for idx, (_overlay_path, overlay_start, overlay_duration) in enumerate(overlay_inputs, start=1):
+                    start = max(0.0, overlay_start)
+                    end = start + max(0.0, overlay_duration)
+                    filter_parts.append(
+                        f"[{idx}:v]setpts=PTS-STARTPTS+{start}/TB[ov{idx}]"
+                    )
+                    out_label = f"base{idx}"
+                    filter_parts.append(
+                        f"[{current_label}][ov{idx}]overlay=0:0:enable='between(t,{start},{end})'[{out_label}]"
+                    )
+                    current_label = out_label
+
+                cmd.extend([
+                    "-filter_complex", ";".join(filter_parts),
+                    "-map", f"[{current_label}]",
+                ])
+                if _main_has_audio(main_video_path):
+                    cmd.extend(["-map", "0:a?"])
+                cmd.extend([
+                    "-c:v", c_v, "-pix_fmt", pix_fmt
+                ])
+                if c_v in ["libx264", "libx265"]:
+                    cmd.extend(["-preset", "ultrafast", "-crf", "28"])
+                cmd.extend([
+                    "-c:a", c_a, "-b:a", "128k",
+                    "-t", str(timeline_end),
+                    str(composited_video_path)
+                ])
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                if composited_video_path.exists():
+                    main_video_path = composited_video_path
 
         # Mix audio for both modes so separate clips have background audio included
-        if audio_clips:
+        if audio_clips or audio_inputs:
             for idx, audio_clip in enumerate(audio_clips):
                 asset_url = audio_clip.get("assetUrl", "")
                 if asset_url and asset_url.startswith("/api/proxy-"):
@@ -2915,7 +3226,7 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         async with httpx.AsyncClient(timeout=30.0) as hc:
                             r = await hc.get(asset_url, headers={"User-Agent": "Mozilla/5.0"})
                             r.raise_for_status()
-                            audio_path = temp_dir / f"audio_{idx+1:02d}.tmp"
+                            audio_path = temp_dir / f"audio_{idx+1:02d}.mp3"
                             audio_path.write_bytes(r.content)
                     except Exception as e:
                         print(f"[export-zip] Failed to download audio {asset_url}: {e}")
@@ -2979,10 +3290,10 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         "-map", "0:v",
                         "-map", "[aout]",
                         "-c:v", "copy",
-                        "-c:a", "aac",
+                        "-c:a", c_a,
                         "-b:a", "192k",
                         "-threads", "0",
-                        "-shortest",
+                        "-t", str(timeline_end),
                         # "-movflags", "+faststart",
                         str(mixed_video_path)
                     ])
@@ -2993,10 +3304,10 @@ async def export_zip_endpoint(session_id: str, body: ExportZipRequest):
                         "-map", "0:v",
                         "-map", "[aout]",
                         "-c:v", "copy",
-                        "-c:a", "aac",
+                        "-c:a", c_a,
                         "-b:a", "192k",
                         "-threads", "0",
-                        "-shortest",
+                        "-t", str(timeline_end),
                         # "-movflags", "+faststart",
                         str(mixed_video_path)
                     ])

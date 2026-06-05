@@ -2458,7 +2458,7 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
 
   const postExportDownload = async (payload: unknown, mode: 'whole' | 'clips') => {
     try {
-      const endpoint = mode === 'whole' ? `/api/videos/${sessionId}/fast-export` : `/api/videos/${sessionId}/export-zip`;
+      const endpoint = `/api/videos/${sessionId}/export-zip`;
       
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -2536,14 +2536,22 @@ export function EditorPage({ sessionId, onReset }: EditorPageProps) {
       return { ...clip, assetUrl: url };
     });
 
+    // Make sure we don't send a local browser Blob URL to the backend for the main video
+    const exportVideoUrl = session.videoUrl.startsWith('blob:')
+      ? new URL(`/api/videos/${sessionId}/stream`, window.location.origin).toString()
+      : (session.videoUrl.startsWith('/') ? new URL(session.videoUrl, window.location.origin).toString() : session.videoUrl);
+
     await postExportDownload({
-      videoUrl: session.videoUrl,
+      videoUrl: exportVideoUrl,
       timeline: decodedFullTimeline,
       clips: decodedFullTimeline,
       selectedIds,
       transcriptSegments: session.transcriptSegments || [],
       mode,
       preset: 'ultrafast',
+      resolution: '720p',
+      threads: 4,
+      fast_mode: true,
       timestamp_str: new Date().toISOString().replace(/[-T:\.Z]/g, '')
     }, mode);
 
